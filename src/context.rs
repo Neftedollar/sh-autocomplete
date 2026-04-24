@@ -74,6 +74,9 @@ fn classify_role(tokens: &[String], active_index: usize, cwd: &Path) -> TokenRol
 }
 
 fn looks_like_path(token: &str, cwd: &Path) -> bool {
+    if token.is_empty() {
+        return false;
+    }
     if token.starts_with("./")
         || token.starts_with("../")
         || token.starts_with('/')

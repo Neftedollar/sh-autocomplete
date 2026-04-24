@@ -279,6 +279,27 @@ impl Engine {
         }
 
         if let Some(command) = parsed.command.as_deref() {
+            if is_python_module_position(parsed) {
+                for module in python_module_candidates() {
+                    if module.name.starts_with(active)
+                        || fuzzy_match_score(active, module.name) > 0.0
+                        || active.is_empty()
+                    {
+                        push_candidate(
+                            &mut candidates,
+                            &mut seen,
+                            Candidate {
+                                insert_text: module.name.to_string(),
+                                display: module.name.to_string(),
+                                kind: "module".to_string(),
+                                source: "builtin-index".to_string(),
+                                description: Some(module.description.to_string()),
+                            },
+                        );
+                    }
+                }
+            }
+
             if self.config.features.doc_search {
                 for doc in self.db.docs_for_command(command)? {
                     if should_include_doc(&doc, active, parsed) {
@@ -651,6 +672,10 @@ fn fuzzy_match_score(query: &str, candidate: &str) -> f64 {
 }
 
 fn should_include_doc(doc: &StoredDoc, active: &str, parsed: &ParsedContext) -> bool {
+    if is_python_module_position(parsed) {
+        return false;
+    }
+
     match parsed.role {
         TokenRole::Option => doc.item_type == "option" && doc.item_value.starts_with(active),
         TokenRole::SubcommandOrArg => {
@@ -691,6 +716,7 @@ fn position_score(parsed: &ParsedContext, candidate: &Candidate) -> f64 {
         TokenRole::Command if candidate.kind == "command" || candidate.kind == "builtin" => 1.0,
         TokenRole::Option if candidate.kind == "option" => 1.0,
         TokenRole::Path if candidate.kind == "path" => 1.0,
+        TokenRole::SubcommandOrArg if candidate.kind == "module" => 1.0,
         TokenRole::SubcommandOrArg if candidate.kind == "subcommand" => 0.9,
         TokenRole::SubcommandOrArg if candidate.kind == "history" => 0.6,
         _ => 0.2,
@@ -701,6 +727,7 @@ fn source_prior(source: &str, kind: &str) -> f64 {
     match (source, kind) {
         ("path_index", "command") => 0.8,
         ("builtin-index", "subcommand") => 0.9,
+        ("builtin-index", "module") => 0.9,
         ("help", "option") => 0.7,
         ("history", _) => 0.6,
         ("runtime_history", _) => 0.65,
@@ -729,6 +756,77 @@ fn sanitize_fts_query(query: &str) -> Option<String> {
     } else {
         Some(tokens.join(" "))
     }
+}
+
+struct PythonModuleCandidate {
+    name: &'static str,
+    description: &'static str,
+}
+
+fn is_python_module_position(parsed: &ParsedContext) -> bool {
+    matches!(parsed.command.as_deref(), Some("python" | "python3"))
+        && matches!(parsed.prev_token.as_deref(), Some("-m"))
+}
+
+fn python_module_candidates() -> &'static [PythonModuleCandidate] {
+    &[
+        PythonModuleCandidate {
+            name: "pytest",
+            description: "Run the pytest test runner",
+        },
+        PythonModuleCandidate {
+            name: "pip",
+            description: "Run the Python package installer",
+        },
+        PythonModuleCandidate {
+            name: "venv",
+            description: "Create or manage virtual environments",
+        },
+        PythonModuleCandidate {
+            name: "http.server",
+            description: "Run a simple HTTP server",
+        },
+        PythonModuleCandidate {
+            name: "unittest",
+            description: "Run Python unit tests",
+        },
+        PythonModuleCandidate {
+            name: "pdb",
+            description: "Run the Python debugger",
+        },
+        PythonModuleCandidate {
+            name: "pydoc",
+            description: "Show Python documentation",
+        },
+        PythonModuleCandidate {
+            name: "json.tool",
+            description: "Validate and pretty-print JSON",
+        },
+        PythonModuleCandidate {
+            name: "timeit",
+            description: "Benchmark small Python snippets",
+        },
+        PythonModuleCandidate {
+            name: "cProfile",
+            description: "Run the Python profiler",
+        },
+        PythonModuleCandidate {
+            name: "doctest",
+            description: "Run examples embedded in docstrings",
+        },
+        PythonModuleCandidate {
+            name: "compileall",
+            description: "Byte-compile Python source files",
+        },
+        PythonModuleCandidate {
+            name: "site",
+            description: "Inspect Python site configuration",
+        },
+        PythonModuleCandidate {
+            name: "ensurepip",
+            description: "Bootstrap pip into an environment",
+        },
+    ]
 }
 
 fn contextual_history_prefix(parsed: &ParsedContext) -> String {

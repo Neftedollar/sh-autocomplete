@@ -46,6 +46,35 @@ fn cli_daemon_records_exact_accept_and_recent_events() {
         "expected python3 in completion output:\n{completion}"
     );
 
+    let module_completion = support::run_ok(
+        &env,
+        [
+            "complete",
+            "--shell",
+            "zsh",
+            "--line",
+            "python3 -m ",
+            "--cursor",
+            "11",
+            "--cwd",
+            &cwd,
+            "--format",
+            "shell-tsv-v2",
+        ],
+    );
+    assert!(
+        module_completion
+            .lines()
+            .any(|line| line.split('\t').collect::<Vec<_>>().get(1) == Some(&"pytest")),
+        "expected python module candidates after `python3 -m `:\n{module_completion}"
+    );
+    assert!(
+        !module_completion
+            .lines()
+            .any(|line| line.split('\t').collect::<Vec<_>>().get(1) == Some(&"-m")),
+        "python module position should not suggest raw python options:\n{module_completion}"
+    );
+
     support::run_ok(
         &env,
         [
@@ -75,7 +104,7 @@ fn cli_daemon_records_exact_accept_and_recent_events() {
     let stats: Value = serde_json::from_str(&support::run_ok(&env, ["stats"])).expect("stats json");
     assert_eq!(stats["history_events"].as_i64(), Some(1));
     assert_eq!(stats["interactive_history_events"].as_i64(), Some(1));
-    assert_eq!(stats["clean_completion_requests"].as_i64(), Some(1));
+    assert_eq!(stats["clean_completion_requests"].as_i64(), Some(2));
     assert_eq!(stats["accepted_clean_completions"].as_i64(), Some(1));
 
     let recent: Value =

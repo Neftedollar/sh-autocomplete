@@ -1,5 +1,5 @@
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -85,6 +85,8 @@ pub struct AppDb {
 impl AppDb {
     pub fn open(path: &Path) -> Result<Self> {
         let conn = Connection::open(path).context("open sqlite db")?;
+        conn.busy_timeout(Duration::from_millis(1_000))
+            .context("set sqlite busy timeout")?;
         let db = Self { conn };
         db.init()?;
         Ok(db)
