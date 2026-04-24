@@ -1,6 +1,10 @@
 # shac
 
+![shac hero: shell completions in a terminal session](docs/assets/hero/shac-hero.gif)
+
 `shac` is a local autocomplete engine for `bash` and `zsh` built around a lightweight Rust daemon.
+
+Landing page: https://neftedollar.github.io/sh-autocomplete/
 
 ## Components
 

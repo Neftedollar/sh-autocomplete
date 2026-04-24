@@ -1,0 +1,179 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>shac | Smart local shell autocomplete</title>
+    <meta
+      name="description"
+      content="shac is a local smart shell autocomplete engine for zsh and bash. Faster command entry, context-aware ranking, and local-first privacy."
+    />
+    <meta property="og:type" content="website" />
+    <meta property="og:title" content="shac" />
+    <meta
+      property="og:description"
+      content="Smart local shell autocomplete for zsh and bash."
+    />
+    <meta
+      property="og:image"
+      content="https://neftedollar.github.io/sh-autocomplete/assets/social/shac-og.png"
+    />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="shac" />
+    <meta
+      name="twitter:description"
+      content="Smart local shell autocomplete for zsh and bash."
+    />
+    <meta
+      name="twitter:image"
+      content="https://neftedollar.github.io/sh-autocomplete/assets/social/shac-og.png"
+    />
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div class="page-shell">
+      <header class="topbar">
+        <a class="brand" href="https://github.com/Neftedollar/sh-autocomplete">
+          <img src="assets/brand/shac-mark.svg" alt="" />
+          <span>shac</span>
+        </a>
+        <nav class="topnav">
+          <a href="https://github.com/Neftedollar/sh-autocomplete#beta-quickstart">Quickstart</a>
+          <a href="https://github.com/Neftedollar/sh-autocomplete#diagnostics">Diagnostics</a>
+          <a href="https://github.com/Neftedollar/sh-autocomplete#data-and-privacy">Privacy</a>
+        </nav>
+      </header>
+
+      <main class="hero-grid">
+        <section class="hero-copy">
+          <img
+            class="wordmark"
+            src="assets/brand/shac-wordmark-light.svg"
+            alt="shac"
+          />
+          <p class="eyebrow">Smart local shell autocomplete</p>
+          <h1>Type less. Stay in flow.</h1>
+          <p class="lede">
+            `shac` helps `zsh` and `bash` finish the command you meant, using local
+            context, command docs, and recent usage without shipping your shell data
+            over the network.
+          </p>
+
+          <div class="cta-row">
+            <a class="button button-primary" href="https://github.com/Neftedollar/sh-autocomplete">
+              Open GitHub
+            </a>
+            <a class="button" href="https://github.com/Neftedollar/sh-autocomplete#beta-quickstart">
+              Beta quickstart
+            </a>
+            <a class="button" href="https://github.com/Neftedollar/sh-autocomplete#homebrew">
+              Homebrew install
+            </a>
+          </div>
+
+          <div class="install-pill">
+            <span>Install</span>
+            <code>brew install Neftedollar/shac/shac</code>
+          </div>
+
+          <div class="proof-grid">
+            <article>
+              <strong>Local-first</strong>
+              <span>No network path in the daemon or shell adapters.</span>
+            </article>
+            <article>
+              <strong>Context-aware</strong>
+              <span>Ranks from history, project context, docs, and hot paths.</span>
+            </article>
+            <article>
+              <strong>Explainable</strong>
+              <span>Inspect why a completion won with `shac explain`.</span>
+            </article>
+          </div>
+        </section>
+
+        <section class="hero-media">
+          <div class="terminal-frame">
+            <img
+              src="assets/hero/shac-hero.gif"
+              alt="Animated terminal session showing shac surfacing shell completions"
+            />
+          </div>
+          <p class="caption">
+            Terminal-first demo: partial commands, ranked completions, less tab spam.
+          </p>
+        </section>
+      </main>
+
+      <section class="section">
+        <div class="section-head">
+          <p class="eyebrow">Why shac</p>
+          <h2>Built for daily shell muscle memory, not demo magic.</h2>
+        </div>
+        <div class="card-grid">
+          <article class="card">
+            <h3>Finish commands faster</h3>
+            <p>
+              Use partial command input like `git ch`, `kubectl con`, or `pyt`,
+              then let `shac` surface the likely next move.
+            </p>
+          </article>
+          <article class="card">
+            <h3>Keep your data local</h3>
+            <p>
+              Config, SQLite data, caches, and daemon state stay on your machine.
+              The daemon and shell adapters do not call out to the network.
+            </p>
+          </article>
+          <article class="card">
+            <h3>Understand the ranking</h3>
+            <p>
+              `shac explain` lets you inspect the feature contributions behind a
+              suggestion instead of treating autocomplete as a black box.
+            </p>
+          </article>
+        </div>
+      </section>
+
+      <section class="section split">
+        <div>
+          <p class="eyebrow">Quickstart</p>
+          <h2>Useful in minutes, not after a weekend config binge.</h2>
+          <p>
+            The current MVP is strongest on `zsh`, with `bash` supported as
+            best-effort list completion. Start the daemon, install the adapter,
+            and reindex once.
+          </p>
+          <div class="link-row">
+            <a href="https://github.com/Neftedollar/sh-autocomplete#beta-quickstart">Full quickstart</a>
+            <a href="https://github.com/Neftedollar/sh-autocomplete#diagnostics">Diagnostics</a>
+            <a href="https://github.com/Neftedollar/sh-autocomplete#data-and-privacy">Privacy</a>
+          </div>
+        </div>
+        <div class="snippet-stack">
+          <pre><code>cargo build --bins
+./target/debug/shac install --shell zsh --edit-rc
+./target/debug/shac daemon start
+./target/debug/shac reindex</code></pre>
+          <pre><code>./target/debug/shac debug completion --shell zsh --line "git ch" --cursor 6
+./target/debug/shac explain --shell zsh --line "kubectl con" --cursor 11</code></pre>
+        </div>
+      </section>
+
+      <section class="section footer-callout">
+        <div>
+          <p class="eyebrow">Built for terminal people</p>
+          <h2>Rust daemon, shell adapters, docs-aware ranking.</h2>
+          <p>
+            `shac` is already shipping command docs for tools like `git`, `docker`,
+            `kubectl`, `npm`, `cargo`, and `python`, with project-aware reranking
+            and optional local ML.
+          </p>
+        </div>
+        <a class="button button-primary" href="https://github.com/Neftedollar/sh-autocomplete">
+          Read the repo
+        </a>
+      </section>
+    </div>
+  </body>
+</html>

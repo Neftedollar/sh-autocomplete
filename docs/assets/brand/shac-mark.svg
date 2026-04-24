@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120" role="img" aria-labelledby="title desc">
+  <title id="title">shac mark</title>
+  <desc id="desc">A prompt-inspired mark for shac.</desc>
+  <rect width="120" height="120" rx="28" fill="#78ffbb"/>
+  <path d="M32 60l18-18v12h38v12H50v12z" fill="#05100d"/>
+  <rect x="70" y="76" width="18" height="8" rx="4" fill="#05100d"/>
+</svg>
