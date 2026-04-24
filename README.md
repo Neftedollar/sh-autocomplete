@@ -34,7 +34,7 @@ cargo build
 The formula always points to a stable tag.
 
 ```bash
-brew install Neftedollar/sh-autocomplete/shac
+brew install Neftedollar/shac/shac
 ```
 
 For local formula testing from this checkout:
