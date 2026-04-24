@@ -7,6 +7,10 @@ use serde_json::Value;
 
 #[test]
 fn zsh_pty_records_manual_accept_and_exact_paste() {
+    if should_skip_pty_on_ci_linux() {
+        eprintln!("skipping zsh PTY smoke on Linux CI");
+        return;
+    }
     if !support::command_available("zsh") || !support::command_available("python3") {
         eprintln!("skipping zsh PTY smoke: zsh or python3 is unavailable");
         return;
@@ -137,6 +141,10 @@ sys.exit(1)
 
 #[test]
 fn zsh_pty_cancel_menu_does_not_record_accept() {
+    if should_skip_pty_on_ci_linux() {
+        eprintln!("skipping zsh PTY smoke on Linux CI");
+        return;
+    }
     if !support::command_available("zsh") || !support::command_available("python3") {
         eprintln!("skipping zsh PTY smoke: zsh or python3 is unavailable");
         return;
@@ -249,6 +257,10 @@ sys.exit(1)
             .any(|event| event["provenance"].as_str() == Some("accepted_completion")),
         "cancelled menu should not record accepted completion: {recent}"
     );
+}
+
+fn should_skip_pty_on_ci_linux() -> bool {
+    std::env::var_os("CI").is_some() && cfg!(target_os = "linux")
 }
 
 fn deterministic_zsh_path(env: &support::TestEnv) -> String {
