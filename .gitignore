@@ -1,0 +1,7 @@
+/target
+/.idea
+/.vscode
+/tmp
+/shac
+*.db-shm
+*.db-wal

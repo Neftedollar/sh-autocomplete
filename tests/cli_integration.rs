@@ -1,0 +1,91 @@
+mod support;
+
+use serde_json::Value;
+
+#[test]
+fn cli_daemon_records_exact_accept_and_recent_events() {
+    let env = support::TestEnv::new("cli");
+    let cwd = support::current_repo();
+
+    support::run_ok(&env, ["config", "set", "daemon_timeout_ms", "750"]);
+    let _daemon = env.spawn_daemon();
+    support::run_ok(&env, ["reindex"]);
+
+    let completion = support::run_ok(
+        &env,
+        [
+            "complete",
+            "--shell",
+            "zsh",
+            "--line",
+            "pyt",
+            "--cursor",
+            "3",
+            "--cwd",
+            &cwd,
+            "--format",
+            "shell-tsv-v2",
+        ],
+    );
+    let mut lines = completion.lines();
+    let header = lines.next().expect("completion header");
+    let header_fields = header.split('\t').collect::<Vec<_>>();
+    assert_eq!(header_fields.first().copied(), Some("__shac_request_id"));
+    let request_id = header_fields
+        .get(1)
+        .and_then(|value| value.parse::<i64>().ok())
+        .expect("numeric request id");
+    let has_python = lines.any(|line| {
+        let fields = line.split('\t').collect::<Vec<_>>();
+        fields.get(1).copied() == Some("python3")
+            || fields.get(2).copied() == Some("python3")
+            || fields.first().copied() == Some("python3")
+    });
+    assert!(
+        has_python,
+        "expected python3 in completion output:\n{completion}"
+    );
+
+    support::run_ok(
+        &env,
+        [
+            "record-command",
+            "--shell",
+            "zsh",
+            "--cwd",
+            &cwd,
+            "--command",
+            "python3",
+            "--trust",
+            "interactive",
+            "--provenance",
+            "accepted_completion",
+            "--origin",
+            "zsh_precmd",
+            "--tty-present",
+            "--accepted-request-id",
+            &request_id.to_string(),
+            "--accepted-item-key",
+            "python3",
+            "--accepted-rank",
+            "0",
+        ],
+    );
+
+    let stats: Value = serde_json::from_str(&support::run_ok(&env, ["stats"])).expect("stats json");
+    assert_eq!(stats["history_events"].as_i64(), Some(1));
+    assert_eq!(stats["interactive_history_events"].as_i64(), Some(1));
+    assert_eq!(stats["clean_completion_requests"].as_i64(), Some(1));
+    assert_eq!(stats["accepted_clean_completions"].as_i64(), Some(1));
+
+    let recent: Value =
+        serde_json::from_str(&support::run_ok(&env, ["recent-events", "--limit", "5"]))
+            .expect("recent events json");
+    let event = recent
+        .as_array()
+        .and_then(|events| events.first())
+        .expect("recent event");
+    assert_eq!(event["command"].as_str(), Some("python3"));
+    assert_eq!(event["trust"].as_str(), Some("interactive"));
+    assert_eq!(event["provenance"].as_str(), Some("accepted_completion"));
+}

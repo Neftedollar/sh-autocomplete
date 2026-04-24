@@ -1,0 +1,54 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            asset_name: shac-linux-x86_64
+          - os: macos-latest
+            asset_name: shac-macos-universal
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binaries
+        run: cargo build --release --bins
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "dist/${{ matrix.asset_name }}/bin"
+          cp target/release/shac "dist/${{ matrix.asset_name }}/bin/"
+          cp target/release/shacd "dist/${{ matrix.asset_name }}/bin/"
+          cp -R shell "dist/${{ matrix.asset_name }}/"
+          cp README.md LICENSE "dist/${{ matrix.asset_name }}/"
+          tar -C dist -czf "dist/${{ matrix.asset_name }}.tar.gz" "${{ matrix.asset_name }}"
+
+      - name: Upload release asset
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/${{ matrix.asset_name }}.tar.gz
