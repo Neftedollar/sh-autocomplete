@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::ErrorKind;
 use std::io::{BufRead, BufReader, IsTerminal, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -1024,12 +1025,31 @@ fn send_request(
     stream.write_all(serde_json::to_string(&request)?.as_bytes())?;
     stream.write_all(b"\n")?;
     let mut reader = BufReader::new(stream);
-    let mut response = String::new();
-    reader.read_line(&mut response)?;
+    let response = read_response_with_retry(&mut reader, timeout)?;
     if response.trim().is_empty() {
         bail!("empty response from daemon");
     }
     Ok(serde_json::from_str(&response)?)
+}
+
+fn read_response_with_retry(
+    reader: &mut BufReader<UnixStream>,
+    timeout: Duration,
+) -> Result<String> {
+    let started = Instant::now();
+    let mut response = String::new();
+    loop {
+        match reader.read_line(&mut response) {
+            Ok(_) => return Ok(response),
+            Err(err)
+                if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut)
+                    && started.elapsed() < timeout =>
+            {
+                thread::sleep(Duration::from_millis(5));
+            }
+            Err(err) => return Err(err).context("read daemon response"),
+        }
+    }
 }
 
 fn connect_with_retry(path: &Path, timeout: Duration) -> Result<UnixStream> {
