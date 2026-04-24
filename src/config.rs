@@ -59,12 +59,43 @@ impl Default for RankingWeights {
     }
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UiConfig {
+    pub zsh: ZshUiConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ZshUiConfig {
+    pub menu_detail: String,
+    pub show_kind: bool,
+    pub show_source: bool,
+    pub show_description: bool,
+    pub max_description_width: usize,
+    pub max_items: usize,
+}
+
+impl Default for ZshUiConfig {
+    fn default() -> Self {
+        Self {
+            menu_detail: "compact".to_string(),
+            show_kind: false,
+            show_source: false,
+            show_description: true,
+            max_description_width: 72,
+            max_items: 8,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppConfig {
     pub enabled: bool,
     pub features: FeatureFlags,
     pub ranking: RankingWeights,
+    pub ui: UiConfig,
     pub max_results: usize,
     pub daemon_timeout_ms: u64,
     pub ml_model_file: Option<String>,
@@ -77,6 +108,7 @@ impl Default for AppConfig {
             enabled: true,
             features: FeatureFlags::default(),
             ranking: RankingWeights::default(),
+            ui: UiConfig::default(),
             max_results: 12,
             daemon_timeout_ms: 150,
             ml_model_file: None,
@@ -174,6 +206,12 @@ impl AppConfig {
             "ranking.position_score" => Some(self.ranking.position_score.to_string()),
             "ranking.source_prior" => Some(self.ranking.source_prior.to_string()),
             "ranking.doc_match_score" => Some(self.ranking.doc_match_score.to_string()),
+            "ui.zsh.menu_detail" => Some(self.ui.zsh.menu_detail.clone()),
+            "ui.zsh.show_kind" => Some(self.ui.zsh.show_kind.to_string()),
+            "ui.zsh.show_source" => Some(self.ui.zsh.show_source.to_string()),
+            "ui.zsh.show_description" => Some(self.ui.zsh.show_description.to_string()),
+            "ui.zsh.max_description_width" => Some(self.ui.zsh.max_description_width.to_string()),
+            "ui.zsh.max_items" => Some(self.ui.zsh.max_items.to_string()),
             _ => None,
         }
     }
@@ -208,9 +246,22 @@ impl AppConfig {
             "ranking.position_score" => self.ranking.position_score = value.parse()?,
             "ranking.source_prior" => self.ranking.source_prior = value.parse()?,
             "ranking.doc_match_score" => self.ranking.doc_match_score = value.parse()?,
+            "ui.zsh.menu_detail" => self.ui.zsh.menu_detail = parse_menu_detail(value)?,
+            "ui.zsh.show_kind" => self.ui.zsh.show_kind = parse_bool(value)?,
+            "ui.zsh.show_source" => self.ui.zsh.show_source = parse_bool(value)?,
+            "ui.zsh.show_description" => self.ui.zsh.show_description = parse_bool(value)?,
+            "ui.zsh.max_description_width" => self.ui.zsh.max_description_width = value.parse()?,
+            "ui.zsh.max_items" => self.ui.zsh.max_items = value.parse()?,
             _ => anyhow::bail!("unsupported config key: {key}"),
         }
         Ok(())
+    }
+}
+
+fn parse_menu_detail(value: &str) -> Result<String> {
+    match value {
+        "minimal" | "compact" | "verbose" | "debug" => Ok(value.to_string()),
+        _ => anyhow::bail!("expected one of minimal|compact|verbose|debug, got {value}"),
     }
 }
 

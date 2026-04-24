@@ -38,6 +38,7 @@ enum Commands {
     Stats,
     MigrationStatus,
     RecentEvents(RecentEventsArgs),
+    ShellEnv(ShellEnvArgs),
     ResetPersonalization,
     ExportTrainingData(TrainingDataArgs),
     TrainModel(TrainModelArgs),
@@ -168,6 +169,12 @@ struct RecentEventsArgs {
 }
 
 #[derive(Debug, Args)]
+struct ShellEnvArgs {
+    #[arg(long, value_enum)]
+    shell: ShellKind,
+}
+
+#[derive(Debug, Args)]
 struct ConfigArgs {
     #[command(subcommand)]
     action: ConfigAction,
@@ -255,6 +262,7 @@ fn main() -> Result<()> {
         }
         Commands::MigrationStatus => migration_status(&paths),
         Commands::RecentEvents(args) => recent_events(&paths, args),
+        Commands::ShellEnv(args) => shell_env(&paths, args),
         Commands::ResetPersonalization => reset_personalization(&paths),
         Commands::ExportTrainingData(args) => export_training_data(&paths, args),
         Commands::TrainModel(args) => train_model_file(&paths, args),
@@ -780,6 +788,38 @@ fn migration_status(paths: &AppPaths) -> Result<()> {
         "{}",
         serde_json::to_string_pretty(&engine.migration_status()?)?
     );
+    Ok(())
+}
+
+fn shell_env(paths: &AppPaths, args: ShellEnvArgs) -> Result<()> {
+    let config = AppConfig::load(paths)?;
+    match args.shell {
+        ShellKind::Zsh => {
+            let zsh = config.ui.zsh;
+            println!(
+                "typeset -g _shac_ui_menu_detail={}",
+                shell_escape(&zsh.menu_detail)
+            );
+            println!(
+                "typeset -gi _shac_ui_show_kind={}",
+                if zsh.show_kind { 1 } else { 0 }
+            );
+            println!(
+                "typeset -gi _shac_ui_show_source={}",
+                if zsh.show_source { 1 } else { 0 }
+            );
+            println!(
+                "typeset -gi _shac_ui_show_description={}",
+                if zsh.show_description { 1 } else { 0 }
+            );
+            println!(
+                "typeset -gi _shac_ui_max_description_width={}",
+                zsh.max_description_width
+            );
+            println!("typeset -gi _shac_ui_max_items={}", zsh.max_items);
+        }
+        ShellKind::Bash => {}
+    }
     Ok(())
 }
 

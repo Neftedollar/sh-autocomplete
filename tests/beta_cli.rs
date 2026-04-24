@@ -19,6 +19,27 @@ fn beta_cli_supports_disable_doctor_and_managed_rc_blocks() {
     }));
 
     support::run_ok(&env, ["config", "set", "enabled", "off"]);
+    support::run_ok(&env, ["config", "set", "ui.zsh.menu_detail", "minimal"]);
+    support::run_ok(&env, ["config", "set", "ui.zsh.show_source", "on"]);
+    support::run_ok(&env, ["config", "set", "ui.zsh.max_items", "4"]);
+    assert_eq!(
+        support::run_ok(&env, ["config", "get", "ui.zsh.menu_detail"]).trim(),
+        "minimal"
+    );
+    let shell_env = support::run_ok(&env, ["shell-env", "--shell", "zsh"]);
+    assert!(
+        shell_env.contains("_shac_ui_menu_detail='minimal'"),
+        "shell-env should expose zsh ui detail: {shell_env}"
+    );
+    assert!(
+        shell_env.contains("_shac_ui_show_source=1"),
+        "shell-env should expose zsh source flag: {shell_env}"
+    );
+    assert!(
+        shell_env.contains("_shac_ui_max_items=4"),
+        "shell-env should expose zsh max items: {shell_env}"
+    );
+
     let completion: Value = serde_json::from_str(&support::run_ok(
         &env,
         [

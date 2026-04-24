@@ -70,6 +70,21 @@ Useful smoke checks:
 ./target/debug/shac recent-events --limit 20
 ```
 
+## zsh menu UI
+
+The owned `zsh` menu can be tuned from config:
+
+```bash
+shac config set ui.zsh.menu_detail compact      # minimal | compact | verbose | debug
+shac config set ui.zsh.show_kind off
+shac config set ui.zsh.show_source off
+shac config set ui.zsh.show_description on
+shac config set ui.zsh.max_description_width 72
+shac config set ui.zsh.max_items 8
+```
+
+Defaults are optimized for daily use: compact descriptions are shown, internal `kind/source` metadata is hidden. Use `ui.zsh.menu_detail debug` when diagnosing ranking or candidate source issues.
+
 ## Install and uninstall
 
 ```bash

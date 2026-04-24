@@ -29,6 +29,16 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
   typeset -ga _shac_menu_kinds=()
   typeset -ga _shac_menu_sources=()
   typeset -ga _shac_menu_descriptions=()
+  typeset -g _shac_ui_menu_detail="compact"
+  typeset -gi _shac_ui_show_kind=0
+  typeset -gi _shac_ui_show_source=0
+  typeset -gi _shac_ui_show_description=1
+  typeset -gi _shac_ui_max_description_width=72
+  typeset -gi _shac_ui_max_items=8
+
+  if command -v shac >/dev/null 2>&1; then
+    eval "$(shac shell-env --shell zsh 2>/dev/null)"
+  fi
 
   function _shac_reset_accept_state() {
     _shac_last_request_id=""
@@ -238,6 +248,47 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
     return 0
   }
 
+  function _shac_truncate_text() {
+    local text="$1"
+    local width="${2:-0}"
+    if (( width > 3 && ${#text} > width )); then
+      REPLY="${text[1,$(( width - 3 ))]}..."
+    else
+      REPLY="$text"
+    fi
+  }
+
+  function _shac_render_metadata_label() {
+    local kind="$1"
+    local source="$2"
+    local detail="${_shac_ui_menu_detail:-compact}"
+    local -a parts
+
+    if [[ "$detail" == "minimal" ]]; then
+      REPLY=""
+      return
+    fi
+
+    if [[ "$detail" == "debug" ]]; then
+      [[ -n "$kind" ]] && parts+=("$kind")
+      [[ -n "$source" ]] && parts+=("$source")
+    else
+      (( _shac_ui_show_kind )) && [[ -n "$kind" ]] && parts+=("$kind")
+      (( _shac_ui_show_source )) && [[ -n "$source" ]] && parts+=("$source")
+    fi
+
+    if (( ${#parts[@]} == 0 )); then
+      REPLY=""
+    else
+      REPLY="[${(j:/:)parts}]"
+    fi
+  }
+
+  function _shac_should_show_description() {
+    local detail="${_shac_ui_menu_detail:-compact}"
+    [[ "$detail" != "minimal" ]] && { (( _shac_ui_show_description )) || [[ "$detail" == "debug" ]]; }
+  }
+
   function _shac_render_menu() {
     local total="${#_shac_menu_item_keys[@]}"
     if (( total == 0 )); then
@@ -245,7 +296,10 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
       return
     fi
 
-    local limit=8
+    local limit="${_shac_ui_max_items:-8}"
+    if (( limit <= 0 )); then
+      limit=8
+    fi
     local start=1
     local end=$total
     if (( total > limit )); then
@@ -263,7 +317,7 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
     local -a lines
     lines+=("shac ${_shac_menu_selected_index}/${total}")
 
-    local i marker display kind source description line
+    local i marker display kind source description line label
     for (( i = start; i <= end; i++ )); do
       marker=" "
       if (( i == _shac_menu_selected_index )); then
@@ -274,11 +328,19 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
       source="${_shac_menu_sources[$i]}"
       description="${_shac_menu_descriptions[$i]}"
       line="${marker} ${display}"
-      if [[ -n "$kind" || -n "$source" ]]; then
-        line="${line} [${kind}${source:+/$source}]"
+      _shac_render_metadata_label "$kind" "$source"
+      label="$REPLY"
+      if [[ -n "$label" ]]; then
+        line="${line} ${label}"
       fi
-      if [[ -n "$description" ]]; then
-        line="${line} -- ${description}"
+      if [[ -n "$description" ]] && _shac_should_show_description; then
+        _shac_truncate_text "$description" "${_shac_ui_max_description_width:-72}"
+        description="$REPLY"
+        if [[ "${_shac_ui_menu_detail:-compact}" == "compact" ]]; then
+          line="${line}  ${description}"
+        else
+          line="${line} -- ${description}"
+        fi
       fi
       lines+=("$line")
     done

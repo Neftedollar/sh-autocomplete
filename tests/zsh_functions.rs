@@ -113,6 +113,50 @@ assert_eq "$_shac_menu_open" "0" "right commit closes menu"
     );
 }
 
+#[test]
+fn zsh_menu_render_respects_ui_detail_settings() {
+    if !support::command_available("zsh") {
+        eprintln!("skipping zsh function tests: zsh is unavailable");
+        return;
+    }
+
+    run_zsh(
+        r#"
+_shac_menu_open=1
+_shac_menu_selected_index=1
+_shac_menu_item_keys=("checkout")
+_shac_menu_insert_texts=("checkout")
+_shac_menu_displays=("checkout")
+_shac_menu_kinds=("subcommand")
+_shac_menu_sources=("builtin-index")
+_shac_menu_descriptions=("Switch branches or restore working tree files")
+
+_shac_ui_menu_detail="minimal"
+_shac_ui_show_kind=1
+_shac_ui_show_source=1
+_shac_ui_show_description=1
+_shac_render_menu
+assert_contains "$POSTDISPLAY" "> checkout" "minimal render includes display"
+assert_not_contains "$POSTDISPLAY" "subcommand" "minimal render hides kind"
+assert_not_contains "$POSTDISPLAY" "Switch branches" "minimal render hides description"
+
+_shac_ui_menu_detail="compact"
+_shac_ui_show_kind=0
+_shac_ui_show_source=0
+_shac_ui_show_description=1
+_shac_render_menu
+assert_contains "$POSTDISPLAY" "> checkout  Switch branches" "compact render includes description"
+assert_not_contains "$POSTDISPLAY" "builtin-index" "compact render hides source"
+
+_shac_ui_menu_detail="debug"
+_shac_ui_show_kind=0
+_shac_ui_show_source=0
+_shac_render_menu
+assert_contains "$POSTDISPLAY" "[subcommand/builtin-index]" "debug render forces metadata"
+"#,
+    );
+}
+
 fn run_zsh(body: &str) {
     let script_path = std::env::current_dir()
         .expect("current dir")
@@ -142,6 +186,28 @@ function assert_preview() {{
   _shac_preview_buffer_for_item "$base_buffer" "$base_cursor" "$insert_text"
   assert_eq "$REPLY" "$expected_buffer" "preview buffer for $base_buffer -> $insert_text"
   assert_eq "$REPLY2" "$expected_cursor" "preview cursor for $base_buffer -> $insert_text"
+}}
+function assert_contains() {{
+  local haystack="$1"
+  local needle="$2"
+  local message="$3"
+  if [[ "$haystack" != *"$needle"* ]]; then
+    print -ru2 -- "assertion failed: $message"
+    print -ru2 -- "missing: <$needle>"
+    print -ru2 -- "haystack: <$haystack>"
+    exit 1
+  fi
+}}
+function assert_not_contains() {{
+  local haystack="$1"
+  local needle="$2"
+  local message="$3"
+  if [[ "$haystack" == *"$needle"* ]]; then
+    print -ru2 -- "assertion failed: $message"
+    print -ru2 -- "unexpected: <$needle>"
+    print -ru2 -- "haystack: <$haystack>"
+    exit 1
+  fi
 }}
 source "{script_path}"
 {body}
