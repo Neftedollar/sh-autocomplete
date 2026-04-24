@@ -1,5 +1,7 @@
 mod support;
 
+use std::fs;
+
 use serde_json::Value;
 
 #[test]
@@ -117,4 +119,67 @@ fn cli_daemon_records_exact_accept_and_recent_events() {
     assert_eq!(event["command"].as_str(), Some("python3"));
     assert_eq!(event["trust"].as_str(), Some("interactive"));
     assert_eq!(event["provenance"].as_str(), Some("accepted_completion"));
+
+    let path_root = env.root.join("path-fixture");
+    fs::create_dir_all(path_root.join("alpha/tools")).expect("create path fixture dirs");
+    fs::write(path_root.join("README.md"), "").expect("create top-level file");
+    fs::write(path_root.join("alpha/README.md"), "").expect("create nested file");
+
+    let cd_completion = support::run_ok(
+        &env,
+        [
+            "complete",
+            "--shell",
+            "zsh",
+            "--line",
+            "cd ",
+            "--cursor",
+            "3",
+            "--cwd",
+            path_root.to_str().expect("utf8 path root"),
+            "--format",
+            "shell-tsv-v2",
+        ],
+    );
+    assert!(
+        cd_completion
+            .lines()
+            .any(|line| line.split('\t').collect::<Vec<_>>().get(1) == Some(&"alpha/")),
+        "cd completion should suggest directories with a trailing slash:\n{cd_completion}"
+    );
+    assert!(
+        !cd_completion
+            .lines()
+            .any(|line| line.split('\t').collect::<Vec<_>>().get(1) == Some(&"README.md")),
+        "cd completion should not suggest files:\n{cd_completion}"
+    );
+
+    let nested_cd_completion = support::run_ok(
+        &env,
+        [
+            "complete",
+            "--shell",
+            "zsh",
+            "--line",
+            "cd alpha/",
+            "--cursor",
+            "9",
+            "--cwd",
+            path_root.to_str().expect("utf8 path root"),
+            "--format",
+            "shell-tsv-v2",
+        ],
+    );
+    assert!(
+        nested_cd_completion
+            .lines()
+            .any(|line| line.split('\t').collect::<Vec<_>>().get(1) == Some(&"alpha/tools/")),
+        "nested cd completion should preserve the active path prefix:\n{nested_cd_completion}"
+    );
+    assert!(
+        !nested_cd_completion
+            .lines()
+            .any(|line| line.split('\t').collect::<Vec<_>>().get(1) == Some(&"tools/")),
+        "nested cd completion must not drop the active path prefix:\n{nested_cd_completion}"
+    );
 }

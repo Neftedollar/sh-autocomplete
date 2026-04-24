@@ -2,6 +2,8 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 
@@ -342,7 +344,13 @@ impl Engine {
                 || matches!(parsed.prev_token.as_deref(), Some("cd"))
                 || command == "cd"
             {
-                self.collect_path_candidates(active, &req.cwd, &mut candidates, &mut seen)?;
+                self.collect_path_candidates(
+                    active,
+                    &req.cwd,
+                    command == "cd" || matches!(parsed.prev_token.as_deref(), Some("cd")),
+                    &mut candidates,
+                    &mut seen,
+                )?;
             }
         }
 
@@ -404,10 +412,12 @@ impl Engine {
         &self,
         token: &str,
         cwd: &str,
+        dirs_only: bool,
         candidates: &mut Vec<Candidate>,
         seen: &mut HashSet<String>,
     ) -> Result<()> {
         let (dir, prefix) = split_path_token(token, cwd);
+        let insertion_prefix = path_insertion_prefix(token);
         let dir_string = dir.to_string_lossy().to_string();
         let mtime = dir
             .metadata()
@@ -439,18 +449,19 @@ impl Engine {
 
         for entry in entries {
             if entry.starts_with(&prefix) {
-                let display =
-                    if token.contains('/') || token.starts_with("./") || token.starts_with("../") {
-                        format!("{}/{}", dir.display(), entry)
-                    } else {
-                        entry.clone()
-                    };
+                let entry_path = dir.join(&entry);
+                let is_dir = entry_path.is_dir();
+                if dirs_only && !is_dir {
+                    continue;
+                }
+                let suffix = if is_dir { "/" } else { "" };
+                let insert_text = format!("{insertion_prefix}{entry}{suffix}");
                 push_candidate(
                     candidates,
                     seen,
                     Candidate {
-                        insert_text: entry.clone(),
-                        display,
+                        insert_text: insert_text.clone(),
+                        display: insert_text,
                         kind: "path".to_string(),
                         source: "path_cache".to_string(),
                         description: None,
@@ -904,14 +915,40 @@ fn split_path_token(token: &str, cwd: &str) -> (PathBuf, String) {
     (dir, prefix)
 }
 
+fn path_insertion_prefix(token: &str) -> String {
+    if token.ends_with('/') {
+        return token.to_string();
+    }
+    token
+        .rfind('/')
+        .map(|index| token[..=index].to_string())
+        .unwrap_or_default()
+}
+
 fn read_dir_entries(dir: &Path) -> Result<Vec<String>> {
-    let mut entries = fs::read_dir(dir)
-        .with_context(|| format!("read dir {}", dir.display()))?
+    let read_dir = read_dir_with_retry(dir)?;
+    let mut entries = read_dir
         .filter_map(|entry| entry.ok())
         .filter_map(|entry| entry.file_name().into_string().ok())
         .collect::<Vec<_>>();
     entries.sort();
     Ok(entries)
+}
+
+fn read_dir_with_retry(dir: &Path) -> Result<fs::ReadDir> {
+    let mut last_error = None;
+    for _ in 0..5 {
+        match fs::read_dir(dir) {
+            Ok(entries) => return Ok(entries),
+            Err(err) if err.raw_os_error() == Some(35) => {
+                last_error = Some(err);
+                thread::sleep(Duration::from_millis(5));
+            }
+            Err(err) => return Err(err).with_context(|| format!("read dir {}", dir.display())),
+        }
+    }
+    Err(last_error.expect("read_dir retry error"))
+        .with_context(|| format!("read dir {}", dir.display()))
 }
 
 #[cfg(test)]

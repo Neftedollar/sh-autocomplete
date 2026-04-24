@@ -865,7 +865,7 @@ fn send_request(
         .map(|config| config.daemon_timeout_ms)
         .unwrap_or_else(|_| AppConfig::default().daemon_timeout_ms);
     let timeout = request_timeout_for_action(action, timeout_ms);
-    let mut stream = UnixStream::connect(&paths.socket_file).context("connect to daemon socket")?;
+    let mut stream = connect_with_retry(&paths.socket_file, timeout)?;
     stream.set_read_timeout(Some(timeout)).ok();
     stream.set_write_timeout(Some(timeout)).ok();
     let request = serde_json::json!({ "action": action, "payload": payload });
@@ -880,10 +880,28 @@ fn send_request(
     Ok(serde_json::from_str(&response)?)
 }
 
-fn wait_for_socket(path: &PathBuf, timeout: Duration) -> bool {
+fn connect_with_retry(path: &Path, timeout: Duration) -> Result<UnixStream> {
+    let started = Instant::now();
+    let mut last_error = None;
+    while started.elapsed() < timeout {
+        match UnixStream::connect(path) {
+            Ok(stream) => return Ok(stream),
+            Err(err) => {
+                last_error = Some(err);
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+    match last_error {
+        Some(err) => Err(err).context("connect to daemon socket"),
+        None => bail!("connect to daemon socket timed out"),
+    }
+}
+
+fn wait_for_socket(path: &Path, timeout: Duration) -> bool {
     let started = Instant::now();
     while started.elapsed() < timeout {
-        if path.exists() && UnixStream::connect(path).is_ok() {
+        if path.exists() {
             return true;
         }
         thread::sleep(Duration::from_millis(50));
@@ -952,18 +970,27 @@ fn current_session_info() -> SessionInfo {
 }
 
 fn daemon_is_running(paths: &AppPaths) -> bool {
-    paths.socket_file.exists() && UnixStream::connect(&paths.socket_file).is_ok()
+    if !paths.socket_file.exists() {
+        return false;
+    }
+
+    if let Ok(pid) = fs::read_to_string(&paths.pid_file) {
+        if process_exists(pid.trim()).unwrap_or(false) {
+            return true;
+        }
+    }
+
+    UnixStream::connect(&paths.socket_file).is_ok()
 }
 
 fn cleanup_stale_daemon_state(paths: &AppPaths) {
-    if paths.socket_file.exists() && UnixStream::connect(&paths.socket_file).is_err() {
-        fs::remove_file(&paths.socket_file).ok();
-    }
-
+    let mut live_pid = false;
     if paths.pid_file.exists() {
         match fs::read_to_string(&paths.pid_file) {
             Ok(pid) => {
-                if !process_exists(pid.trim()).unwrap_or(false) {
+                if process_exists(pid.trim()).unwrap_or(false) {
+                    live_pid = true;
+                } else {
                     fs::remove_file(&paths.pid_file).ok();
                 }
             }
@@ -971,6 +998,14 @@ fn cleanup_stale_daemon_state(paths: &AppPaths) {
                 fs::remove_file(&paths.pid_file).ok();
             }
         }
+    }
+
+    if live_pid {
+        return;
+    }
+
+    if paths.socket_file.exists() && UnixStream::connect(&paths.socket_file).is_err() {
+        fs::remove_file(&paths.socket_file).ok();
     }
 }
 
