@@ -215,6 +215,7 @@ impl Engine {
         let mut candidates = Vec::new();
         let mut seen = HashSet::new();
         let active = parsed.active_token.as_str();
+        let cd_empty_path_context = is_cd_path_context(parsed) && active.is_empty();
 
         if matches!(parsed.role, TokenRole::Command) {
             for (name, kind) in self.db.list_commands()? {
@@ -234,7 +235,7 @@ impl Engine {
             }
         }
 
-        if self.config.features.history_ranking {
+        if self.config.features.history_ranking && !cd_empty_path_context {
             for command in &req.history_hint.runtime_commands {
                 if let Some((insert_text, display, kind)) =
                     project_history_candidate(command, parsed)
@@ -352,6 +353,10 @@ impl Engine {
                     &mut seen,
                 )?;
             }
+        }
+
+        if cd_empty_path_context {
+            return Ok(candidates);
         }
 
         if let Some(prev_command) = req
@@ -727,11 +732,17 @@ fn position_score(parsed: &ParsedContext, candidate: &Candidate) -> f64 {
         TokenRole::Command if candidate.kind == "command" || candidate.kind == "builtin" => 1.0,
         TokenRole::Option if candidate.kind == "option" => 1.0,
         TokenRole::Path if candidate.kind == "path" => 1.0,
+        _ if is_cd_path_context(parsed) && candidate.kind == "path" => 1.0,
         TokenRole::SubcommandOrArg if candidate.kind == "module" => 1.0,
         TokenRole::SubcommandOrArg if candidate.kind == "subcommand" => 0.9,
         TokenRole::SubcommandOrArg if candidate.kind == "history" => 0.6,
         _ => 0.2,
     }
+}
+
+fn is_cd_path_context(parsed: &ParsedContext) -> bool {
+    matches!(parsed.command.as_deref(), Some("cd"))
+        || matches!(parsed.prev_token.as_deref(), Some("cd"))
 }
 
 fn source_prior(source: &str, kind: &str) -> f64 {

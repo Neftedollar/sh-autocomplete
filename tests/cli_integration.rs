@@ -153,6 +153,13 @@ fn cli_daemon_records_exact_accept_and_recent_events() {
             .any(|line| line.split('\t').collect::<Vec<_>>().get(1) == Some(&"README.md")),
         "cd completion should not suggest files:\n{cd_completion}"
     );
+    assert!(
+        !cd_completion.lines().any(|line| {
+            let fields = line.split('\t').collect::<Vec<_>>();
+            fields.get(4) == Some(&"history") || fields.get(4) == Some(&"runtime_history")
+        }),
+        "empty cd completion should prioritize current-directory paths without history noise:\n{cd_completion}"
+    );
 
     let nested_cd_completion = support::run_ok(
         &env,

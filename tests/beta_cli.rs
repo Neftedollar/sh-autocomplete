@@ -17,6 +17,19 @@ fn beta_cli_supports_disable_doctor_and_managed_rc_blocks() {
     assert!(checks.iter().any(|check| {
         check["name"].as_str() == Some("zsh_adapter") && check["ok"].as_bool() == Some(true)
     }));
+    assert!(checks.iter().any(|check| {
+        check["name"].as_str() == Some("active_shac") && check["ok"].as_bool() == Some(true)
+    }));
+
+    let zsh_doctor: Value = serde_json::from_str(&support::run_ok(
+        &env,
+        ["doctor", "--json", "--shell", "zsh"],
+    ))
+    .expect("zsh doctor json");
+    let zsh_checks = zsh_doctor.as_array().expect("zsh doctor checks");
+    assert!(zsh_checks.iter().any(|check| {
+        check["name"].as_str() == Some("zsh_adapter_version") && check["ok"].as_bool() == Some(true)
+    }));
 
     support::run_ok(&env, ["config", "set", "enabled", "off"]);
     support::run_ok(&env, ["config", "set", "ui.zsh.menu_detail", "minimal"]);

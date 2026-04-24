@@ -56,6 +56,8 @@ struct InstallArgs {
 struct DoctorArgs {
     #[arg(long)]
     json: bool,
+    #[arg(long, value_enum)]
+    shell: Option<ShellKind>,
 }
 
 #[derive(Debug, Args)]
@@ -342,7 +344,7 @@ fn index_action(paths: &AppPaths, action: IndexAction) -> Result<()> {
 fn doctor(paths: &AppPaths, args: DoctorArgs) -> Result<()> {
     cleanup_stale_daemon_state(paths);
     let config = AppConfig::load(paths).unwrap_or_default();
-    let checks = vec![
+    let mut checks = vec![
         doctor_check(
             "config_file",
             paths.config_file.exists(),
@@ -358,12 +360,12 @@ fn doctor(paths: &AppPaths, args: DoctorArgs) -> Result<()> {
             paths.socket_file.exists(),
             paths.socket_file.display().to_string(),
         ),
+        doctor_check("pid_file", paths.pid_file.exists(), pid_file_detail(paths)),
         doctor_check(
-            "pid_file",
-            paths.pid_file.exists(),
-            paths.pid_file.display().to_string(),
+            "daemon_running",
+            daemon_is_running(paths),
+            daemon_detail(paths),
         ),
-        doctor_check("daemon_running", daemon_is_running(paths), String::new()),
         doctor_check(
             "zsh_adapter",
             paths.shell_dir.join("shac.zsh").exists(),
@@ -385,13 +387,41 @@ fn doctor(paths: &AppPaths, args: DoctorArgs) -> Result<()> {
             "SHAC_DISABLE unset".to_string(),
         ),
         doctor_check(
+            "active_shac",
+            true,
+            std::env::current_exe()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|err| err.to_string()),
+        ),
+        doctor_check(
             "shacd_binary",
             daemon_binary_path().is_ok(),
             daemon_binary_path()
                 .map(|path| path.display().to_string())
                 .unwrap_or_else(|err| err.to_string()),
         ),
+        doctor_check(
+            "daemon_timeout_ms",
+            config.daemon_timeout_ms >= 20,
+            config.daemon_timeout_ms.to_string(),
+        ),
+        doctor_check("zsh_menu_detail", true, config.ui.zsh.menu_detail.clone()),
+        doctor_check(
+            "zsh_menu_metadata",
+            true,
+            format!(
+                "kind={} source={} description={} max_items={} width={}",
+                config.ui.zsh.show_kind,
+                config.ui.zsh.show_source,
+                config.ui.zsh.show_description,
+                config.ui.zsh.max_items,
+                config.ui.zsh.max_description_width
+            ),
+        ),
     ];
+    if matches!(args.shell, Some(ShellKind::Zsh)) {
+        checks.extend(zsh_doctor_checks(paths)?);
+    }
     if args.json {
         println!("{}", serde_json::to_string_pretty(&checks)?);
     } else {
@@ -409,6 +439,88 @@ fn doctor(paths: &AppPaths, args: DoctorArgs) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn pid_file_detail(paths: &AppPaths) -> String {
+    match fs::read_to_string(&paths.pid_file) {
+        Ok(pid) => format!("{} pid={}", paths.pid_file.display(), pid.trim()),
+        Err(_) => paths.pid_file.display().to_string(),
+    }
+}
+
+fn daemon_detail(paths: &AppPaths) -> String {
+    let pid = fs::read_to_string(&paths.pid_file)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "unknown".to_string());
+    format!("socket={} pid={pid}", paths.socket_file.display())
+}
+
+fn zsh_doctor_checks(paths: &AppPaths) -> Result<Vec<serde_json::Value>> {
+    let script = paths.shell_dir.join("shac.zsh");
+    let mut checks = Vec::new();
+    checks.push(doctor_check(
+        "zsh_adapter_version",
+        adapter_contains_owned_widget(&script),
+        "owned-widget-v1".to_string(),
+    ));
+
+    if !command_available("zsh") {
+        checks.push(doctor_check(
+            "zsh_binding_smoke",
+            false,
+            "zsh not found".to_string(),
+        ));
+        return Ok(checks);
+    }
+
+    let smoke = Command::new("zsh")
+        .arg("-fic")
+        .arg(format!(
+            "source {}; print -r -- \"tab=$(bindkey '^I') space=$(bindkey ' ') ctrl_f=$(bindkey '^F') fn_tab=${{+functions[_shac_tab_widget]}} fn_space=${{+functions[_shac_space_widget]}} detail=${{_shac_ui_menu_detail:-}}\"",
+            shell_escape(&script.to_string_lossy())
+        ))
+        .output()
+        .context("run zsh binding smoke")?;
+    let stdout = String::from_utf8_lossy(&smoke.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&smoke.stderr).trim().to_string();
+    let detail = if stderr.is_empty() {
+        stdout.clone()
+    } else {
+        format!("{stdout} stderr={stderr}")
+    };
+    checks.push(doctor_check(
+        "zsh_binding_smoke",
+        smoke.status.success()
+            && stdout.contains("_shac_tab_widget")
+            && stdout.contains("_shac_space_widget")
+            && stdout.contains("_shac_forward_char_widget")
+            && stdout.contains("fn_tab=1")
+            && stdout.contains("fn_space=1"),
+        detail,
+    ));
+    Ok(checks)
+}
+
+fn adapter_contains_owned_widget(path: &Path) -> bool {
+    fs::read_to_string(path)
+        .map(|content| {
+            content.contains("_shac_tab_widget") && content.contains("_shac_space_widget")
+        })
+        .unwrap_or(false)
+}
+
+fn command_available(command: &str) -> bool {
+    Command::new("sh")
+        .arg("-c")
+        .arg(format!(
+            "command -v {} >/dev/null 2>&1",
+            shell_escape(command)
+        ))
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
 }
 
 fn doctor_check(name: &str, ok: bool, detail: String) -> serde_json::Value {
