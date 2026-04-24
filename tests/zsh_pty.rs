@@ -63,7 +63,7 @@ send("shac reindex\n", 1.2)
 send("echo pty-manual-check\n", 0.5)
 tab_output = send("pyt\t", 1.1)
 sys.stdout.buffer.write(tab_output)
-send("\n", 1.1)
+send("\n\n", 1.1)
 send("\x1b[200~echo pty-exact-paste\x1b[201~\n", 0.8)
 send("exit\n", 0.5)
 
@@ -316,7 +316,7 @@ send("source " + env["SHAC_ZSH"] + "\n", 0.5)
 send("shac reindex\n", 1.2)
 tab_output = send("python3 -\t", 1.1)
 sys.stdout.buffer.write(tab_output)
-send("\n", 1.1)
+send("\n\n", 1.1)
 send("exit\n", 0.5)
 
 deadline = time.time() + 3.0

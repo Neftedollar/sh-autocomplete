@@ -66,6 +66,53 @@ assert_eq "$_shac_menu_open" "0" "close menu clears open flag"
     );
 }
 
+#[test]
+fn zsh_menu_commit_accepts_without_running() {
+    if !support::command_available("zsh") {
+        eprintln!("skipping zsh function tests: zsh is unavailable");
+        return;
+    }
+
+    run_zsh(
+        r#"
+BUFFER="python3 -"
+CURSOR=9
+_shac_last_request_id="42"
+_shac_menu_item_keys=("python3 -m")
+_shac_menu_insert_texts=("-m")
+_shac_menu_displays=("-m")
+_shac_menu_kinds=("option")
+_shac_menu_sources=("builtin-index")
+_shac_menu_descriptions=("Run a library module as a script")
+
+_shac_open_menu
+assert_eq "$BUFFER" "python3 -m" "open menu previews selected option"
+_shac_space_widget
+assert_eq "$BUFFER" "python3 -m " "enter commits -m and adds required space"
+assert_eq "$CURSOR" "11" "commit cursor after inserted space"
+assert_eq "$_shac_menu_open" "0" "commit closes menu"
+assert_eq "$_shac_last_accepted_item_key" "python3 -m" "commit keeps accepted key"
+assert_eq "$_shac_input_provenance" "accepted_completion" "commit keeps accepted provenance"
+
+BUFFER="pyt"
+CURSOR=3
+_shac_last_request_id="43"
+_shac_menu_item_keys=("python3")
+_shac_menu_insert_texts=("python3")
+_shac_menu_displays=("python3")
+_shac_menu_kinds=("command")
+_shac_menu_sources=("path_index")
+_shac_menu_descriptions=("Python interpreter")
+
+_shac_open_menu
+_shac_forward_char_widget
+assert_eq "$BUFFER" "python3" "right commits command without extra space"
+assert_eq "$CURSOR" "7" "right commit cursor"
+assert_eq "$_shac_menu_open" "0" "right commit closes menu"
+"#,
+    );
+}
+
 fn run_zsh(body: &str) {
     let script_path = std::env::current_dir()
         .expect("current dir")

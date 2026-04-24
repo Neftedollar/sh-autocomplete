@@ -174,6 +174,70 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
     _shac_completion_edited=0
   }
 
+  function _shac_selected_kind() {
+    REPLY="${_shac_menu_kinds[$_shac_menu_selected_index]:-}"
+  }
+
+  function _shac_selected_source() {
+    REPLY="${_shac_menu_sources[$_shac_menu_selected_index]:-}"
+  }
+
+  function _shac_selected_item_key() {
+    REPLY="${_shac_menu_item_keys[$_shac_menu_selected_index]:-}"
+  }
+
+  function _shac_selected_requires_more_input() {
+    local kind="$1"
+    local insert_text="$2"
+
+    case "$kind" in
+      option)
+        [[ "$insert_text" == "-m" || "$insert_text" == "-c" || "$insert_text" == --*= ]] && return 0
+        return 1
+        ;;
+      subcommand|module)
+        return 0
+        ;;
+      *)
+        return 1
+        ;;
+    esac
+  }
+
+  function _shac_selected_is_full_line() {
+    local source="$1"
+    local item_key="$2"
+    [[ "$source" == "history" || "$source" == "runtime_history" || "$source" == "transition" ]] && [[ "$item_key" == *" "* ]]
+  }
+
+  function _shac_buffer_ends_with_space() {
+    [[ "$BUFFER" == *[[:space:]] ]]
+  }
+
+  function _shac_commit_selected_item() {
+    local add_space="${1:-auto}"
+    if (( !_shac_menu_open )); then
+      return 1
+    fi
+
+    local index="$_shac_menu_selected_index"
+    local insert_text="${_shac_menu_insert_texts[$index]}"
+    local kind="${_shac_menu_kinds[$index]}"
+
+    _shac_apply_selected_item "$index" "$_shac_menu_original_buffer" "$_shac_menu_original_cursor"
+    if [[ "$add_space" == "always" ]] || { [[ "$add_space" == "auto" ]] && _shac_selected_requires_more_input "$kind" "$insert_text"; }; then
+      if ! _shac_buffer_ends_with_space; then
+        BUFFER="${BUFFER} "
+        CURSOR=$(( CURSOR + 1 ))
+      fi
+    fi
+    _shac_close_menu 0
+    if zle; then
+      zle -R
+    fi
+    return 0
+  }
+
   function _shac_render_menu() {
     local total="${#_shac_menu_item_keys[@]}"
     if (( total == 0 )); then
@@ -437,7 +501,8 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
 
   function _shac_forward_char_widget() {
     if (( _shac_menu_open )); then
-      _shac_close_menu 1
+      _shac_commit_selected_item never
+      return $?
     fi
     zle _shac_orig_forward_char -- "$@"
   }
@@ -459,14 +524,23 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
 
   function _shac_accept_line_widget() {
     if (( _shac_menu_open )); then
-      _shac_preexec_provenance="accepted_completion"
-      _shac_preexec_provenance_source="unknown"
-      _shac_preexec_provenance_confidence="unknown"
-      _shac_preexec_request_id="$_shac_last_request_id"
-      _shac_preexec_item_key="$_shac_last_accepted_item_key"
-      _shac_preexec_rank="$_shac_last_accepted_rank"
-      _shac_close_menu 0
-      zle _shac_orig_accept_line -- "$@"
+      local source item_key
+      _shac_selected_source
+      source="$REPLY"
+      _shac_selected_item_key
+      item_key="$REPLY"
+      if _shac_selected_is_full_line "$source" "$item_key"; then
+        _shac_preexec_provenance="accepted_completion"
+        _shac_preexec_provenance_source="unknown"
+        _shac_preexec_provenance_confidence="unknown"
+        _shac_preexec_request_id="$_shac_last_request_id"
+        _shac_preexec_item_key="$_shac_last_accepted_item_key"
+        _shac_preexec_rank="$_shac_last_accepted_rank"
+        _shac_close_menu 0
+        zle _shac_orig_accept_line -- "$@"
+        return $?
+      fi
+      _shac_commit_selected_item auto
       return $?
     fi
 
@@ -502,6 +576,14 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
       _shac_preexec_rank=""
     fi
     zle _shac_orig_accept_line -- "$@"
+  }
+
+  function _shac_space_widget() {
+    if (( _shac_menu_open )); then
+      _shac_commit_selected_item always
+      return $?
+    fi
+    zle _shac_orig_self_insert -- "$@"
   }
 
   function _shac_record_precmd() {
@@ -564,6 +646,8 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
 
     zle -A self-insert _shac_orig_self_insert
     zle -N self-insert _shac_self_insert_widget
+    zle -N _shac_space_widget _shac_space_widget
+    bindkey ' ' _shac_space_widget
     zle -A backward-delete-char _shac_orig_backward_delete_char
     zle -N backward-delete-char _shac_backward_delete_char_widget
     zle -A delete-char _shac_orig_delete_char
@@ -585,6 +669,7 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
     zle -A expand-or-complete _shac_orig_expand_or_complete
     zle -N _shac_tab_widget _shac_tab_widget
     bindkey '^I' _shac_tab_widget
+    bindkey '^F' _shac_forward_char_widget
     if zle -la reverse-menu-complete >/dev/null 2>&1; then
       zle -A reverse-menu-complete _shac_orig_reverse_menu_complete
     fi
