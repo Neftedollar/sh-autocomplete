@@ -29,6 +29,20 @@
 cargo build
 ```
 
+## Homebrew
+
+The formula always points to a stable tag.
+
+```bash
+brew install Neftedollar/sh-autocomplete/shac
+```
+
+For local formula testing from this checkout:
+
+```bash
+brew install --build-from-source ./Formula/shac.rb
+```
+
 ## Beta quickstart
 
 Recommended beta path is `zsh`; `bash` is supported as best-effort list completion.

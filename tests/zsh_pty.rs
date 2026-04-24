@@ -1,6 +1,7 @@
 mod support;
 
 use std::process::Command;
+use std::{fs, os::unix::fs::PermissionsExt, path::Path};
 
 use serde_json::Value;
 
@@ -16,6 +17,7 @@ fn zsh_pty_records_manual_accept_and_exact_paste() {
     support::run_ok(&env, ["install", "--shell", "zsh"]);
     support::assert_path_exists(&env.zsh_script_path());
     let _daemon = env.spawn_daemon();
+    let zsh_path = deterministic_zsh_path(&env);
 
     let script = r#"
 import os
@@ -25,6 +27,7 @@ import sys
 import time
 
 env = os.environ.copy()
+env["PATH"] = env["ZSH_PATH"]
 pid, fd = pty.fork()
 if pid == 0:
     os.execvpe("zsh", ["zsh", "-f"], env)
@@ -57,7 +60,6 @@ send("echo pty-manual-check\n", 0.5)
 tab_output = send("pyt\t", 1.1)
 sys.stdout.buffer.write(tab_output)
 send("\n", 1.1)
-send("exit()\n", 0.5)
 send("\x1b[200~echo pty-exact-paste\x1b[201~\n", 0.8)
 send("exit\n", 0.5)
 
@@ -84,6 +86,7 @@ sys.exit(1)
         .arg("-c")
         .arg(script)
         .env("SHAC_ZSH", env.zsh_script_path())
+        .env("ZSH_PATH", zsh_path)
         .env("TERM", "xterm-256color");
     let output = python.output().expect("run python pty smoke");
     assert!(
@@ -144,6 +147,7 @@ fn zsh_pty_cancel_menu_does_not_record_accept() {
     support::run_ok(&env, ["install", "--shell", "zsh"]);
     support::assert_path_exists(&env.zsh_script_path());
     let _daemon = env.spawn_daemon();
+    let zsh_path = deterministic_zsh_path(&env);
 
     let script = r#"
 import os
@@ -153,6 +157,7 @@ import sys
 import time
 
 env = os.environ.copy()
+env["PATH"] = env["ZSH_PATH"]
 pid, fd = pty.fork()
 if pid == 0:
     os.execvpe("zsh", ["zsh", "-f"], env)
@@ -211,6 +216,7 @@ sys.exit(1)
         .arg("-c")
         .arg(script)
         .env("SHAC_ZSH", env.zsh_script_path())
+        .env("ZSH_PATH", zsh_path)
         .env("TERM", "xterm-256color");
     let output = python.output().expect("run python pty smoke");
     assert!(
@@ -243,4 +249,23 @@ sys.exit(1)
             .any(|event| event["provenance"].as_str() == Some("accepted_completion")),
         "cancelled menu should not record accepted completion: {recent}"
     );
+}
+
+fn deterministic_zsh_path(env: &support::TestEnv) -> String {
+    let fake_bin = env.root.join("fake-bin");
+    fs::create_dir_all(&fake_bin).expect("create fake bin");
+    write_executable(&fake_bin.join("python3"), "#!/bin/sh\nexit 0\n");
+    write_executable(&fake_bin.join("python3-config"), "#!/bin/sh\nexit 0\n");
+    format!(
+        "{}:{}:/usr/bin:/bin",
+        fake_bin.display(),
+        env.bin_dir.display()
+    )
+}
+
+fn write_executable(path: &Path, content: &str) {
+    fs::write(path, content).expect("write executable");
+    let mut permissions = fs::metadata(path).expect("metadata").permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(path, permissions).expect("set executable bit");
 }
