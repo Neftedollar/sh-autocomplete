@@ -1,0 +1,6 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Q&A / General Questions
+    # TODO: replace with the GitHub Discussions Q&A category URL once AGE-20 enables Discussions
+    url: https://github.com/Neftedollar/sh-autocomplete/discussions
+    about: For general questions, use GitHub Discussions.

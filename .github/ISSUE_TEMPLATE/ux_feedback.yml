@@ -1,0 +1,68 @@
+name: UX Feedback
+description: Share thoughts on discoverability, suggestion quality, and ergonomics.
+title: "[UX]: "
+labels:
+  - beta-feedback
+body:
+  - type: dropdown
+    id: install-method
+    attributes:
+      label: How did you install shac?
+      options:
+        - "Homebrew via Neftedollar/homebrew-shac"
+        - "curl | sh"
+        - "Source build"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: usage-duration
+    attributes:
+      label: How long have you been using shac?
+      options:
+        - Less than a day
+        - 1–7 days
+        - 1–4 weeks
+        - More than a month
+    validations:
+      required: true
+
+  - type: textarea
+    id: top-commands
+    attributes:
+      label: Top 3 commands you typed most
+      description: The commands you use most frequently where shac's suggestions showed up.
+      placeholder: |
+        1. git
+        2. docker
+        3. kubectl
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected-vs-actual
+    attributes:
+      label: I expected X but got Y
+      description: Describe any moments where shac's suggestions surprised or disappointed you.
+      placeholder: "I expected `git checkout` completions to show branch names, but got file paths instead."
+    validations:
+      required: false
+
+  - type: dropdown
+    id: would-recommend
+    attributes:
+      label: Would you recommend shac to a colleague?
+      options:
+        - "Yes"
+        - "No"
+        - "Maybe"
+    validations:
+      required: true
+
+  - type: textarea
+    id: anything-else
+    attributes:
+      label: Anything else?
+      description: General ergonomics notes, discoverability issues, or ideas.
+    validations:
+      required: false
