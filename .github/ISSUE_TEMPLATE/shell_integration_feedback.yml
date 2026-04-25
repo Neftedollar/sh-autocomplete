@@ -1,0 +1,68 @@
+name: Shell Integration Feedback
+description: Share feedback on completion hooks, latency, and conflicts with other tools.
+title: "[Integration]: "
+labels:
+  - beta-feedback
+body:
+  - type: dropdown
+    id: shell
+    attributes:
+      label: Shell
+      options:
+        - zsh
+        - bash
+        - fish
+    validations:
+      required: true
+
+  - type: dropdown
+    id: shell-framework
+    attributes:
+      label: Shell framework
+      options:
+        - oh-my-zsh
+        - prezto
+        - starship
+        - none
+        - other (describe below)
+    validations:
+      required: true
+
+  - type: textarea
+    id: other-completion-tools
+    attributes:
+      label: Other completion tools running
+      description: List any other completion or suggestion tools active in your shell.
+      placeholder: "fzf, zsh-autosuggestions, fish abbr, ..."
+    validations:
+      required: false
+
+  - type: dropdown
+    id: perceived-latency
+    attributes:
+      label: Perceived latency on common commands
+      description: How does shac's completion speed feel on everyday commands?
+      options:
+        - Instant (< 50 ms)
+        - Acceptable (50–200 ms)
+        - Noticeable (200–500 ms)
+        - Slow (> 500 ms)
+    validations:
+      required: true
+
+  - type: textarea
+    id: key-conflicts
+    attributes:
+      label: Key conflicts
+      description: Is shac taking over key bindings you want to use for something else?
+      placeholder: "shac intercepts Ctrl+Space which I use for fzf"
+    validations:
+      required: false
+
+  - type: textarea
+    id: additional-context
+    attributes:
+      label: Additional context
+      description: Any other integration issues, edge cases, or suggestions.
+    validations:
+      required: false
