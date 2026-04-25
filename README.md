@@ -41,6 +41,8 @@ The formula always points to a stable tag.
 brew install Neftedollar/shac/shac
 ```
 
+[Leave beta feedback →](https://github.com/Neftedollar/sh-autocomplete/discussions)
+
 For local formula testing from this checkout:
 
 ```bash
