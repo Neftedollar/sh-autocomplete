@@ -1,6 +1,11 @@
 blank_issues_enabled: false
 contact_links:
   - name: Q&A / General Questions
-    # TODO: replace with the GitHub Discussions Q&A category URL once AGE-20 enables Discussions
-    url: https://github.com/Neftedollar/sh-autocomplete/discussions
-    about: For general questions, use GitHub Discussions.
+    url: https://github.com/Neftedollar/sh-autocomplete/discussions/categories/q-a
+    about: For general questions, use GitHub Discussions Q&A.
+  - name: Beta Feedback
+    url: https://github.com/Neftedollar/sh-autocomplete/discussions/categories/beta-feedback
+    about: Share open-ended beta feedback in Discussions instead of opening an issue.
+  - name: Ideas / Feature Requests
+    url: https://github.com/Neftedollar/sh-autocomplete/discussions/categories/ideas
+    about: Pitch ideas and feature requests in Discussions before opening an issue.
