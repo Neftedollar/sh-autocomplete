@@ -31,6 +31,7 @@ const PACKAGE_JSON_MAX_BYTES: u64 = 1_048_576; // 1 MiB
 const SSH_FILE_MAX_BYTES: u64 = 1_048_576; // 1 MiB
 
 use anyhow::{Context, Result};
+use rusqlite;
 
 use crate::config::{AppConfig, AppPaths};
 use crate::context::{self, ParsedContext, TokenRole};
@@ -520,7 +521,14 @@ impl Engine {
             ArgType::Host => {
                 self.collect_ssh_host_candidates(active, candidates, seen)?;
             }
-            ArgType::Resource | ArgType::Image | ArgType::Workspace | ArgType::Target => {
+            ArgType::Workspace => {
+                // Primary: recent VS Code workspaces from the global store.
+                self.collect_workspace_candidates(active, candidates, seen)?;
+                // Secondary: filesystem path completion so `code ~/d<Tab>` also
+                // surfaces directories the user is typing directly.
+                self.collect_path_candidates(active, cwd, true, candidates, seen)?;
+            }
+            ArgType::Resource | ArgType::Image | ArgType::Target => {
                 // Stubs for now — implementations land in subsequent PRs.
             }
             ArgType::Subcommand | ArgType::Flag | ArgType::None => {
@@ -775,6 +783,105 @@ impl Engine {
             );
             emitted += 1;
         }
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // VS Code workspace collector (§7.9)
+    // -----------------------------------------------------------------------
+
+    /// Collect VS Code recent-workspace candidates.
+    ///
+    /// Strategy:
+    /// 1. Find VS Code's recent-workspaces store (SQLite DB preferred; JSON
+    ///    fallback for older installations).
+    /// 2. Parse out the recent folder/workspace paths.
+    /// 3. Filter out stale entries that no longer exist on disk.
+    /// 4. Filter by `active` prefix matched against the basename — users type
+    ///    project name, not full path.
+    /// 5. Emit candidates with `insert_text` = `~`-shortened path.
+    fn collect_workspace_candidates(
+        &self,
+        active: &str,
+        candidates: &mut Vec<Candidate>,
+        seen: &mut HashSet<String>,
+    ) -> Result<()> {
+        let home = dirs::home_dir();
+
+        // Locate and parse recent workspaces.
+        let mut paths: Vec<PathBuf> = Vec::new();
+        for storage_path in vscode_storage_paths() {
+            let parsed = parse_vscode_recent_workspaces(&storage_path);
+            if !parsed.is_empty() {
+                paths = parsed;
+                break;
+            }
+        }
+
+        // Filter: must exist on disk, must not be a plain file used as a
+        // recently-opened item (we want folders / .code-workspace bundles).
+        // Also apply the active-prefix filter against the basename.
+        let limit = self.config.max_results.saturating_mul(2).max(8);
+        let mut emitted = 0usize;
+
+        for path in paths {
+            if emitted >= limit {
+                break;
+            }
+
+            // Skip entries that have gone missing.
+            if !path.exists() {
+                continue;
+            }
+
+            let path_str = path.to_string_lossy();
+
+            // Build the basename for prefix-filtering.
+            let basename = path
+                .file_name()
+                .map(|n| n.to_string_lossy())
+                .unwrap_or_else(|| path_str.clone());
+
+            // Prefix filter against the basename (project name).
+            // Empty `active` passes all; non-empty must prefix-match basename.
+            if !active.is_empty() && !basename.starts_with(active) {
+                continue;
+            }
+
+            // Compute ~-shortened insert_text.
+            let insert_text = shorten_with_home(&path_str, home.as_deref());
+
+            // Display: "basename · parent" to help scan.
+            let parent_str = path
+                .parent()
+                .map(|p| shorten_with_home(&p.to_string_lossy(), home.as_deref()))
+                .unwrap_or_default();
+
+            let is_workspace_bundle = path
+                .extension()
+                .map(|e| e.eq_ignore_ascii_case("code-workspace"))
+                .unwrap_or(false);
+
+            let display = if is_workspace_bundle {
+                format!("{basename} [workspace bundle] \u{00b7} {parent_str}")
+            } else {
+                format!("{basename} \u{00b7} {parent_str}")
+            };
+
+            push_candidate(
+                candidates,
+                seen,
+                Candidate {
+                    insert_text: insert_text.clone(),
+                    display,
+                    kind: "workspace".to_string(),
+                    source: "workspace".to_string(),
+                    description: Some("recent VS Code workspace".to_string()),
+                },
+            );
+            emitted += 1;
+        }
+
         Ok(())
     }
 
@@ -1128,6 +1235,7 @@ fn position_score(parsed: &ParsedContext, candidate: &Candidate) -> f64 {
         _ if candidate.kind == "branch" => 1.0,
         _ if candidate.kind == "npm_script" => 1.0,
         _ if candidate.kind == "ssh_host" => 1.0,
+        _ if candidate.kind == "workspace" => 1.0,
         TokenRole::SubcommandOrArg if candidate.kind == "module" => 1.0,
         TokenRole::SubcommandOrArg if candidate.kind == "subcommand" => 0.9,
         TokenRole::SubcommandOrArg if candidate.kind == "history" => 0.6,
@@ -1154,6 +1262,7 @@ fn source_prior(source: &str, kind: &str) -> f64 {
         ("git_branch", "branch") => 0.85,
         ("npm_script", _) => 0.85,
         ("ssh_host", _) => 0.85,
+        ("workspace", _) => 0.85,
         _ => 0.4,
     }
 }
@@ -1377,6 +1486,195 @@ fn ssh_config_path() -> Option<PathBuf> {
 /// cannot be determined.
 fn known_hosts_path() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".ssh").join("known_hosts"))
+}
+
+// ---------------------------------------------------------------------------
+// VS Code workspace storage helpers (§7.9)
+// ---------------------------------------------------------------------------
+
+/// Return candidate VS Code storage paths in priority order.
+///
+/// Priority:
+/// 1. SQLite DB (`state.vscdb`) — the authoritative store in VS Code ≥ 1.80.
+/// 2. JSON file (`storage.json`) — legacy / fallback for older installations.
+///
+/// macOS paths are tried before Linux (`~/.config`) paths. Returns all that
+/// conceptually exist; the caller tries each in order and stops at the first
+/// that yields non-empty results.
+fn vscode_storage_paths() -> Vec<PathBuf> {
+    let Some(home) = dirs::home_dir() else {
+        return Vec::new();
+    };
+
+    // macOS: ~/Library/Application Support/Code/...
+    // Linux: ~/.config/Code/...
+    let candidates: &[&[&str]] = &[
+        &["Library", "Application Support", "Code", "User", "globalStorage", "state.vscdb"],
+        &["Library", "Application Support", "Code", "User", "globalStorage", "storage.json"],
+        &[".config", "Code", "User", "globalStorage", "state.vscdb"],
+        &[".config", "Code", "User", "globalStorage", "storage.json"],
+    ];
+
+    candidates
+        .iter()
+        .map(|parts| parts.iter().fold(home.clone(), |p, s| p.join(s)))
+        .collect()
+}
+
+/// Parse a VS Code storage file and return recent workspace/folder paths.
+///
+/// Supports two formats:
+/// - **SQLite** (`state.vscdb`): queries `ItemTable` for the key
+///   `history.recentlyOpenedPathsList`; the value is JSON.
+/// - **JSON** (`storage.json`): reads the file and looks for
+///   `history.recentlyOpenedPathsList` under the top-level object.
+///
+/// In both cases, entries are JSON objects with optional keys:
+/// - `folderUri` — a folder opened directly (`file:///path` or remote URI).
+/// - `workspace` / `workspace.configPath` — a `.code-workspace` bundle.
+/// - `fileUri` — a single file (not a workspace); **skipped**.
+///
+/// Remote entries (those with a `remoteAuthority` key, or whose URI scheme is
+/// not `file://`) are **skipped** for v1.
+///
+/// `file:///` URIs are decoded (percent-decoded) and the scheme prefix is
+/// stripped to yield a plain `PathBuf`.
+///
+/// Returns an empty Vec if the file is missing, unreadable, or malformed.
+fn parse_vscode_recent_workspaces(path: &Path) -> Vec<PathBuf> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    let json_str: String = if ext == "vscdb" {
+        // SQLite path — use rusqlite (already in deps).
+        match rusqlite::Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        ) {
+            Ok(conn) => {
+                match conn.query_row(
+                    "SELECT value FROM ItemTable WHERE key = 'history.recentlyOpenedPathsList'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                ) {
+                    Ok(val) => val,
+                    Err(_) => return Vec::new(),
+                }
+            }
+            Err(_) => return Vec::new(),
+        }
+    } else {
+        // JSON path.
+        match fs::read_to_string(path) {
+            Ok(text) => {
+                // The JSON file may embed the history list under the key
+                // "history.recentlyOpenedPathsList" at top level.
+                let top: serde_json::Value = match serde_json::from_str(&text) {
+                    Ok(v) => v,
+                    Err(_) => return Vec::new(),
+                };
+                match top
+                    .get("history.recentlyOpenedPathsList")
+                    .and_then(|v| v.as_str())
+                {
+                    Some(s) => s.to_string(),
+                    None => {
+                        // The JSON file might itself be the history object.
+                        text
+                    }
+                }
+            }
+            Err(_) => return Vec::new(),
+        }
+    };
+
+    // Parse the JSON payload.
+    let root: serde_json::Value = match serde_json::from_str(&json_str) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+
+    let entries = match root.get("entries").and_then(|v| v.as_array()) {
+        Some(arr) => arr,
+        None => return Vec::new(),
+    };
+
+    let mut out = Vec::new();
+    for entry in entries {
+        let obj = match entry.as_object() {
+            Some(o) => o,
+            None => continue,
+        };
+
+        // Skip remote workspaces (v1 — local only).
+        if obj.contains_key("remoteAuthority") {
+            continue;
+        }
+
+        // Prefer folderUri; fall back to workspace.configPath for bundles.
+        let raw_uri = if let Some(v) = obj.get("folderUri").and_then(|v| v.as_str()) {
+            v
+        } else if let Some(ws) = obj.get("workspace").and_then(|v| v.as_object()) {
+            match ws.get("configPath").and_then(|v| v.as_str()) {
+                Some(s) => s,
+                None => continue,
+            }
+        } else {
+            // fileUri or unrecognised — skip.
+            continue;
+        };
+
+        // Only handle local file:// URIs.
+        if !raw_uri.starts_with("file://") {
+            continue;
+        }
+
+        // Strip scheme and percent-decode the path component.
+        let encoded = raw_uri.trim_start_matches("file://");
+        let decoded = percent_decode_uri(encoded);
+        if decoded.is_empty() {
+            continue;
+        }
+        out.push(PathBuf::from(decoded));
+    }
+    out
+}
+
+/// Minimal percent-decoder for `file://` URI path components.
+///
+/// Only handles the subset of percent-encoded characters that appear in
+/// VS Code workspace URIs in practice (`%20` for space, `%2B`, etc.).
+/// Invalid sequences are passed through as-is (best-effort).
+fn percent_decode_uri(encoded: &str) -> String {
+    let bytes = encoded.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = (hex_nibble(bytes[i + 1]), hex_nibble(bytes[i + 2])) {
+                out.push((hi << 4) | lo);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Convert an ASCII hex digit to its nibble value.
+#[inline]
+fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
 }
 
 /// Parse `~/.ssh/config` and extract concrete host names (aliases).
@@ -2180,5 +2478,65 @@ mod tests {
             hosts.contains(&"realhost.example.com".to_string()),
             "plain host must appear: {hosts:?}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // VS Code workspace parser unit tests (§7.9)
+    // -----------------------------------------------------------------------
+
+    /// Build a temporary SQLite `state.vscdb` with the given JSON payload as
+    /// the `history.recentlyOpenedPathsList` value.
+    fn write_test_vscdb(dir: &std::path::Path, payload: &str) -> std::path::PathBuf {
+        let db_path = dir.join("state.vscdb");
+        let conn = rusqlite::Connection::open(&db_path).expect("open test vscdb");
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS ItemTable (key TEXT UNIQUE, value TEXT);",
+        )
+        .expect("create table");
+        conn.execute(
+            "INSERT INTO ItemTable (key, value) VALUES ('history.recentlyOpenedPathsList', ?1)",
+            rusqlite::params![payload],
+        )
+        .expect("insert");
+        db_path
+    }
+
+    #[test]
+    fn parse_vscode_recent_workspaces_basic() {
+        let scratch = unique_tmp("shac-vsc-basic");
+        let payload = r#"{"entries":[{"folderUri":"file:///foo/alpha"},{"folderUri":"file:///foo/beta"}]}"#;
+        let db_path = write_test_vscdb(&scratch, payload);
+        let paths = parse_vscode_recent_workspaces(&db_path);
+        assert_eq!(paths.len(), 2, "expected 2 paths: {paths:?}");
+        let strs: Vec<String> = paths.iter().map(|p| p.to_string_lossy().to_string()).collect();
+        assert!(strs.iter().any(|s| s == "/foo/alpha"), "alpha missing: {strs:?}");
+        assert!(strs.iter().any(|s| s == "/foo/beta"), "beta missing: {strs:?}");
+    }
+
+    #[test]
+    fn parse_vscode_recent_workspaces_strips_file_uri_prefix() {
+        let scratch = unique_tmp("shac-vsc-strip-prefix");
+        let payload = r#"{"entries":[{"folderUri":"file:///Users/roman/dev/proj"}]}"#;
+        let db_path = write_test_vscdb(&scratch, payload);
+        let paths = parse_vscode_recent_workspaces(&db_path);
+        assert_eq!(paths.len(), 1);
+        assert_eq!(
+            paths[0].to_string_lossy().as_ref(),
+            "/Users/roman/dev/proj",
+            "file:// prefix must be stripped"
+        );
+    }
+
+    #[test]
+    fn parse_vscode_recent_workspaces_skips_remote() {
+        let scratch = unique_tmp("shac-vsc-skip-remote");
+        let payload = r#"{"entries":[
+            {"folderUri":"file:///local/proj"},
+            {"folderUri":"vscode-remote://ssh-remote%2Bserver.example.com/home/user/proj","remoteAuthority":"ssh-remote+server.example.com"}
+        ]}"#;
+        let db_path = write_test_vscdb(&scratch, payload);
+        let paths = parse_vscode_recent_workspaces(&db_path);
+        assert_eq!(paths.len(), 1, "remote entry must be skipped: {paths:?}");
+        assert_eq!(paths[0].to_string_lossy().as_ref(), "/local/proj");
     }
 }

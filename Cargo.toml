@@ -29,3 +29,4 @@ blake3 = "1"
 toml = "1.1"
 
 [dev-dependencies]
+rusqlite = { version = "0.39", features = ["bundled"] }
