@@ -708,8 +708,13 @@ fn install(paths: &AppPaths, args: InstallArgs) -> Result<()> {
             },
         );
 
+        // Open the DB once for both the import flow and the prior seeder.
+        // We seed priors regardless of `--no-import` because they're a
+        // bundled corpus, not a per-user import — without them the
+        // cold-start menu collapses to alphabetical command names.
+        let db = shac::db::AppDb::open(&paths.db_file)?;
+
         if !args.no_import {
-            let db = shac::db::AppDb::open(&paths.db_file)?;
             let opts = shac::import::ImportOpts {
                 yes: args.yes,
                 roots: shac::import::default_project_roots(),
@@ -722,6 +727,11 @@ fn install(paths: &AppPaths, args: InstallArgs) -> Result<()> {
                 Ok(summaries) => print_first_run_summary(&summaries),
                 Err(err) => eprintln!("shac: import failed: {err:#}"),
             }
+        }
+
+        match shac::priors::seed_priors_into_docs(&db) {
+            Ok(seeded) => print_priors_seeded_line(seeded),
+            Err(err) => eprintln!("shac: priors seeding failed: {err:#}"),
         }
 
         println!();
@@ -767,6 +777,21 @@ fn print_first_run_summary(summaries: &[shac::import::ImportSummary]) {
             elapsed = format_elapsed(s.elapsed),
         );
     }
+}
+
+/// First-run UX line for the bundled command priors. Renders a single
+/// `Loaded N command priors` row that follows the same visual style as
+/// [`print_first_run_summary`] (green check on TTY, plain on non-TTY).
+/// Decoupled from `ImportSummary` because priors are not a per-user import —
+/// they're a static corpus shipped in the binary.
+fn print_priors_seeded_line(count: usize) {
+    let tty = std::io::stdout().is_terminal();
+    let check = if tty { "\x1b[32m\u{2713}\x1b[0m" } else { "\u{2713}" };
+    let dim_open = if tty { "\x1b[2m" } else { "" };
+    let dim_close = if tty { "\x1b[0m" } else { "" };
+    let label = "Loaded command priors";
+    let detail = format!("{} grammar pairs", fmt_count(count));
+    println!("{check} {label:<46} {dim_open}{detail}{dim_close}");
 }
 
 /// Compact human label and detail for one [`ImportSummary`], used both by the

@@ -586,13 +586,13 @@ Status as of integration commit `e31edde` + cleanup/tests `f68ac43` + Section 7 
 - **7.12** Doctor cold-start telemetry (`feat/section-7-12-doctor-telemetry` `a5f916e`, +1 test). 3 new checks in `shac doctor`: `cold_start_paths`, `cold_start_history` (with `import_coverage_pct`), `time_to_first_accept`. Doctor name column widened `{:<18}` → `{:<22}`. README Diagnostics updated.
 - **7.13** zsh cosmetic tint for `kind=path_jump` (`feat/section-7-13-zsh-tint` `24a1183`, +1 test). Cyan tint on `[path_jump]` label and leading `→` arrow in `_shac_render_metadata_label` / `_shac_render_menu`. Respects `SHAC_NO_COLOR=1`. README zsh menu UI section updated.
 - **7.15** Clippy clean (`feat/section-7-15-clippy` `ac1497a`). All 4 pre-existing lib warnings cleared (`Ok(x?)`, manual suffix stripping, `clone() → slice::from_ref`, borrowed-expression-in-test) + 9 auto-fixed `needless_borrows_for_generic_args` test warnings. `cargo clippy --all-targets` zero-warning on this branch tip.
+- **7.2** Bundled command priors (`feat/section-7-2-priors`, +6 tests). `src/priors.rs` ships a hand-curated static corpus of ~60 `(command, item_type, item_value, description)` rows covering `git`, `npm`, `pnpm`, `yarn`, `cargo`, `docker`, `kubectl`, `gh`, `brew`, `make`, `python`/`python3`, `pip`. `seed_priors_into_docs(&db)` writes them with `source = "priors"` via `replace_docs_for_command` (idempotent). `shac install` seeds priors after `run_full_import` and prints `Loaded N command priors`. README Current MVP updated.
 
 ### ⏳ Pending — High priority (cold-start activation)
 
 ~~**7.1 First-run UX printer (polished)**~~ — ✅ Done (see above).
 
-**7.2 Bundled command priors**
-Static corpus of ~100 grammar pairs (`git status`, `git push origin main`, `npm install --save-dev`, ...) shipped in the binary. Critical for users without zsh-history — without it cold-start collapses to alphabetical. **New file:** `src/priors.rs` (or embedded TOML via `include_str!`). Loaded into `command_docs` on first install via `seed_priors_into_docs(db)`. Source corpus: aggregate from public command-history datasets, redacted.
+~~**7.2 Bundled command priors**~~ — ✅ Done (see above).
 
 **7.3 `detect_tools()` + tool-aware profile loading**
 B intentionally skipped this (PLAN §B5). Detect installed CLIs (homebrew, cargo, dotnet, nvm, etc.) and load only relevant profiles into `command_docs`. Reduces noise for users without those tools. **File:** `src/import.rs::detect_tools`.
