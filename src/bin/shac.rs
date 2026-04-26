@@ -401,6 +401,58 @@ fn learning_status_check(paths: &AppPaths, config: &AppConfig) -> serde_json::Va
     doctor_check("learning_status", ok, detail)
 }
 
+/// Cold-start checks (PLAN §7.12) surface the telemetry collected during
+/// `shac install` so users can confirm their first-run import paid off:
+///
+/// - `cold_start_paths`: how many rows are in `paths_index` (zsh history
+///   replay + zoxide + project scan combined). Zero is a red flag — likely
+///   the user ran `--no-import` or all sources were missing.
+/// - `cold_start_history`: imported zsh history events count + import
+///   coverage percent (imported / total history rows).
+/// - `time_to_first_accept`: seconds between `install` and the first
+///   accepted completion. Surfaced as informational once available.
+fn cold_start_checks(paths: &AppPaths) -> Vec<serde_json::Value> {
+    let stats = match shac::db::AppDb::open(&paths.db_file).and_then(|db| db.stats()) {
+        Ok(s) => s,
+        Err(err) => {
+            return vec![doctor_check(
+                "cold_start_telemetry",
+                false,
+                format!("could not open db: {err:#}"),
+            )];
+        }
+    };
+
+    let mut checks = Vec::with_capacity(3);
+
+    let paths_ok = stats.paths_index_rows > 0;
+    let paths_detail = format!(
+        "{} entries (cwd_event + zoxide + project_scan)",
+        stats.paths_index_rows
+    );
+    checks.push(doctor_check("cold_start_paths", paths_ok, paths_detail));
+
+    let history_ok = stats.imported_history_events > 0;
+    let history_detail = format!(
+        "{} imported events ({:.1}% of history)",
+        stats.imported_history_events, stats.import_coverage_pct
+    );
+    checks.push(doctor_check(
+        "cold_start_history",
+        history_ok,
+        history_detail,
+    ));
+
+    let (ttfa_ok, ttfa_detail) = match stats.time_to_first_accept_seconds {
+        Some(secs) if secs >= 0 => (true, format!("{secs}s")),
+        Some(_) => (true, "negative — clock skew?".to_string()),
+        None => (false, "not yet — press Tab to accept a completion".to_string()),
+    };
+    checks.push(doctor_check("time_to_first_accept", ttfa_ok, ttfa_detail));
+
+    checks
+}
+
 fn doctor(paths: &AppPaths, args: DoctorArgs) -> Result<()> {
     cleanup_stale_daemon_state(paths);
     let config = AppConfig::load(paths).unwrap_or_default();
@@ -480,6 +532,7 @@ fn doctor(paths: &AppPaths, args: DoctorArgs) -> Result<()> {
         ),
     ];
     checks.push(learning_status_check(paths, &config));
+    checks.extend(cold_start_checks(paths));
     if matches!(args.shell, Some(ShellKind::Zsh)) {
         checks.extend(zsh_doctor_checks(paths)?);
     }
@@ -488,7 +541,7 @@ fn doctor(paths: &AppPaths, args: DoctorArgs) -> Result<()> {
     } else {
         for check in checks {
             println!(
-                "{:<18} {:<4} {}",
+                "{:<22} {:<4} {}",
                 check["name"].as_str().unwrap_or_default(),
                 if check["ok"].as_bool().unwrap_or(false) {
                     "ok"

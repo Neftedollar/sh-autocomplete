@@ -172,6 +172,12 @@ shac stats
 shac recent-events --limit 20
 ```
 
+`shac doctor` surfaces three cold-start telemetry checks alongside the usual config / daemon / shell-adapter checks:
+
+- `cold_start_paths`: row count in `paths_index` (zsh-history replay + zoxide + project scan combined). Zero means hybrid `cd` will fall back to local cwd children.
+- `cold_start_history`: imported zsh history events plus `import_coverage_pct` (imported / total history rows).
+- `time_to_first_accept`: seconds between `shac install` and the first accepted completion. Recorded once and never overwritten.
+
 If completion breaks, first try:
 
 ```bash
