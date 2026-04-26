@@ -187,6 +187,20 @@ impl AppDb {
                 entries TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS paths_index (
+                path TEXT PRIMARY KEY,
+                rank REAL NOT NULL DEFAULT 0.0,
+                last_visit INTEGER NOT NULL DEFAULT 0,
+                visit_count INTEGER NOT NULL DEFAULT 0,
+                source TEXT NOT NULL,
+                is_git_repo INTEGER NOT NULL DEFAULT 0,
+                project_marker TEXT,
+                created_ts INTEGER NOT NULL,
+                updated_ts INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_paths_index_rank ON paths_index(rank DESC);
+            CREATE INDEX IF NOT EXISTS idx_paths_index_last_visit ON paths_index(last_visit DESC);
+
             CREATE TABLE IF NOT EXISTS index_targets (
                 id INTEGER PRIMARY KEY,
                 target_type TEXT NOT NULL,
@@ -264,6 +278,8 @@ impl AppDb {
             "tty_present",
             "INTEGER NOT NULL DEFAULT 0",
         )?;
+        self.ensure_column("history_events", "import_hash", "TEXT")?;
+        self.ensure_column("history_events", "imported_at", "INTEGER")?;
 
         self.ensure_column(
             "completion_requests",
@@ -307,6 +323,11 @@ impl AppDb {
         )?;
         self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_completion_requests_trust ON completion_requests(trust, provenance)",
+            [],
+        )?;
+        self.conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_history_import_hash \
+             ON history_events(import_hash) WHERE import_hash IS NOT NULL",
             [],
         )?;
 

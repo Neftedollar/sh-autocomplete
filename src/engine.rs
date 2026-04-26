@@ -374,18 +374,14 @@ impl Engine {
                 }
             }
 
-            if matches!(parsed.role, TokenRole::Path)
-                || matches!(parsed.prev_token.as_deref(), Some("cd"))
-                || command == "cd"
-            {
-                self.collect_path_candidates(
-                    active,
-                    &req.cwd,
-                    command == "cd" || matches!(parsed.prev_token.as_deref(), Some("cd")),
-                    &mut candidates,
-                    &mut seen,
-                )?;
-            }
+            self.dispatch_path_like(
+                parsed,
+                command,
+                active,
+                &req.cwd,
+                &mut candidates,
+                &mut seen,
+            )?;
         }
 
         if cd_empty_path_context {
@@ -444,6 +440,32 @@ impl Engine {
         }
 
         Ok(candidates)
+    }
+
+    fn dispatch_path_like(
+        &self,
+        parsed: &ParsedContext,
+        command: &str,
+        active: &str,
+        cwd: &str,
+        candidates: &mut Vec<Candidate>,
+        seen: &mut HashSet<String>,
+    ) -> Result<()> {
+        // Preserve existing behavior EXACTLY: cd-hardcoded path completion only.
+        // Workstream A will extend this; Workstream C will replace the body.
+        if matches!(parsed.role, TokenRole::Path)
+            || matches!(parsed.prev_token.as_deref(), Some("cd"))
+            || command == "cd"
+        {
+            self.collect_path_candidates(
+                active,
+                cwd,
+                command == "cd" || matches!(parsed.prev_token.as_deref(), Some("cd")),
+                candidates,
+                seen,
+            )?;
+        }
+        Ok(())
     }
 
     fn collect_path_candidates(
