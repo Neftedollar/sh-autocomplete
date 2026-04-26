@@ -30,6 +30,13 @@ const PACKAGE_JSON_MAX_BYTES: u64 = 1_048_576; // 1 MiB
 /// Real files rarely exceed a few KB; 1 MiB is a very conservative guard.
 const SSH_FILE_MAX_BYTES: u64 = 1_048_576; // 1 MiB
 
+/// Maximum number of ancestor directories walked while searching for a build
+/// file (Makefile / justfile / Taskfile). Mirrors [`PACKAGE_JSON_WALK_LIMIT`].
+const BUILD_FILE_WALK_LIMIT: usize = 8;
+
+/// Cap on the size of build files we'll read for target extraction.
+const BUILD_FILE_MAX_BYTES: u64 = 1_048_576; // 1 MiB
+
 use anyhow::{Context, Result};
 
 use crate::config::{AppConfig, AppPaths};
@@ -487,7 +494,7 @@ impl Engine {
     fn dispatch_path_like(
         &self,
         parsed: &ParsedContext,
-        _command: &str,
+        command: &str,
         active: &str,
         cwd: &str,
         candidates: &mut Vec<Candidate>,
@@ -520,7 +527,10 @@ impl Engine {
             ArgType::Host => {
                 self.collect_ssh_host_candidates(active, candidates, seen)?;
             }
-            ArgType::Resource | ArgType::Image | ArgType::Workspace | ArgType::Target => {
+            ArgType::Target => {
+                self.collect_target_candidates(command, active, Path::new(cwd), candidates, seen)?;
+            }
+            ArgType::Resource | ArgType::Image | ArgType::Workspace => {
                 // Stubs for now — implementations land in subsequent PRs.
             }
             ArgType::Subcommand | ArgType::Flag | ArgType::None => {
@@ -770,6 +780,67 @@ impl Engine {
                     display: hostname,
                     kind: "ssh_host".to_string(),
                     source: "ssh_host".to_string(),
+                    description: Some(description),
+                },
+            );
+            emitted += 1;
+        }
+        Ok(())
+    }
+
+    /// Emit build-target candidates for `make`, `just`, and `task` by walking
+    /// up from `cwd` to the nearest build file, then parsing target names from
+    /// it.
+    ///
+    /// Walk-up is bounded by [`BUILD_FILE_WALK_LIMIT`] and stops at any `.git`
+    /// boundary (the boundary directory is checked for the build file before
+    /// stopping). On any failure (no build file found, parse error, I/O error)
+    /// we return `Ok(())` silently — target completion is best-effort and must
+    /// never block other candidate sources.
+    fn collect_target_candidates(
+        &self,
+        command: &str,
+        active: &str,
+        cwd: &Path,
+        candidates: &mut Vec<Candidate>,
+        seen: &mut HashSet<String>,
+    ) -> Result<()> {
+        let (build_file, system) = match find_build_file_root(command, cwd) {
+            Some(pair) => pair,
+            None => return Ok(()),
+        };
+
+        let targets = match system {
+            BuildSystem::Make => parse_makefile_targets(&build_file),
+            BuildSystem::Just => parse_justfile_targets(&build_file),
+            BuildSystem::Task => parse_taskfile_targets(&build_file),
+        };
+
+        let system_name = match system {
+            BuildSystem::Make => "make",
+            BuildSystem::Just => "just",
+            BuildSystem::Task => "task",
+        };
+
+        let limit = self.config.max_results.saturating_mul(2).max(8);
+        let mut emitted = 0usize;
+        for target in targets {
+            if emitted >= limit {
+                break;
+            }
+            // Prefix filter; empty active passes all.
+            if !active.is_empty() && !target.starts_with(active) {
+                continue;
+            }
+            let description = format!("{system_name} target");
+            push_candidate(
+                candidates,
+                seen,
+                Candidate {
+                    insert_text: target.clone(),
+                    display: target,
+                    kind: "build_target".to_string(),
+                    source: "build_target".to_string(),
                     description: Some(description),
                 },
             );
@@ -1128,6 +1199,7 @@ fn position_score(parsed: &ParsedContext, candidate: &Candidate) -> f64 {
         _ if candidate.kind == "branch" => 1.0,
         _ if candidate.kind == "npm_script" => 1.0,
         _ if candidate.kind == "ssh_host" => 1.0,
+        _ if candidate.kind == "build_target" => 1.0,
         TokenRole::SubcommandOrArg if candidate.kind == "module" => 1.0,
         TokenRole::SubcommandOrArg if candidate.kind == "subcommand" => 0.9,
         TokenRole::SubcommandOrArg if candidate.kind == "history" => 0.6,
@@ -1154,6 +1226,7 @@ fn source_prior(source: &str, kind: &str) -> f64 {
         ("git_branch", "branch") => 0.85,
         ("npm_script", _) => 0.85,
         ("ssh_host", _) => 0.85,
+        ("build_target", _) => 0.85,
         _ => 0.4,
     }
 }
@@ -1711,6 +1784,280 @@ fn read_dir_with_retry(dir: &Path) -> Result<fs::ReadDir> {
         .with_context(|| format!("read dir {}", dir.display()))
 }
 
+// ---------------------------------------------------------------------------
+// Build-target collector helpers
+// ---------------------------------------------------------------------------
+
+/// Which build system a discovered file belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BuildSystem {
+    Make,
+    Just,
+    Task,
+}
+
+/// Walk up from `start`, probing for the canonical build files of the build
+/// system implied by `command`. Caps the walk at [`BUILD_FILE_WALK_LIMIT`]
+/// levels and stops (inclusive) at any ancestor that contains a `.git`
+/// directory or file.
+///
+/// Returns the path to the *file* (not the directory) together with which
+/// build system it belongs to, or `None` when nothing is found.
+fn find_build_file_root(command: &str, start: &Path) -> Option<(PathBuf, BuildSystem)> {
+    // File name candidates for each build system (in preference order).
+    let (names, system) = match command {
+        "just" => (
+            &["justfile", "Justfile", ".justfile"][..],
+            BuildSystem::Just,
+        ),
+        "task" => (
+            &["Taskfile.yml", "Taskfile.yaml", "taskfile.yml"][..],
+            BuildSystem::Task,
+        ),
+        // "make" and anything else defaults to Makefile probing.
+        _ => (
+            &["Makefile", "makefile", "GNUmakefile"][..],
+            BuildSystem::Make,
+        ),
+    };
+
+    let mut cur: Option<&Path> = Some(start);
+    let mut steps = 0usize;
+    while let Some(dir) = cur {
+        if steps >= BUILD_FILE_WALK_LIMIT {
+            return None;
+        }
+        // Check each candidate name in preference order.
+        for &name in names {
+            let candidate = dir.join(name);
+            if candidate.is_file() {
+                return Some((candidate, system));
+            }
+        }
+        // Stop after examining a `.git` boundary (we checked the boundary dir
+        // itself above, so we never escape past a project root).
+        if dir.join(".git").exists() {
+            return None;
+        }
+        cur = dir.parent();
+        steps += 1;
+    }
+    None
+}
+
+/// Parse a `Makefile` / `makefile` / `GNUmakefile` and return a list of
+/// explicit target names. The following are excluded:
+///
+/// * Targets that start with `.` (special targets like `.PHONY`, `.SUFFIXES`).
+/// * Targets containing `%` or `*` (pattern / wildcard rules).
+/// * Lines of the form `VAR := value` or `VAR = value` (variable assignments).
+/// * Targets whose name looks like a filesystem path (`foo/bar.o`).
+///
+/// `.PHONY` *declarations* are a common pattern — we skip `.PHONY` itself but
+/// still include the concrete target names referenced on the same line as
+/// plain targets elsewhere.
+///
+/// On any I/O error or if the file exceeds [`BUILD_FILE_MAX_BYTES`], returns
+/// an empty `Vec`. Never panics.
+fn parse_makefile_targets(path: &Path) -> Vec<String> {
+    if path.metadata().map(|m| m.len()).unwrap_or(0) > BUILD_FILE_MAX_BYTES {
+        return Vec::new();
+    }
+    let text = match fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut targets = Vec::new();
+    for line in text.lines() {
+        // Skip blank lines and comments.
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        // Recipe bodies start with a tab — skip them.
+        if line.starts_with('\t') {
+            continue;
+        }
+        // A target line has the form `TARGET(s): [deps]` but NOT `:=` or `::=`
+        // (those are variable assignments). Split on the first `:`.
+        let colon_pos = match trimmed.find(':') {
+            Some(p) => p,
+            None => continue,
+        };
+        // Reject `:=` (immediate variable assignment) and `::=` (POSIX assign).
+        let after_colon = &trimmed[colon_pos + 1..];
+        if after_colon.starts_with('=') {
+            continue;
+        }
+
+        // Everything before the colon is space-separated target names.
+        let before = trimmed[..colon_pos].trim();
+        if before.is_empty() {
+            continue;
+        }
+
+        for name in before.split_whitespace() {
+            // Skip special targets (start with `.`).
+            if name.starts_with('.') {
+                continue;
+            }
+            // Skip pattern / wildcard rules.
+            if name.contains('%') || name.contains('*') {
+                continue;
+            }
+            // Skip names that look like file paths (`path/to/file.o`).
+            if name.contains('/') {
+                continue;
+            }
+            targets.push(name.to_string());
+        }
+    }
+    targets
+}
+
+/// Parse a `justfile` / `Justfile` / `.justfile` and return a list of recipe
+/// names.
+///
+/// Parsing rules:
+/// * Blank lines and `#` comments are skipped.
+/// * Lines that start with whitespace are recipe bodies — skip them.
+/// * A recipe declaration has the form:
+///   `name[(params)]: [deps]`
+///   where `name` starts with a letter and consists of `[a-zA-Z0-9_-]`.
+///
+/// On any I/O error or oversized file, returns an empty `Vec`. Never panics.
+fn parse_justfile_targets(path: &Path) -> Vec<String> {
+    if path.metadata().map(|m| m.len()).unwrap_or(0) > BUILD_FILE_MAX_BYTES {
+        return Vec::new();
+    }
+    let text = match fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut targets = Vec::new();
+    for line in text.lines() {
+        // Skip blank lines and comments.
+        let trimmed = line.trim_end();
+        if trimmed.is_empty() || trimmed.trim_start().starts_with('#') {
+            continue;
+        }
+        // Recipe bodies start with whitespace.
+        if line.starts_with(' ') || line.starts_with('\t') {
+            continue;
+        }
+        // A recipe line starts with an identifier character.
+        let first = match trimmed.chars().next() {
+            Some(c) => c,
+            None => continue,
+        };
+        if !first.is_ascii_alphabetic() && first != '_' {
+            continue;
+        }
+        // Extract the name: everything up to the first `(`, ` `, or `:`.
+        let name_end = trimmed
+            .find(['(', ' ', ':'])
+            .unwrap_or(trimmed.len());
+        let name = &trimmed[..name_end];
+        if name.is_empty() {
+            continue;
+        }
+        // Validate: only `[a-zA-Z0-9_-]`.
+        if name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            // Confirm there's a `:` somewhere after the name (to exclude bare
+            // setting lines like `set shell := [...]`).
+            if trimmed[name_end..].contains(':') {
+                targets.push(name.to_string());
+            }
+        }
+    }
+    targets
+}
+
+/// Parse a `Taskfile.yml` / `Taskfile.yaml` / `taskfile.yml` and return a
+/// list of task names.
+///
+/// `serde_yaml` is not in `Cargo.toml`, so this is a hand-rolled extractor:
+/// it looks for a top-level `tasks:` key and then collects all immediately
+/// 2-space-indented keys that end with `:`.  Sufficient for the vast majority
+/// of real Taskfile layouts.
+///
+/// On any I/O error or oversized file, returns an empty `Vec`. Never panics.
+fn parse_taskfile_targets(path: &Path) -> Vec<String> {
+    if path.metadata().map(|m| m.len()).unwrap_or(0) > BUILD_FILE_MAX_BYTES {
+        return Vec::new();
+    }
+    let text = match fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut targets = Vec::new();
+    let mut in_tasks = false;
+    for line in text.lines() {
+        // Skip blank lines and YAML comments.
+        let raw = line;
+        let trimmed = raw.trim_end();
+        if trimmed.trim().is_empty() || trimmed.trim_start().starts_with('#') {
+            continue;
+        }
+        // Detect the top-level `tasks:` key (no leading whitespace).
+        if !raw.starts_with(' ') && !raw.starts_with('\t') {
+            in_tasks = raw.trim_end() == "tasks:";
+            continue;
+        }
+        if !in_tasks {
+            continue;
+        }
+        // We're inside the `tasks:` block. Task names are at the first indent
+        // level — exactly 2 spaces (common convention). Accept any number of
+        // leading spaces as long as it's < the indent of a nested key.
+        // Heuristic: if the line starts with exactly 2 spaces (or 1 tab) and
+        // ends with `:`, treat the key as a task name.
+        let indent = raw.len() - raw.trim_start().len();
+        // Task-name lines sit at the first indent level (2 or 4 spaces typical).
+        // We accept indent levels 1-4 for the name, but NOT deeper nesting
+        // (which would be task properties). Use a simple threshold: indent <= 4
+        // and the stripped line is a bare `key:` (nothing after the colon).
+        if indent == 0 {
+            // Hit a new top-level key; we already handled this above.
+            continue;
+        }
+        let stripped = raw.trim_start();
+        // A task-name line: `  name:` with nothing (or only a space) after `:`.
+        if let Some(colon_pos) = stripped.find(':') {
+            let after = stripped[colon_pos + 1..].trim();
+            // The value after `:` may be empty (block mapping) or a string.
+            // We want entries that look like task-name keys (not sub-keys of a
+            // task). Use indent == 2 as the canonical task-level indent,
+            // but also accept indent == 4 for 4-space-indented Taskfiles.
+            if indent <= 4 && (after.is_empty() || after.starts_with('#')) {
+                let name = stripped[..colon_pos].trim();
+                // Skip YAML-internal keys like `cmds`, `desc`, `deps`, `env`, `vars`, etc.
+                // They appear at deeper indent anyway, but guard here too.
+                let is_yaml_key = matches!(
+                    name,
+                    "cmds" | "desc" | "summary" | "deps" | "env"
+                        | "vars" | "silent" | "run" | "method"
+                        | "sources" | "generates" | "status"
+                        | "preconditions" | "ignore_error" | "dir"
+                        | "dotenv" | "label" | "internal" | "platforms"
+                        | "prompt" | "requires" | "aliases" | "set"
+                        | "shopt"
+                );
+                if !is_yaml_key && !name.is_empty() && !name.starts_with('-') {
+                    targets.push(name.to_string());
+                }
+            }
+        }
+    }
+    targets
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2179,6 +2526,204 @@ mod tests {
         assert!(
             hosts.contains(&"realhost.example.com".to_string()),
             "plain host must appear: {hosts:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Target-collector inline parser tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_makefile_targets_basic() {
+        let scratch = unique_tmp("shac-make-basic");
+        let path = write_file(
+            &scratch,
+            "Makefile",
+            "build:\n\
+             \t@echo building\n\
+             \n\
+             test: build\n\
+             \t@echo testing\n\
+             \n\
+             clean:\n\
+             \t@echo cleaning\n",
+        );
+        let targets = parse_makefile_targets(&path);
+        assert!(targets.contains(&"build".to_string()), "{targets:?}");
+        assert!(targets.contains(&"test".to_string()), "{targets:?}");
+        assert!(targets.contains(&"clean".to_string()), "{targets:?}");
+    }
+
+    #[test]
+    fn parse_makefile_targets_skips_var_assignments() {
+        let scratch = unique_tmp("shac-make-var");
+        let path = write_file(
+            &scratch,
+            "Makefile",
+            "CC := gcc\n\
+             CFLAGS := -O2\n\
+             build:\n\
+             \t$(CC) main.c\n",
+        );
+        let targets = parse_makefile_targets(&path);
+        assert!(
+            !targets.iter().any(|t| t == "CC" || t == "CFLAGS"),
+            "variable assignments must not appear as targets: {targets:?}"
+        );
+        assert!(targets.contains(&"build".to_string()), "{targets:?}");
+    }
+
+    #[test]
+    fn parse_makefile_targets_skips_pattern_rules() {
+        let scratch = unique_tmp("shac-make-pattern");
+        let path = write_file(
+            &scratch,
+            "Makefile",
+            "%.o: %.c\n\
+             \t$(CC) -c $<\n\
+             all:\n\
+             \t@echo all\n",
+        );
+        let targets = parse_makefile_targets(&path);
+        assert!(
+            !targets.iter().any(|t| t.contains('%')),
+            "pattern rules must not appear: {targets:?}"
+        );
+        assert!(targets.contains(&"all".to_string()), "{targets:?}");
+    }
+
+    #[test]
+    fn parse_makefile_targets_skips_dot_targets() {
+        let scratch = unique_tmp("shac-make-dot");
+        let path = write_file(
+            &scratch,
+            "Makefile",
+            ".PHONY: build clean\n\
+             build:\n\
+             \t@echo build\n\
+             clean:\n\
+             \t@echo clean\n",
+        );
+        let targets = parse_makefile_targets(&path);
+        assert!(
+            !targets.iter().any(|t| t.starts_with('.')),
+            ".PHONY must not appear as target: {targets:?}"
+        );
+        assert!(targets.contains(&"build".to_string()), "{targets:?}");
+        assert!(targets.contains(&"clean".to_string()), "{targets:?}");
+    }
+
+    #[test]
+    fn parse_justfile_targets_basic() {
+        let scratch = unique_tmp("shac-just-basic");
+        let path = write_file(
+            &scratch,
+            "justfile",
+            "build:\n\
+             \tcargo build\n\
+             \n\
+             test arg1 arg2:\n\
+             \tcargo test\n\
+             \n\
+             dev:\n\
+             \tcargo run\n",
+        );
+        let targets = parse_justfile_targets(&path);
+        assert!(targets.contains(&"build".to_string()), "{targets:?}");
+        assert!(targets.contains(&"test".to_string()), "{targets:?}");
+        assert!(targets.contains(&"dev".to_string()), "{targets:?}");
+    }
+
+    #[test]
+    fn parse_justfile_targets_handles_parameters() {
+        let scratch = unique_tmp("shac-just-params");
+        let path = write_file(
+            &scratch,
+            "justfile",
+            "recipe-name param1='default':\n\
+             \techo {{param1}}\n",
+        );
+        let targets = parse_justfile_targets(&path);
+        assert!(
+            targets.contains(&"recipe-name".to_string()),
+            "parameterized recipe must appear: {targets:?}"
+        );
+    }
+
+    #[test]
+    fn parse_taskfile_targets_basic() {
+        let scratch = unique_tmp("shac-task-basic");
+        let content = concat!(
+            "version: '3'\n",
+            "\n",
+            "tasks:\n",
+            "\n",
+            "  build:\n",
+            "    cmds:\n",
+            "      - go build ./...\n",
+            "\n",
+            "  test:\n",
+            "    cmds:\n",
+            "      - go test ./...\n",
+            "\n",
+            "  clean:\n",
+            "    cmds:\n",
+            "      - rm -rf dist\n",
+        );
+        let path = write_file(&scratch, "Taskfile.yml", content);
+        let targets = parse_taskfile_targets(&path);
+        assert!(targets.contains(&"build".to_string()), "{targets:?}");
+        assert!(targets.contains(&"test".to_string()), "{targets:?}");
+        assert!(targets.contains(&"clean".to_string()), "{targets:?}");
+    }
+
+    #[test]
+    fn find_build_file_root_make() {
+        let scratch = unique_tmp("shac-target-make-root");
+        let root = scratch.join("project");
+        let nested = root.join("src/components");
+        std::fs::create_dir_all(&nested).expect("mkdir");
+        std::fs::write(root.join("Makefile"), "build:\n\t@echo\n").expect("write");
+        let (found_path, system) =
+            find_build_file_root("make", &nested).expect("should find Makefile");
+        assert_eq!(system, BuildSystem::Make);
+        assert_eq!(
+            found_path.canonicalize().unwrap(),
+            root.join("Makefile").canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn find_build_file_root_just() {
+        let scratch = unique_tmp("shac-target-just-root");
+        let root = scratch.join("project");
+        let nested = root.join("src");
+        std::fs::create_dir_all(&nested).expect("mkdir");
+        std::fs::write(root.join("justfile"), "build:\n\tcargo build\n").expect("write");
+        let (found_path, system) =
+            find_build_file_root("just", &nested).expect("should find justfile");
+        assert_eq!(system, BuildSystem::Just);
+        assert_eq!(
+            found_path.canonicalize().unwrap(),
+            root.join("justfile").canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn find_build_file_root_stops_at_git() {
+        // outer/Makefile  <- must NOT be reached
+        // outer/inner/.git
+        // outer/inner/    <- start here
+        let scratch = unique_tmp("shac-target-git-boundary");
+        let outer = scratch.join("outer");
+        let inner = outer.join("inner");
+        std::fs::create_dir_all(&inner).expect("mkdir");
+        std::fs::create_dir_all(inner.join(".git")).expect("mkdir .git");
+        std::fs::write(outer.join("Makefile"), "build:\n").expect("write");
+        let result = find_build_file_root("make", &inner);
+        assert!(
+            result.is_none(),
+            "should not escape past .git boundary, got {result:?}"
         );
     }
 }

@@ -28,6 +28,7 @@ Landing page: https://neftedollar.github.io/sh-autocomplete/
 - bundled command priors (~60 grammar pairs for git, docker, kubectl, npm, ...) seeded on first install for cold-start (filtered to installed CLIs only)
 - live `npm run` / `pnpm run` / `yarn run` script completion parsed from the cwd's nearest `package.json` (walk-up bounded to 8 levels, stops at `.git` boundary)
 - `ssh <Tab>` / `mosh <Tab>` host completion parsed from `~/.ssh/config` `Host` entries and `~/.ssh/known_hosts` (wildcards skipped, hashed entries skipped, `[host]:port` notation handled)
+- `make <Tab>` / `just <Tab>` / `task <Tab>` target completion parsed from the cwd's nearest `Makefile`, `justfile`, or `Taskfile.yml` (walk-up bounded to 8 levels, stops at `.git` boundary; skips `.PHONY`, pattern rules, and variable assignments)
 - builtin docs for `git`, `docker`, `kubectl`, `npm`, `cargo`, `dotnet`, `python`, `pip`, `pytest`
 - explain output for feature contributions
 
