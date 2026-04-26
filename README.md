@@ -26,6 +26,7 @@ Landing page: https://neftedollar.github.io/sh-autocomplete/
 - on-demand path completion with cached hot directories
 - branch-aware completion for `git checkout|switch|branch|merge|rebase` via `git for-each-ref` (200 ms timeout, no cache yet)
 - builtin docs for `git`, `docker`, `kubectl`, `npm`, `cargo`, `dotnet`, `python`, `pip`, `pytest`
+- bundled command priors (~60 grammar pairs for git, docker, kubectl, npm, ...) seeded on first install for cold-start
 - explain output for feature contributions
 
 ## Build
