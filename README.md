@@ -56,7 +56,7 @@ Recommended beta path is `zsh`; `bash` is supported as best-effort list completi
 ```bash
 brew install Neftedollar/shac/shac
 shac install --shell zsh --edit-rc
-shac daemon start
+brew services start shac
 shac reindex
 shac doctor
 ```

@@ -13,13 +13,25 @@ class Shac < Formula
     pkgshare.install "shell"
   end
 
+  service do
+    run [opt_bin/"shacd"]
+    keep_alive true
+    log_path var/"log/shac.log"
+    error_log_path var/"log/shac.log"
+  end
+
   def caveats
     <<~EOS
       Install shell integration with:
         shac install --shell zsh --edit-rc
 
-      Start and inspect the daemon with:
+      Start the daemon (auto-restarts on login via launchd):
+        brew services start shac
+
+      Or start manually without launchd:
         shac daemon start
+
+      Check status:
         shac doctor
     EOS
   end
