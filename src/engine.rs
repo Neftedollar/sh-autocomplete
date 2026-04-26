@@ -26,6 +26,10 @@ const PACKAGE_JSON_WALK_LIMIT: usize = 8;
 /// as malformed (script lists are tiny — ~hundreds of bytes typical).
 const PACKAGE_JSON_MAX_BYTES: u64 = 1_048_576; // 1 MiB
 
+/// Cap on size of `~/.ssh/config` and `~/.ssh/known_hosts` we'll read.
+/// Real files rarely exceed a few KB; 1 MiB is a very conservative guard.
+const SSH_FILE_MAX_BYTES: u64 = 1_048_576; // 1 MiB
+
 use anyhow::{Context, Result};
 
 use crate::config::{AppConfig, AppPaths};
@@ -513,11 +517,10 @@ impl Engine {
                     seen,
                 )?;
             }
-            ArgType::Host
-            | ArgType::Resource
-            | ArgType::Image
-            | ArgType::Workspace
-            | ArgType::Target => {
+            ArgType::Host => {
+                self.collect_ssh_host_candidates(active, candidates, seen)?;
+            }
+            ArgType::Resource | ArgType::Image | ArgType::Workspace | ArgType::Target => {
                 // Stubs for now — implementations land in subsequent PRs.
             }
             ArgType::Subcommand | ArgType::Flag | ArgType::None => {
@@ -692,6 +695,81 @@ impl Engine {
                     display: name,
                     kind: "npm_script".to_string(),
                     source: "npm_script".to_string(),
+                    description: Some(description),
+                },
+            );
+            emitted += 1;
+        }
+        Ok(())
+    }
+
+    /// Emit SSH host candidates for `ssh`, `scp`, `mosh`, `rsync` from:
+    ///   1. `~/.ssh/config` — `Host` directive lines (skipping wildcards).
+    ///   2. `~/.ssh/known_hosts` — first column host list (handling
+    ///      `[host]:port` form, skipping hashed `|1|...` entries and
+    ///      `@cert-authority`/`@revoked` markers).
+    ///
+    /// Sources are merged and deduplicated via the shared `seen` set.
+    /// No `cwd` argument — SSH host completion is global, not project-local.
+    fn collect_ssh_host_candidates(
+        &self,
+        active: &str,
+        candidates: &mut Vec<Candidate>,
+        seen: &mut HashSet<String>,
+    ) -> Result<()> {
+        // Collect hosts from each source, tracking origin for description.
+        let mut config_hosts: HashSet<String> = HashSet::new();
+        let mut known_hosts: HashSet<String> = HashSet::new();
+
+        if let Some(path) = ssh_config_path() {
+            for host in parse_ssh_config_hosts(&path) {
+                config_hosts.insert(host);
+            }
+        }
+        if let Some(path) = known_hosts_path() {
+            for host in parse_known_hosts_hostnames(&path) {
+                known_hosts.insert(host);
+            }
+        }
+
+        // Build a merged, deduplicated list with provenance labels.
+        let mut all: Vec<(String, &'static str)> = Vec::new();
+        for host in &config_hosts {
+            let label = if known_hosts.contains(host) {
+                "both"
+            } else {
+                "config"
+            };
+            all.push((host.clone(), label));
+        }
+        for host in &known_hosts {
+            if !config_hosts.contains(host) {
+                all.push((host.clone(), "known_hosts"));
+            }
+        }
+
+        // Sort for deterministic output.
+        all.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+
+        let limit = self.config.max_results.saturating_mul(2).max(8);
+        let mut emitted = 0usize;
+        for (hostname, source_label) in all {
+            if emitted >= limit {
+                break;
+            }
+            // Prefix filter; empty active passes all.
+            if !active.is_empty() && !hostname.starts_with(active) {
+                continue;
+            }
+            let description = format!("ssh host \u{00b7} {source_label}");
+            push_candidate(
+                candidates,
+                seen,
+                Candidate {
+                    insert_text: hostname.clone(),
+                    display: hostname,
+                    kind: "ssh_host".to_string(),
+                    source: "ssh_host".to_string(),
                     description: Some(description),
                 },
             );
@@ -1049,6 +1127,7 @@ fn position_score(parsed: &ParsedContext, candidate: &Candidate) -> f64 {
         _ if is_cd_path_context(parsed) && candidate.kind == "path_jump" => 1.0,
         _ if candidate.kind == "branch" => 1.0,
         _ if candidate.kind == "npm_script" => 1.0,
+        _ if candidate.kind == "ssh_host" => 1.0,
         TokenRole::SubcommandOrArg if candidate.kind == "module" => 1.0,
         TokenRole::SubcommandOrArg if candidate.kind == "subcommand" => 0.9,
         TokenRole::SubcommandOrArg if candidate.kind == "history" => 0.6,
@@ -1074,6 +1153,7 @@ fn source_prior(source: &str, kind: &str) -> f64 {
         ("path_jump", _) => 0.85,
         ("git_branch", "branch") => 0.85,
         ("npm_script", _) => 0.85,
+        ("ssh_host", _) => 0.85,
         _ => 0.4,
     }
 }
@@ -1285,6 +1365,136 @@ fn truncate_command(command: &str, max_len: usize) -> String {
     }
     let truncated: String = normalized.chars().take(max_len).collect();
     format!("{truncated}\u{2026}")
+}
+
+/// Returns the path to `~/.ssh/config`, or `None` if the home directory
+/// cannot be determined.
+fn ssh_config_path() -> Option<PathBuf> {
+    dirs::home_dir().map(|h| h.join(".ssh").join("config"))
+}
+
+/// Returns the path to `~/.ssh/known_hosts`, or `None` if the home directory
+/// cannot be determined.
+fn known_hosts_path() -> Option<PathBuf> {
+    dirs::home_dir().map(|h| h.join(".ssh").join("known_hosts"))
+}
+
+/// Parse `~/.ssh/config` and extract concrete host names (aliases).
+///
+/// Parsing rules:
+/// - Blank lines and `#` comments are skipped.
+/// - Lines whose first token is `Host` (case-insensitive) are host-declaration
+///   lines; everything after `Host` and whitespace are zero or more patterns.
+/// - Patterns containing `*` or `?` (glob wildcards) are skipped.
+/// - Multiple patterns on one line are allowed: `Host alpha beta gamma`.
+/// - `Include` directives are **not** followed (v1 — TODO for v2).
+///
+/// Returns an empty Vec on any I/O error (caller treats absence as "no
+/// candidates"); never panics.
+fn parse_ssh_config_hosts(path: &Path) -> Vec<String> {
+    // Guard against suspiciously large files.
+    if path.metadata().map(|m| m.len()).unwrap_or(0) > SSH_FILE_MAX_BYTES {
+        return Vec::new();
+    }
+    let text = match fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut hosts = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        // Skip blank lines and comments.
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        // Split on the first run of whitespace.
+        let mut iter = trimmed.splitn(2, |c: char| c.is_whitespace());
+        let directive = match iter.next() {
+            Some(d) => d,
+            None => continue,
+        };
+        if !directive.eq_ignore_ascii_case("Host") {
+            continue;
+        }
+        // TODO(v2): follow Include directives for multi-file ssh configs.
+        let rest = iter.next().unwrap_or("").trim();
+        for pattern in rest.split_whitespace() {
+            // Skip wildcards — they are not real hostnames.
+            if pattern.contains('*') || pattern.contains('?') {
+                continue;
+            }
+            if !pattern.is_empty() {
+                hosts.push(pattern.to_string());
+            }
+        }
+    }
+    hosts
+}
+
+/// Parse `~/.ssh/known_hosts` and extract hostnames.
+///
+/// Parsing rules:
+/// - Blank lines and `#` comments are skipped.
+/// - Lines starting with `@` (`@cert-authority`, `@revoked`) are skipped.
+/// - The first whitespace-delimited token is the comma-separated host list.
+/// - Each element of the host list is processed:
+///   - `[host]:port` bracket notation → strip to bare `host`.
+///   - Entries starting with `|1|` are hashed (`HashKnownHosts yes`) — skip.
+///   - Entries containing `*` are wildcards — skip.
+///   - Plain `host` and `ip` entries are kept as-is (IPs are valid ssh targets).
+///
+/// Returns an empty Vec on any I/O error; never panics.
+fn parse_known_hosts_hostnames(path: &Path) -> Vec<String> {
+    if path.metadata().map(|m| m.len()).unwrap_or(0) > SSH_FILE_MAX_BYTES {
+        return Vec::new();
+    }
+    let text = match fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut hosts = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        // Skip blank, comments, marker lines.
+        if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with('@') {
+            continue;
+        }
+        // First token is the host list.
+        let host_list = match trimmed.split_whitespace().next() {
+            Some(t) => t,
+            None => continue,
+        };
+        for entry in host_list.split(',') {
+            if entry.is_empty() {
+                continue;
+            }
+            // Skip hashed entries.
+            if entry.starts_with("|1|") {
+                continue;
+            }
+            // Skip wildcards.
+            if entry.contains('*') {
+                continue;
+            }
+            // Strip bracket notation: [hostname]:port → hostname.
+            let hostname = if entry.starts_with('[') {
+                // Find the closing bracket.
+                if let Some(close) = entry.find(']') {
+                    &entry[1..close]
+                } else {
+                    entry
+                }
+            } else {
+                entry
+            };
+            if !hostname.is_empty() {
+                hosts.push(hostname.to_string());
+            }
+        }
+    }
+    hosts
 }
 
 fn format_path_jump_description(is_git_repo: bool, last_visit: i64, now: i64) -> String {
@@ -1860,5 +2070,115 @@ mod tests {
         if let Some(root) = result {
             assert!(root.join(".git").exists(), "claimed repo root has no .git");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // SSH parser unit tests
+    // -----------------------------------------------------------------------
+
+    fn write_file(dir: &std::path::Path, name: &str, content: &str) -> std::path::PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, content).expect("write file");
+        path
+    }
+
+    #[test]
+    fn parse_ssh_config_extracts_hosts() {
+        let scratch = unique_tmp("shac-ssh-config-extract");
+        let config = write_file(
+            &scratch,
+            "config",
+            "Host alias1 alias2\n\
+             \tHostName foo.example.com\n\
+             \tUser joe\n\
+             \n\
+             Host *.internal\n\
+             \tProxyJump bastion\n\
+             \n\
+             Host bastion\n\
+             \tHostName 10.0.0.1\n",
+        );
+        let hosts = parse_ssh_config_hosts(&config);
+        assert!(
+            hosts.contains(&"alias1".to_string()),
+            "expected alias1: {hosts:?}"
+        );
+        assert!(
+            hosts.contains(&"alias2".to_string()),
+            "expected alias2: {hosts:?}"
+        );
+        assert!(
+            hosts.contains(&"bastion".to_string()),
+            "expected bastion: {hosts:?}"
+        );
+        // Wildcard must be excluded.
+        assert!(
+            !hosts.iter().any(|h| h.contains('*')),
+            "wildcard must not appear: {hosts:?}"
+        );
+    }
+
+    #[test]
+    fn parse_ssh_config_handles_multi_host_line() {
+        let scratch = unique_tmp("shac-ssh-config-multi");
+        let config = write_file(
+            &scratch,
+            "config",
+            "Host alpha beta gamma\n\
+             \tUser user\n",
+        );
+        let hosts = parse_ssh_config_hosts(&config);
+        assert_eq!(
+            hosts.len(),
+            3,
+            "expected 3 hosts from multi-host line: {hosts:?}"
+        );
+        assert!(hosts.contains(&"alpha".to_string()));
+        assert!(hosts.contains(&"beta".to_string()));
+        assert!(hosts.contains(&"gamma".to_string()));
+    }
+
+    #[test]
+    fn parse_known_hosts_handles_brackets_and_ports() {
+        let scratch = unique_tmp("shac-ssh-known-brackets");
+        let known = write_file(
+            &scratch,
+            "known_hosts",
+            "[bastion]:2222,[bastion-alt]:2222 ssh-ed25519 AAAA...\n",
+        );
+        let hosts = parse_known_hosts_hostnames(&known);
+        assert!(
+            hosts.contains(&"bastion".to_string()),
+            "expected bastion: {hosts:?}"
+        );
+        assert!(
+            hosts.contains(&"bastion-alt".to_string()),
+            "expected bastion-alt: {hosts:?}"
+        );
+        // Port suffix must not appear.
+        assert!(
+            !hosts.iter().any(|h| h.contains(':') || h.contains('[')),
+            "brackets/port must be stripped: {hosts:?}"
+        );
+    }
+
+    #[test]
+    fn parse_known_hosts_skips_hashed_entries() {
+        let scratch = unique_tmp("shac-ssh-known-hashed");
+        let known = write_file(
+            &scratch,
+            "known_hosts",
+            "|1|abc123|def456 ssh-rsa AAAA...\n\
+             realhost.example.com ssh-rsa AAAA...\n",
+        );
+        let hosts = parse_known_hosts_hostnames(&known);
+        assert!(
+            !hosts.iter().any(|h| h.starts_with('|')),
+            "hashed entry must be skipped: {hosts:?}"
+        );
+        assert!(
+            hosts.contains(&"realhost.example.com".to_string()),
+            "plain host must appear: {hosts:?}"
+        );
     }
 }
