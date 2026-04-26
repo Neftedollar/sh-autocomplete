@@ -11,7 +11,7 @@ use crate::config::{AppConfig, AppPaths};
 use crate::context::{self, ParsedContext, TokenRole};
 use crate::db::{AppDb, LoggedCompletionItem, StoredDoc};
 use crate::indexer;
-use crate::ml::{MlModel, TrainingSample};
+use crate::ml::{train_model, MlModel, TrainOptions, TrainingSample};
 use crate::protocol::{
     CompletionItem, CompletionMeta, CompletionRequest, CompletionResponse, ExplainFeature,
     ExplainItem, ExplainResponse, MigrationStatusResponse, RecentEvent, RecordCommandRequest,
@@ -206,7 +206,40 @@ impl Engine {
     pub fn recent_events(&self, limit: usize) -> Result<Vec<RecentEvent>> {
         self.db.recent_events(limit)
     }
+}
 
+const ML_ACTIVATION_THRESHOLD: i64 = 50;
+const ML_TRAIN_LIMIT: usize = 10_000;
+
+/// Checks whether enough accepted completions have been collected to train and
+/// auto-enable the ML model. Called once at daemon startup. Returns true when
+/// the model was just activated for the first time.
+pub fn maybe_auto_train(paths: &AppPaths) -> Result<bool> {
+    let mut config = AppConfig::load(paths)?;
+    if config.features.ml_rerank {
+        return Ok(false);
+    }
+    let db = AppDb::open(&paths.db_file)?;
+    let stats = db.stats()?;
+    if stats.accepted_clean_completions < ML_ACTIVATION_THRESHOLD {
+        return Ok(false);
+    }
+    let model_path = paths.data_dir.join("model.json");
+    if !model_path.exists() {
+        let samples = db.training_samples(ML_TRAIN_LIMIT)?;
+        if samples.is_empty() {
+            return Ok(false);
+        }
+        let model = train_model(&samples, &TrainOptions::default());
+        model.save(&model_path)?;
+    }
+    config.ml_model_file = Some(model_path.to_string_lossy().into_owned());
+    config.features.ml_rerank = true;
+    config.save(paths)?;
+    Ok(true)
+}
+
+impl Engine {
     fn collect_candidates(
         &self,
         req: &CompletionRequest,
@@ -670,21 +703,41 @@ fn fuzzy_match_score(query: &str, candidate: &str) -> f64 {
     if query.is_empty() {
         return 0.2;
     }
-    let mut score = 0.0;
     let mut cursor = 0usize;
+    let mut bonus = 0.0f64;
     let candidate_chars: Vec<char> = candidate.chars().collect();
+    let n = candidate_chars.len();
+    let q_len = query.chars().count();
+
     for ch in query.chars() {
-        if let Some(pos) = candidate_chars[cursor..]
+        let Some(pos) = candidate_chars[cursor..]
             .iter()
             .position(|c| c.eq_ignore_ascii_case(&ch))
-        {
-            score += 1.0;
-            cursor += pos + 1;
-        } else {
+        else {
             return 0.0;
+        };
+        let abs_pos = cursor + pos;
+
+        if pos == 0 && cursor > 0 {
+            // consecutive: adjacent to previous match
+            bonus += 1.0;
         }
+        if abs_pos == 0 {
+            bonus += 1.0;
+        } else {
+            let prev = candidate_chars[abs_pos - 1];
+            if matches!(prev, '-' | '_' | '.' | '/' | ' ') {
+                // word boundary: match starts a new word
+                bonus += 1.0;
+            }
+        }
+
+        cursor = abs_pos + 1;
     }
-    score / candidate_chars.len().max(1) as f64
+
+    let base = q_len as f64 / n.max(1) as f64;
+    let max_bonus = (q_len * 2) as f64;
+    (base * (1.0 + bonus / max_bonus)).min(1.0)
 }
 
 fn should_include_doc(doc: &StoredDoc, active: &str, parsed: &ParsedContext) -> bool {
@@ -970,6 +1023,24 @@ mod tests {
     fn fuzzy_score_handles_subsequence() {
         assert!(fuzzy_match_score("gt", "git") > 0.0);
         assert_eq!(fuzzy_match_score("zz", "git"), 0.0);
+    }
+
+    #[test]
+    fn fuzzy_score_consecutive_beats_scattered() {
+        // "gt" in "gtscript" (consecutive) > "gt" in "gxtscrip" (not consecutive)
+        assert!(fuzzy_match_score("gt", "gtscript") > fuzzy_match_score("gt", "gxtscrip"));
+    }
+
+    #[test]
+    fn fuzzy_score_boundary_beats_mid_word() {
+        // same length: "g-clust" has 'c' at boundary, "gxcxxx0" does not
+        assert!(fuzzy_match_score("gc", "g-clust") > fuzzy_match_score("gc", "gxcxxx0"));
+    }
+
+    #[test]
+    fn fuzzy_score_space_boundary() {
+        // "git pull" — 'p' after space is a boundary
+        assert!(fuzzy_match_score("gp", "git pull") > 0.0);
     }
 
     #[test]

@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use clap::Parser;
 use shac::config::AppPaths;
-use shac::engine::Engine;
+use shac::engine::{self, Engine};
 use shac::protocol::RecordCommandRequest;
 
 #[derive(Debug, Parser)]
@@ -29,6 +29,9 @@ fn main() -> Result<()> {
     fs::write(&paths.pid_file, std::process::id().to_string()).context("write pid file")?;
     let listener = UnixListener::bind(&paths.socket_file).context("bind unix socket")?;
     let _state_guard = StateGuard::new(paths.socket_file.clone(), paths.pid_file.clone());
+    if engine::maybe_auto_train(&paths).unwrap_or(false) {
+        eprintln!("shac: personalized model activated");
+    }
     let engine = Engine::new(&paths)?;
 
     for stream in listener.incoming() {

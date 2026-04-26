@@ -342,6 +342,22 @@ fn index_action(paths: &AppPaths, action: IndexAction) -> Result<()> {
     }
 }
 
+fn learning_status_check(paths: &AppPaths, config: &AppConfig) -> serde_json::Value {
+    let accepted = shac::db::AppDb::open(&paths.db_file)
+        .and_then(|db| db.stats())
+        .map(|s| s.accepted_clean_completions)
+        .unwrap_or(0);
+    let (ok, detail) = if config.features.ml_rerank {
+        (true, format!("personalized model active ({accepted} accepted completions)"))
+    } else if accepted == 0 {
+        (false, "no accepted completions yet — press Tab a few times to start learning".to_string())
+    } else {
+        let remaining = (50 - accepted).max(0);
+        (false, format!("{accepted}/50 accepted completions — {remaining} more to activate personalized model"))
+    };
+    doctor_check("learning_status", ok, detail)
+}
+
 fn doctor(paths: &AppPaths, args: DoctorArgs) -> Result<()> {
     cleanup_stale_daemon_state(paths);
     let config = AppConfig::load(paths).unwrap_or_default();
@@ -420,6 +436,7 @@ fn doctor(paths: &AppPaths, args: DoctorArgs) -> Result<()> {
             ),
         ),
     ];
+    checks.push(learning_status_check(paths, &config));
     if matches!(args.shell, Some(ShellKind::Zsh)) {
         checks.extend(zsh_doctor_checks(paths)?);
     }
@@ -574,9 +591,17 @@ fn install(paths: &AppPaths, shell: ShellKind, edit_rc: bool) -> Result<()> {
     let shell_file = paths.shell_dir.join(file_name);
     fs::write(&shell_file, content)?;
     if edit_rc {
+        let rc_file = rc_file_for_shell(shell)?;
         install_rc_block(shell, &shell_file)?;
+        println!("installed  {}", rc_file.display());
+        println!();
+        println!("next steps:");
+        println!("  1. open a new terminal (or run: source {})", rc_file.display());
+        println!("  2. try pressing Tab after: git <Tab>  or  cargo <Tab>");
+        println!("  3. run `shac doctor` if something looks off");
+    } else {
+        println!("{snippet}");
     }
-    println!("{snippet}");
     Ok(())
 }
 
