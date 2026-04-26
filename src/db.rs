@@ -359,12 +359,11 @@ impl AppDb {
     pub fn command_has_docs(&self, command: &str) -> bool {
         self.conn
             .query_row(
-                "SELECT COUNT(*) FROM command_docs WHERE command = ?1",
+                "SELECT EXISTS(SELECT 1 FROM command_docs WHERE command = ?1)",
                 [command],
-                |row| row.get::<_, i64>(0),
+                |row| row.get::<_, bool>(0),
             )
-            .unwrap_or(0)
-            > 0
+            .unwrap_or(false)
     }
 
     pub fn docs_for_command(&self, command: &str) -> Result<Vec<StoredDoc>> {
@@ -1317,11 +1316,9 @@ fn detect_project_root(cwd: &str) -> Option<String> {
 mod tests {
     use super::*;
     use std::path::PathBuf;
-    use tempfile::NamedTempFile;
 
     fn test_db() -> AppDb {
-        let tmp = NamedTempFile::new().unwrap();
-        AppDb::open(tmp.path()).unwrap()
+        AppDb::open(std::path::Path::new(":memory:")).unwrap()
     }
 
     #[test]
@@ -1678,5 +1675,19 @@ mod tests {
         };
         db.replace_docs_for_command("mycmd", &[doc]).unwrap();
         assert!(db.command_has_docs("mycmd"));
+    }
+
+    #[test]
+    fn command_has_docs_does_not_bleed_across_commands() {
+        let db = test_db();
+        let doc = StoredDoc {
+            command: "mycmd".into(),
+            item_type: "subcommand".into(),
+            item_value: "run".into(),
+            description: "Run something".into(),
+            source: "help".into(),
+        };
+        db.replace_docs_for_command("mycmd", &[doc]).unwrap();
+        assert!(!db.command_has_docs("othercmd"));
     }
 }
