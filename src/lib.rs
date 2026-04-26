@@ -4,5 +4,6 @@ pub mod db;
 pub mod engine;
 pub mod indexer;
 pub mod ml;
+pub mod profiles;
 pub mod protocol;
 pub mod shell;
