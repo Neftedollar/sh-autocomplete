@@ -25,7 +25,7 @@ Landing page: https://neftedollar.github.io/sh-autocomplete/
 - optional local ML reranking from a JSON model file
 - on-demand path completion with cached hot directories
 - branch-aware completion for `git checkout|switch|branch|merge|rebase` via `git for-each-ref` (200 ms timeout, no cache yet)
-- bundled command priors (~60 grammar pairs for git, docker, kubectl, npm, ...) seeded on first install for cold-start
+- bundled command priors (~60 grammar pairs for git, docker, kubectl, npm, ...) seeded on first install for cold-start (filtered to installed CLIs only)
 - live `npm run` / `pnpm run` / `yarn run` script completion parsed from the cwd's nearest `package.json` (walk-up bounded to 8 levels, stops at `.git` boundary)
 - builtin docs for `git`, `docker`, `kubectl`, `npm`, `cargo`, `dotnet`, `python`, `pip`, `pytest`
 - explain output for feature contributions
