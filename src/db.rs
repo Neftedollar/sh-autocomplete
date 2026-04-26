@@ -53,6 +53,17 @@ pub struct IndexTarget {
 }
 
 #[derive(Debug, Clone)]
+pub struct PathFrecency {
+    pub path: String,
+    pub rank: f64,
+    pub last_visit: i64,
+    pub visit_count: i64,
+    pub source: String,
+    pub is_git_repo: bool,
+    pub project_marker: Option<String>,
+}
+
+#[derive(Debug, Clone)]
 pub struct LoggedCompletionItem {
     pub rank: usize,
     pub item_key: String,
@@ -547,6 +558,11 @@ impl AppDb {
             let _ = self.mark_completion_accepted(&request.command, &request.cwd, &classified);
         }
 
+        // Hybrid-cd: extract `cd <path>` events into paths_index for global frecency.
+        if let Some(target) = extract_cd_target(&request.command) {
+            let _ = self.upsert_path_index(&target, "cwd_event", false, None);
+        }
+
         Ok(classified)
     }
 
@@ -817,6 +833,146 @@ impl AppDb {
             params![dir, mtime, entries],
         )?;
         Ok(())
+    }
+
+    /// Bump frecency for a path (rank += 1.0, clamped to 100.0). On insert, rank=1.0.
+    pub fn upsert_path_index(
+        &self,
+        path: &str,
+        source: &str,
+        is_git_repo: bool,
+        project_marker: Option<&str>,
+    ) -> Result<()> {
+        let now = unix_ts();
+        let git_flag = if is_git_repo { 1 } else { 0 };
+        self.conn.execute(
+            "INSERT INTO paths_index(path, rank, last_visit, visit_count, source, is_git_repo, project_marker, created_ts, updated_ts)
+             VALUES (?1, 1.0, ?2, 1, ?3, ?4, ?5, ?2, ?2)
+             ON CONFLICT(path) DO UPDATE SET
+                 rank = MIN(rank + 1.0, 100.0),
+                 last_visit = excluded.last_visit,
+                 visit_count = visit_count + 1,
+                 updated_ts = excluded.updated_ts,
+                 is_git_repo = MAX(is_git_repo, excluded.is_git_repo),
+                 project_marker = COALESCE(excluded.project_marker, project_marker)",
+            params![path, now, source, git_flag, project_marker],
+        )?;
+        Ok(())
+    }
+
+    /// Insert/update a path with explicit rank/last_visit (for zoxide / project scan importers).
+    /// On conflict: only update rank/last_visit if the new rank is higher.
+    pub fn upsert_path_index_with_rank(
+        &self,
+        path: &str,
+        rank: f64,
+        last_visit: i64,
+        source: &str,
+        is_git_repo: bool,
+        project_marker: Option<&str>,
+    ) -> Result<()> {
+        let now = unix_ts();
+        let git_flag = if is_git_repo { 1 } else { 0 };
+        self.conn.execute(
+            "INSERT INTO paths_index(path, rank, last_visit, visit_count, source, is_git_repo, project_marker, created_ts, updated_ts)
+             VALUES (?1, ?2, ?3, 0, ?4, ?5, ?6, ?7, ?7)
+             ON CONFLICT(path) DO UPDATE SET
+                 rank = MAX(rank, excluded.rank),
+                 last_visit = MAX(last_visit, excluded.last_visit),
+                 updated_ts = excluded.updated_ts,
+                 is_git_repo = MAX(is_git_repo, excluded.is_git_repo),
+                 project_marker = COALESCE(excluded.project_marker, project_marker)",
+            params![path, rank, last_visit, source, git_flag, project_marker, now],
+        )?;
+        Ok(())
+    }
+
+    /// Top frecent paths, ranked by `rank * decay(now - last_visit)`.
+    /// `prefix_filter`: optional case-insensitive substring match on `path`.
+    pub fn top_paths(&self, prefix_filter: Option<&str>, limit: usize) -> Result<Vec<PathFrecency>> {
+        // Decay matches engine.rs::recency_score: 1 / (1 + age_hours).
+        // Computed in Rust after pulling rows; we order in SQL by rank, then re-sort.
+        // We over-fetch by 4x to give room for decay-based reordering, capped.
+        let fetch = (limit * 4).max(limit + 16);
+        let now = unix_ts();
+        let mut rows: Vec<PathFrecency> = if let Some(filter) = prefix_filter {
+            let pattern = format!("%{}%", filter.to_lowercase());
+            let mut stmt = self.conn.prepare(
+                "SELECT path, rank, last_visit, visit_count, source, is_git_repo, project_marker
+                 FROM paths_index
+                 WHERE LOWER(path) LIKE ?1
+                 ORDER BY rank DESC
+                 LIMIT ?2",
+            )?;
+            let mapped = stmt
+                .query_map(params![pattern, fetch as i64], |row| {
+                    Ok(PathFrecency {
+                        path: row.get(0)?,
+                        rank: row.get(1)?,
+                        last_visit: row.get(2)?,
+                        visit_count: row.get(3)?,
+                        source: row.get(4)?,
+                        is_git_repo: row.get::<_, i64>(5)? != 0,
+                        project_marker: row.get(6)?,
+                    })
+                })?
+                .filter_map(Result::ok)
+                .collect::<Vec<_>>();
+            mapped
+        } else {
+            let mut stmt = self.conn.prepare(
+                "SELECT path, rank, last_visit, visit_count, source, is_git_repo, project_marker
+                 FROM paths_index
+                 ORDER BY rank DESC
+                 LIMIT ?1",
+            )?;
+            let mapped = stmt
+                .query_map(params![fetch as i64], |row| {
+                    Ok(PathFrecency {
+                        path: row.get(0)?,
+                        rank: row.get(1)?,
+                        last_visit: row.get(2)?,
+                        visit_count: row.get(3)?,
+                        source: row.get(4)?,
+                        is_git_repo: row.get::<_, i64>(5)? != 0,
+                        project_marker: row.get(6)?,
+                    })
+                })?
+                .filter_map(Result::ok)
+                .collect::<Vec<_>>();
+            mapped
+        };
+
+        rows.sort_by(|a, b| {
+            let sa = path_frecency_decayed(a.rank, a.last_visit, now);
+            let sb = path_frecency_decayed(b.rank, b.last_visit, now);
+            sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        rows.truncate(limit);
+        Ok(rows)
+    }
+
+    /// Maximum rank across paths_index (for normalization).
+    pub fn paths_index_max_rank(&self) -> Result<f64> {
+        let value: Option<f64> = self
+            .conn
+            .query_row("SELECT MAX(rank) FROM paths_index", [], |row| row.get(0))
+            .optional()?
+            .flatten();
+        Ok(value.unwrap_or(0.0))
+    }
+
+    /// Look up the rank for a single path; 0.0 if missing.
+    pub fn path_rank(&self, path: &str) -> Result<f64> {
+        let value: Option<f64> = self
+            .conn
+            .query_row(
+                "SELECT rank FROM paths_index WHERE path = ?1",
+                params![path],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(value.unwrap_or(0.0))
     }
 
     pub fn upsert_index_target(
@@ -1175,6 +1331,54 @@ fn unix_ts() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64
+}
+
+fn path_frecency_decayed(rank: f64, last_visit: i64, now: i64) -> f64 {
+    let age_secs = (now - last_visit).max(0) as f64;
+    let decay = 1.0 / (1.0 + age_secs / 3600.0);
+    rank * decay
+}
+
+/// Resolve a `cd` target to an absolute path string.
+/// Returns None for relative paths and shell substitutions (skip).
+fn resolve_cd_target(target: &str) -> Option<String> {
+    let target = target.trim();
+    if target.is_empty() || target.contains('$') || target.contains('`') {
+        return None;
+    }
+    if let Some(rest) = target.strip_prefix("~/") {
+        let home = dirs::home_dir()?;
+        return Some(home.join(rest).to_string_lossy().to_string());
+    }
+    if target == "~" {
+        let home = dirs::home_dir()?;
+        return Some(home.to_string_lossy().to_string());
+    }
+    if target.starts_with('/') {
+        return Some(target.to_string());
+    }
+    None
+}
+
+/// If `command` is a `cd <path>`, return the resolved absolute target.
+fn extract_cd_target(command: &str) -> Option<String> {
+    let trimmed = command.trim();
+    let rest = trimmed.strip_prefix("cd ")?;
+    // Strip surrounding quotes if any (single, double).
+    let arg = rest.trim();
+    let unquoted = if (arg.starts_with('"') && arg.ends_with('"') && arg.len() >= 2)
+        || (arg.starts_with('\'') && arg.ends_with('\'') && arg.len() >= 2)
+    {
+        &arg[1..arg.len() - 1]
+    } else {
+        arg
+    };
+    // Take only the first token (don't try to interpret flags).
+    let first = unquoted.split_whitespace().next().unwrap_or(unquoted);
+    if first.is_empty() {
+        return None;
+    }
+    resolve_cd_target(first)
 }
 
 fn sanitize_trust(value: Option<&str>) -> Option<String> {
@@ -1710,5 +1914,99 @@ mod tests {
         };
         db.replace_docs_for_command("mycmd", &[doc]).unwrap();
         assert!(!db.command_has_docs("othercmd"));
+    }
+
+    #[test]
+    fn paths_index_upsert_and_top_paths() {
+        let db = test_db();
+        let now = unix_ts();
+        db.upsert_path_index_with_rank("/tmp/aaa", 3.0, now, "test", false, None)
+            .unwrap();
+        db.upsert_path_index_with_rank("/tmp/bbb", 5.0, now, "test", false, None)
+            .unwrap();
+        db.upsert_path_index_with_rank("/tmp/ccc", 1.0, now, "test", false, None)
+            .unwrap();
+
+        let top = db.top_paths(None, 5).unwrap();
+        assert_eq!(top.len(), 3);
+        assert_eq!(top[0].path, "/tmp/bbb");
+        assert_eq!(top[1].path, "/tmp/aaa");
+        assert_eq!(top[2].path, "/tmp/ccc");
+    }
+
+    #[test]
+    fn top_paths_filters_by_prefix() {
+        let db = test_db();
+        let now = unix_ts();
+        db.upsert_path_index_with_rank("/tmp/alpha", 2.0, now, "test", false, None)
+            .unwrap();
+        db.upsert_path_index_with_rank("/tmp/beta", 3.0, now, "test", false, None)
+            .unwrap();
+
+        let filtered = db.top_paths(Some("alp"), 10).unwrap();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].path, "/tmp/alpha");
+    }
+
+    #[test]
+    fn cd_history_event_populates_paths_index() {
+        let db = test_db();
+        db.record_history(&RecordCommandRequest {
+            command: "cd /tmp/foo".to_string(),
+            cwd: "/tmp".to_string(),
+            shell: Some("zsh".to_string()),
+            trust: Some(TRUST_INTERACTIVE.to_string()),
+            provenance: Some(PROVENANCE_TYPED_MANUAL.to_string()),
+            provenance_source: None,
+            provenance_confidence: None,
+            origin: Some("zsh_precmd".to_string()),
+            tty_present: Some(true),
+            exit_status: None,
+            accepted_request_id: None,
+            accepted_item_key: None,
+            accepted_rank: None,
+        })
+        .expect("record cd history");
+
+        let top = db.top_paths(None, 10).unwrap();
+        assert!(
+            top.iter().any(|p| p.path == "/tmp/foo"),
+            "expected /tmp/foo in paths_index, got: {top:?}"
+        );
+    }
+
+    #[test]
+    fn upsert_path_index_increments_rank() {
+        let db = test_db();
+        db.upsert_path_index("/tmp/foo", "cwd_event", false, None)
+            .unwrap();
+        db.upsert_path_index("/tmp/foo", "cwd_event", false, None)
+            .unwrap();
+        db.upsert_path_index("/tmp/foo", "cwd_event", false, None)
+            .unwrap();
+        let top = db.top_paths(None, 10).unwrap();
+        let row = top.iter().find(|p| p.path == "/tmp/foo").unwrap();
+        assert_eq!(row.visit_count, 3);
+        assert!(row.rank >= 3.0);
+    }
+
+    #[test]
+    fn extract_cd_target_resolves_absolute_and_skips_relative() {
+        assert_eq!(
+            extract_cd_target("cd /tmp/foo"),
+            Some("/tmp/foo".to_string())
+        );
+        assert_eq!(
+            extract_cd_target("cd  /tmp/foo "),
+            Some("/tmp/foo".to_string())
+        );
+        assert_eq!(
+            extract_cd_target("cd \"/tmp/foo\""),
+            Some("/tmp/foo".to_string())
+        );
+        assert_eq!(extract_cd_target("cd ./relative"), None);
+        assert_eq!(extract_cd_target("cd $VAR"), None);
+        assert_eq!(extract_cd_target("git cd /tmp"), None);
+        assert_eq!(extract_cd_target("cd"), None);
     }
 }

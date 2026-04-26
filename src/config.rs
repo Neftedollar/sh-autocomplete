@@ -40,6 +40,7 @@ pub struct RankingWeights {
     pub position_score: f64,
     pub source_prior: f64,
     pub doc_match_score: f64,
+    pub path_frecency_score: f64,
 }
 
 impl Default for RankingWeights {
@@ -55,6 +56,7 @@ impl Default for RankingWeights {
             position_score: 0.04,
             source_prior: 0.03,
             doc_match_score: 0.02,
+            path_frecency_score: 0.10,
         }
     }
 }
@@ -206,6 +208,7 @@ impl AppConfig {
             "ranking.position_score" => Some(self.ranking.position_score.to_string()),
             "ranking.source_prior" => Some(self.ranking.source_prior.to_string()),
             "ranking.doc_match_score" => Some(self.ranking.doc_match_score.to_string()),
+            "ranking.path_frecency_score" => Some(self.ranking.path_frecency_score.to_string()),
             "ui.zsh.menu_detail" => Some(self.ui.zsh.menu_detail.clone()),
             "ui.zsh.show_kind" => Some(self.ui.zsh.show_kind.to_string()),
             "ui.zsh.show_source" => Some(self.ui.zsh.show_source.to_string()),
@@ -246,6 +249,7 @@ impl AppConfig {
             "ranking.position_score" => self.ranking.position_score = value.parse()?,
             "ranking.source_prior" => self.ranking.source_prior = value.parse()?,
             "ranking.doc_match_score" => self.ranking.doc_match_score = value.parse()?,
+            "ranking.path_frecency_score" => self.ranking.path_frecency_score = value.parse()?,
             "ui.zsh.menu_detail" => self.ui.zsh.menu_detail = parse_menu_detail(value)?,
             "ui.zsh.show_kind" => self.ui.zsh.show_kind = parse_bool(value)?,
             "ui.zsh.show_source" => self.ui.zsh.show_source = parse_bool(value)?,

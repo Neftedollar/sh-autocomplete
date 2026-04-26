@@ -92,10 +92,17 @@ impl Engine {
             .clone()
             .or_else(|| self.db.latest_command().ok().flatten());
 
+        let max_path_rank = self.db.paths_index_max_rank().unwrap_or(0.0);
         let mut items: Vec<RankedCandidate> = candidates
             .drain(..)
             .map(|candidate| {
-                self.score_candidate(&candidate, &parsed, &req.cwd, prev_command.as_deref())
+                self.score_candidate(
+                    &candidate,
+                    &parsed,
+                    &req.cwd,
+                    prev_command.as_deref(),
+                    max_path_rank,
+                )
             })
             .collect();
 
@@ -145,11 +152,18 @@ impl Engine {
             .prev_command
             .clone()
             .or_else(|| self.db.latest_command().ok().flatten());
+        let max_path_rank = self.db.paths_index_max_rank().unwrap_or(0.0);
         let mut explained = self
             .collect_candidates(&req, &parsed)?
             .into_iter()
             .map(|candidate| {
-                self.score_candidate(&candidate, &parsed, &req.cwd, prev_command.as_deref())
+                self.score_candidate(
+                    &candidate,
+                    &parsed,
+                    &req.cwd,
+                    prev_command.as_deref(),
+                    max_path_rank,
+                )
             })
             .collect::<Vec<_>>();
         explained.sort_by(|left, right| cmp_score(right.item.score, left.item.score));
@@ -385,7 +399,10 @@ impl Engine {
         }
 
         if cd_empty_path_context {
-            return Ok(candidates);
+            // Suppress only history sources from polluting empty `cd ` results;
+            // allow path_cache and path_jump to flow through so users see
+            // local children plus global frecent jumps.
+            candidates.retain(|c| c.source != "history" && c.source != "runtime_history");
         }
 
         if let Some(prev_command) = req
@@ -451,19 +468,82 @@ impl Engine {
         candidates: &mut Vec<Candidate>,
         seen: &mut HashSet<String>,
     ) -> Result<()> {
-        // Preserve existing behavior EXACTLY: cd-hardcoded path completion only.
-        // Workstream A will extend this; Workstream C will replace the body.
         if matches!(parsed.role, TokenRole::Path)
             || matches!(parsed.prev_token.as_deref(), Some("cd"))
             || command == "cd"
         {
-            self.collect_path_candidates(
-                active,
-                cwd,
-                command == "cd" || matches!(parsed.prev_token.as_deref(), Some("cd")),
+            let cd_like =
+                command == "cd" || matches!(parsed.prev_token.as_deref(), Some("cd"));
+            self.collect_path_candidates(active, cwd, cd_like, candidates, seen)?;
+            // Hybrid-cd: also surface frecent paths from the global index for
+            // cd-like contexts so deep directories can be jumped to from anywhere.
+            if is_cd_path_context(parsed) {
+                self.collect_global_path_candidates(active, cwd, candidates, seen)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn collect_global_path_candidates(
+        &self,
+        active: &str,
+        cwd: &str,
+        candidates: &mut Vec<Candidate>,
+        seen: &mut HashSet<String>,
+    ) -> Result<()> {
+        let filter = if active.is_empty() {
+            None
+        } else {
+            Some(active)
+        };
+        let limit = self.config.max_results.saturating_mul(2).max(8);
+        let rows = match self.db.top_paths(filter, limit) {
+            Ok(rows) => rows,
+            Err(_) => return Ok(()),
+        };
+        if rows.is_empty() {
+            return Ok(());
+        }
+
+        let cwd_path = PathBuf::from(cwd);
+        let home = dirs::home_dir();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+
+        for row in rows {
+            let path = PathBuf::from(&row.path);
+            // Skip paths equal to cwd.
+            if path == cwd_path {
+                continue;
+            }
+            // Skip direct children of cwd (already covered by collect_path_candidates).
+            if path.parent().map(|p| p == cwd_path).unwrap_or(false) {
+                continue;
+            }
+            // Skip missing paths (cheap stat).
+            if !path.exists() {
+                continue;
+            }
+
+            let abs = path.to_string_lossy().to_string();
+            let display_path = shorten_with_home(&abs, home.as_deref());
+            let insert_text = display_path.clone();
+            let display = format!("\u{2192} {display_path}");
+            let description = format_path_jump_description(row.is_git_repo, row.last_visit, now);
+
+            push_candidate(
                 candidates,
                 seen,
-            )?;
+                Candidate {
+                    insert_text,
+                    display,
+                    kind: "path_jump".to_string(),
+                    source: "path_jump".to_string(),
+                    description: Some(description),
+                },
+            );
         }
         Ok(())
     }
@@ -538,6 +618,7 @@ impl Engine {
         parsed: &ParsedContext,
         cwd: &str,
         prev_command: Option<&str>,
+        max_path_rank: f64,
     ) -> RankedCandidate {
         let active = parsed.active_token.as_str();
         let history_key = contextual_candidate_key(parsed, candidate);
@@ -603,6 +684,11 @@ impl Engine {
                 "doc_match_score",
                 doc_match_score(active, candidate.description.as_deref()),
                 self.config.ranking.doc_match_score,
+            ),
+            feature(
+                "path_frecency_score",
+                path_frecency_score(candidate, &self.db, max_path_rank),
+                self.config.ranking.path_frecency_score,
             ),
         ];
 
@@ -808,6 +894,7 @@ fn position_score(parsed: &ParsedContext, candidate: &Candidate) -> f64 {
         TokenRole::Option if candidate.kind == "option" => 1.0,
         TokenRole::Path if candidate.kind == "path" => 1.0,
         _ if is_cd_path_context(parsed) && candidate.kind == "path" => 1.0,
+        _ if is_cd_path_context(parsed) && candidate.kind == "path_jump" => 1.0,
         TokenRole::SubcommandOrArg if candidate.kind == "module" => 1.0,
         TokenRole::SubcommandOrArg if candidate.kind == "subcommand" => 0.9,
         TokenRole::SubcommandOrArg if candidate.kind == "history" => 0.6,
@@ -830,6 +917,7 @@ fn source_prior(source: &str, kind: &str) -> f64 {
         ("runtime_history", _) => 0.65,
         ("transition", _) => 0.7,
         ("path_cache", _) => 0.9,
+        ("path_jump", _) => 0.85,
         _ => 0.4,
     }
 }
@@ -841,6 +929,64 @@ fn doc_match_score(query: &str, description: Option<&str>) -> f64 {
     description
         .map(|text| fuzzy_match_score(query, text))
         .unwrap_or_default()
+}
+
+fn path_frecency_score(candidate: &Candidate, db: &AppDb, max_rank: f64) -> f64 {
+    if candidate.kind != "path_jump" || max_rank <= 0.0 {
+        return 0.0;
+    }
+    let abs = expand_with_home(&candidate.insert_text);
+    let rank = db.path_rank(&abs).unwrap_or(0.0);
+    (rank / max_rank).clamp(0.0, 1.0)
+}
+
+fn shorten_with_home(path: &str, home: Option<&Path>) -> String {
+    if let Some(home) = home {
+        let home_str = home.to_string_lossy();
+        if path == home_str.as_ref() {
+            return "~".to_string();
+        }
+        if let Some(stripped) = path.strip_prefix(home_str.as_ref()) {
+            if let Some(rest) = stripped.strip_prefix('/') {
+                return format!("~/{rest}");
+            }
+        }
+    }
+    path.to_string()
+}
+
+fn expand_with_home(path: &str) -> String {
+    if path == "~" {
+        return dirs::home_dir()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|| path.to_string());
+    }
+    if let Some(rest) = path.strip_prefix("~/") {
+        return dirs::home_dir()
+            .map(|p| p.join(rest).to_string_lossy().to_string())
+            .unwrap_or_else(|| path.to_string());
+    }
+    path.to_string()
+}
+
+fn format_path_jump_description(is_git_repo: bool, last_visit: i64, now: i64) -> String {
+    let age = (now - last_visit).max(0);
+    let age_label = if last_visit <= 0 {
+        "no recent visit".to_string()
+    } else if age < 60 {
+        "just now".to_string()
+    } else if age < 3600 {
+        format!("{}m ago", age / 60)
+    } else if age < 86_400 {
+        format!("{}h ago", age / 3600)
+    } else {
+        format!("{}d ago", age / 86_400)
+    };
+    if is_git_repo {
+        format!("git repo \u{00b7} last visit {age_label}")
+    } else {
+        format!("last visit {age_label}")
+    }
 }
 
 fn sanitize_fts_query(query: &str) -> Option<String> {
@@ -1079,6 +1225,130 @@ mod tests {
             sanitize_fts_query("pytest -k"),
             Some("pytest k".to_string())
         );
+    }
+
+    struct TestDir {
+        path: PathBuf,
+    }
+    impl TestDir {
+        fn new(label: &str) -> Self {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            let path = std::env::temp_dir()
+                .join(format!("shac-engine-{label}-{}-{nanos}", std::process::id()));
+            std::fs::create_dir_all(&path).expect("create test dir");
+            Self { path }
+        }
+    }
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn test_engine(label: &str) -> (Engine, TestDir) {
+        let dir = TestDir::new(label);
+        let paths = AppPaths {
+            config_file: dir.path.join("config.toml"),
+            db_file: dir.path.join("shac.db"),
+            socket_file: dir.path.join("shacd.sock"),
+            pid_file: dir.path.join("shacd.pid"),
+            shell_dir: dir.path.join("shell"),
+            config_dir: dir.path.clone(),
+            data_dir: dir.path.clone(),
+            state_dir: dir.path.clone(),
+        };
+        let engine = Engine::new(&paths).expect("engine");
+        (engine, dir)
+    }
+
+    fn make_request(line: &str, cwd: &str) -> CompletionRequest {
+        CompletionRequest {
+            shell: "zsh".to_string(),
+            line: line.to_string(),
+            cursor: line.len(),
+            cwd: cwd.to_string(),
+            env: std::collections::HashMap::new(),
+            session: crate::protocol::SessionInfo {
+                tty: Some("test".to_string()),
+                pid: None,
+            },
+            history_hint: crate::protocol::HistoryHint {
+                prev_command: None,
+                runtime_commands: Vec::new(),
+            },
+        }
+    }
+
+    #[test]
+    fn cd_with_global_path_emits_path_jump() {
+        use std::fs;
+        let (engine, _dir) = test_engine("path-jump");
+        let cwd = std::env::temp_dir().join(format!(
+            "shac-cd-cwd-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&cwd).unwrap();
+        let target = std::env::temp_dir().join(format!(
+            "shac-cd-target-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&target).unwrap();
+        let target_str = target.to_string_lossy().to_string();
+        engine
+            .db
+            .upsert_path_index_with_rank(&target_str, 5.0, 0, "test", false, None)
+            .unwrap();
+
+        let response = engine
+            .complete(make_request("cd ", &cwd.to_string_lossy()))
+            .expect("complete");
+        let has_path_jump = response.items.iter().any(|i| i.kind == "path_jump");
+        assert!(
+            has_path_jump,
+            "expected at least one path_jump candidate, got: {:?}",
+            response.items
+        );
+
+        let _ = fs::remove_dir_all(&cwd);
+        let _ = fs::remove_dir_all(&target);
+    }
+
+    #[test]
+    fn cd_with_no_global_paths_falls_back_to_children_only() {
+        use std::fs;
+        let (engine, _dir) = test_engine("no-global");
+        let cwd = std::env::temp_dir().join(format!(
+            "shac-cd-noglobal-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        fs::create_dir_all(cwd.join("alpha")).unwrap();
+
+        let response = engine
+            .complete(make_request("cd ", &cwd.to_string_lossy()))
+            .expect("complete");
+        let any_path_jump = response.items.iter().any(|i| i.kind == "path_jump");
+        assert!(
+            !any_path_jump,
+            "expected no path_jump candidates with empty paths_index, got: {:?}",
+            response.items
+        );
+
+        let _ = fs::remove_dir_all(&cwd);
     }
 
     #[test]
