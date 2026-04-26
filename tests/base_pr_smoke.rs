@@ -6,7 +6,7 @@ use support::TestEnv;
 fn base_pr_paths_index_table_exists() {
     let env = TestEnv::new("base-pr-paths-index");
     // Trigger DB init via any shac command
-    support::run_ok(&env, &["stats"]);
+    support::run_ok(&env, ["stats"]);
     let db_path = env.app_paths().db_file;
     let conn = rusqlite::Connection::open(&db_path).unwrap();
     let count: i64 = conn
@@ -22,7 +22,7 @@ fn base_pr_paths_index_table_exists() {
 #[test]
 fn base_pr_history_import_hash_column_exists() {
     let env = TestEnv::new("base-pr-history-import-hash");
-    support::run_ok(&env, &["stats"]);
+    support::run_ok(&env, ["stats"]);
     let db_path = env.app_paths().db_file;
     let conn = rusqlite::Connection::open(&db_path).unwrap();
     let mut stmt = conn.prepare("PRAGMA table_info(history_events)").unwrap();

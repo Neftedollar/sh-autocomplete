@@ -226,8 +226,8 @@ fn read_history_lines(path: &Path) -> Result<Vec<String>> {
     let mut out = Vec::new();
     let mut current = String::new();
     for raw in decoded.lines() {
-        if raw.ends_with('\\') {
-            current.push_str(&raw[..raw.len() - 1]);
+        if let Some(stripped) = raw.strip_suffix('\\') {
+            current.push_str(stripped);
             current.push('\n');
             continue;
         }
@@ -781,7 +781,7 @@ mod tests {
         }
         // Add a non-repo too
         std::fs::create_dir_all(root.join("delta")).unwrap();
-        let summary = scan_projects(&db, &[root.clone()], 3).unwrap();
+        let summary = scan_projects(&db, std::slice::from_ref(&root), 3).unwrap();
         assert!(summary.inserted >= 3, "summary={:?}", summary);
         assert_eq!(db.count_paths_index_by_source("project_scan").unwrap(), 3);
         let rows = db.top_paths(None, 50).unwrap();

@@ -1222,7 +1222,7 @@ impl AppDb {
         Ok(())
     }
 
-    pub fn count_paths_index(&self) -> Result<i64> { Ok(count(&self.conn, "paths_index")?) }
+    pub fn count_paths_index(&self) -> Result<i64> { count(&self.conn, "paths_index") }
     pub fn count_paths_index_by_source(&self, source: &str) -> Result<i64> {
         Ok(self.conn.query_row(
             "SELECT COUNT(*) FROM paths_index WHERE source = ?1",
