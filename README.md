@@ -24,6 +24,7 @@ Landing page: https://neftedollar.github.io/sh-autocomplete/
 - project-aware heuristic reranking
 - optional local ML reranking from a JSON model file
 - on-demand path completion with cached hot directories
+- branch-aware completion for `git checkout|switch|branch|merge|rebase` via `git for-each-ref` (200 ms timeout, no cache yet)
 - builtin docs for `git`, `docker`, `kubectl`, `npm`, `cargo`, `dotnet`, `python`, `pip`, `pytest`
 - explain output for feature contributions
 
