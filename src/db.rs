@@ -1211,6 +1211,56 @@ impl AppDb {
         Ok(changed > 0)
     }
 
+    /// Batch-insert imported history rows in a single multi-VALUES statement
+    /// using `INSERT OR IGNORE`. Returns the number of rows actually inserted
+    /// (changes() reflects rows the unique partial index accepted). Empty
+    /// batches are a no-op and return 0.
+    ///
+    /// Each row is a tuple `(ts, cwd, command, shell, import_hash, trust,
+    /// provenance)`. `imported_at` is filled with `unix_ts()` per call.
+    /// `provenance_source`, `provenance_confidence`, `origin`, and
+    /// `tty_present` use the same constants as `insert_imported_history`.
+    #[allow(clippy::type_complexity)]
+    pub fn insert_imported_history_batch(
+        &self,
+        rows: &[(i64, String, String, Option<String>, String, String, String)],
+    ) -> Result<usize> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        let imported_at = unix_ts();
+        let mut sql = String::from(
+            "INSERT OR IGNORE INTO history_events(\
+                ts, cwd, command, shell, trust, provenance,\
+                provenance_source, provenance_confidence, origin, tty_present,\
+                import_hash, imported_at\
+             ) VALUES ",
+        );
+        // 12 columns per row; build placeholders.
+        let placeholders_per_row = "(?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)";
+        for i in 0..rows.len() {
+            if i > 0 { sql.push(','); }
+            sql.push_str(placeholders_per_row);
+        }
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::with_capacity(rows.len() * 11);
+        for (ts, cwd, command, shell, import_hash, trust, provenance) in rows {
+            params.push(Box::new(*ts));
+            params.push(Box::new(cwd.clone()));
+            params.push(Box::new(command.clone()));
+            params.push(Box::new(shell.clone()));
+            params.push(Box::new(trust.clone()));
+            params.push(Box::new(provenance.clone()));
+            params.push(Box::new(PROVENANCE_SOURCE_UNKNOWN));
+            params.push(Box::new(PROVENANCE_CONFIDENCE_UNKNOWN));
+            params.push(Box::new("import"));
+            params.push(Box::new(import_hash.clone()));
+            params.push(Box::new(imported_at));
+        }
+        let refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|b| b.as_ref()).collect();
+        let changed = self.conn.execute(&sql, rusqlite::params_from_iter(refs.iter()))?;
+        Ok(changed)
+    }
+
     pub fn begin_txn(&self) -> Result<()> { self.conn.execute_batch("BEGIN")?; Ok(()) }
     pub fn commit_txn(&self) -> Result<()> { self.conn.execute_batch("COMMIT")?; Ok(()) }
     pub fn rollback_txn(&self) -> Result<()> { self.conn.execute_batch("ROLLBACK")?; Ok(()) }
