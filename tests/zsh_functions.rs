@@ -157,6 +157,48 @@ assert_contains "$POSTDISPLAY" "[subcommand/builtin-index]" "debug render forces
     );
 }
 
+#[test]
+fn zsh_menu_render_tints_path_jump_kind() {
+    if !support::command_available("zsh") {
+        eprintln!("skipping zsh function tests: zsh is unavailable");
+        return;
+    }
+
+    run_zsh(
+        r#"
+unset SHAC_NO_COLOR
+_shac_menu_open=1
+_shac_menu_selected_index=1
+_shac_menu_item_keys=("~/Documents/dev/sh-autocomplete")
+_shac_menu_insert_texts=("~/Documents/dev/sh-autocomplete")
+_shac_menu_displays=($'\xe2\x86\x92 ~/Documents/dev/sh-autocomplete')
+_shac_menu_kinds=("path_jump")
+_shac_menu_sources=("path_jump")
+_shac_menu_descriptions=("git repo")
+
+_shac_ui_menu_detail="debug"
+_shac_ui_show_kind=0
+_shac_ui_show_source=0
+_shac_ui_show_description=0
+_shac_render_menu
+assert_contains "$POSTDISPLAY" $'\e[36m[path_jump/path_jump]\e[0m' "debug render tints path_jump label cyan"
+assert_contains "$POSTDISPLAY" $'\e[36m\xe2\x86\x92\e[0m' "menu render tints path_jump arrow cyan"
+
+# SHAC_NO_COLOR opt-out: no ANSI escapes anywhere in POSTDISPLAY.
+SHAC_NO_COLOR=1 _shac_render_menu
+assert_not_contains "$POSTDISPLAY" $'\e[36m' "SHAC_NO_COLOR disables cyan tint"
+
+# Non-path_jump kinds remain uncolored even when color is on.
+unset SHAC_NO_COLOR
+_shac_menu_kinds=("subcommand")
+_shac_menu_sources=("builtin-index")
+_shac_menu_displays=("checkout")
+_shac_render_menu
+assert_not_contains "$POSTDISPLAY" $'\e[36m' "non-path_jump kind is not tinted"
+"#,
+    );
+}
+
 fn run_zsh(body: &str) {
     let script_path = std::env::current_dir()
         .expect("current dir")
