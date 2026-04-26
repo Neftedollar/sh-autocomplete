@@ -1,8 +1,8 @@
 class Shac < Formula
-  desc "Local shell autocomplete engine for zsh and bash"
+  desc "Local shell autocomplete engine for bash, zsh, and fish"
   homepage "https://github.com/Neftedollar/sh-autocomplete"
-  url "https://github.com/Neftedollar/sh-autocomplete/archive/refs/tags/v0.1.3.tar.gz"
-  sha256 "fee8db0fdd4a171a6cc352d5f19e2259503cd61d7427caf554f34dabbc1c899a"
+  url "https://github.com/Neftedollar/sh-autocomplete/archive/refs/tags/v0.2.0.tar.gz"
+  sha256 "d49744a51eb5cfd0fe578b518e23b6839ef823d5f20a171caa248c9c0535bc29"
   license "MIT"
   head "https://github.com/Neftedollar/sh-autocomplete.git", branch: "main"
 
