@@ -94,6 +94,8 @@ shac config set ui.zsh.max_items 8
 
 Defaults are optimized for daily use: compact descriptions are shown, internal `kind/source` metadata is hidden. Use `ui.zsh.menu_detail debug` when diagnosing ranking or candidate source issues.
 
+Hybrid `cd` candidates surfaced from `paths_index` (`kind=path_jump`) render with a cyan-tinted leading `→` arrow so they're visually distinguishable from local cwd children. Set `SHAC_NO_COLOR=1` to disable the tint.
+
 ## Install and uninstall
 
 ```bash

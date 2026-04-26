@@ -371,7 +371,16 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
     if (( ${#parts[@]} == 0 )); then
       REPLY=""
     else
-      REPLY="[${(j:/:)parts}]"
+      local raw="[${(j:/:)parts}]"
+      # Cosmetic tint: path_jump candidates (hybrid-cd, frecent global
+      # paths) render with a cyan label so they're distinguishable from
+      # local cwd children at a glance. SHAC_NO_COLOR=1 disables ANSI
+      # output; default is on for interactive shells.
+      if [[ "$kind" == "path_jump" && -z "${SHAC_NO_COLOR:-}" ]]; then
+        REPLY=$'\e[36m'"$raw"$'\e[0m'
+      else
+        REPLY="$raw"
+      fi
     fi
   }
 
@@ -418,6 +427,13 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
       kind="${_shac_menu_kinds[$i]}"
       source="${_shac_menu_sources[$i]}"
       description="${_shac_menu_descriptions[$i]}"
+      # Cosmetic tint: replace the leading arrow on path_jump items with a
+      # cyan-tinted arrow so frecent global paths are distinguishable from
+      # local cwd children at a glance. Idempotent — only the arrow glyph
+      # is colorized, the rest of the display string is unchanged.
+      if [[ "$kind" == "path_jump" && -z "${SHAC_NO_COLOR:-}" && "$display" == $'→ '* ]]; then
+        display=$'\e[36m→\e[0m'"${display#$'→'}"
+      fi
       line="${marker} ${display}"
       _shac_render_metadata_label "$kind" "$source"
       label="$REPLY"
