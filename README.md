@@ -27,6 +27,7 @@ Landing page: https://neftedollar.github.io/sh-autocomplete/
 - branch-aware completion for `git checkout|switch|branch|merge|rebase` via `git for-each-ref` (200 ms timeout, no cache yet)
 - bundled command priors (~60 grammar pairs for git, docker, kubectl, npm, ...) seeded on first install for cold-start
 - live `npm run` / `pnpm run` / `yarn run` script completion parsed from the cwd's nearest `package.json` (walk-up bounded to 8 levels, stops at `.git` boundary)
+- `ssh <Tab>` / `mosh <Tab>` host completion parsed from `~/.ssh/config` `Host` entries and `~/.ssh/known_hosts` (wildcards skipped, hashed entries skipped, `[host]:port` notation handled)
 - builtin docs for `git`, `docker`, `kubectl`, `npm`, `cargo`, `dotnet`, `python`, `pip`, `pytest`
 - explain output for feature contributions
 

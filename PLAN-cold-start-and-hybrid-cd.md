@@ -589,6 +589,7 @@ Status as of integration commit `e31edde` + cleanup/tests `f68ac43` + Section 7 
 - **7.14** Performance tuning of zsh-history import (`feat/section-7-14-perf` `bc9e89d`, +2 perf tests). Switched dedupe hash from `sha2::Sha256` to `blake3` and batched `INSERT OR IGNORE INTO history_events` into multi-VALUES statements of 500 rows. Measured release-mode: 10k lines in ~50ms, 200k lines in ~1.6s (under 2.5s budget). Tests `perf_10k_history_lines_under_800ms_release` and `perf_200k_history_lines_under_2500ms_release` lock in budgets. `sha2` dep removed.
 - **7.6** Script collector (`feat/section-7-6-script-collector` `695622f`, +6 tests). `collect_npm_script_candidates` in `src/engine.rs` walks up from cwd to nearest `package.json` (capped at 8 levels, stops at `.git`), parses `scripts` object, emits each name with `kind=npm_script` (position_score 1.0, source_prior 0.85). `dispatch_path_like` `Script =>` arm wired up. Covers `npm run`, `pnpm run`, `yarn run`. README Current MVP updated.
 - **7.2** Bundled command priors (`feat/section-7-2-priors`, +6 tests). `src/priors.rs` ships a hand-curated static corpus of ~60 `(command, item_type, item_value, description)` rows covering `git`, `npm`, `pnpm`, `yarn`, `cargo`, `docker`, `kubectl`, `gh`, `brew`, `make`, `python`/`python3`, `pip`. `seed_priors_into_docs(&db)` writes them with `source = "priors"` via `replace_docs_for_command` (idempotent). `shac install` seeds priors after `run_full_import` and prints `Loaded N command priors`. README Current MVP updated.
+- **7.5** Host collector (`feat/section-7-5-host-collector`, +13 tests). `collect_ssh_host_candidates` in `src/engine.rs` parses `~/.ssh/config` `Host` directives (skipping `*`/`?` wildcards, not following `Include` in v1) and `~/.ssh/known_hosts` host columns (stripping `[host]:port` brackets, skipping `|1|` hashed entries and `@cert-authority`/`@revoked` markers). Both sources merged and deduplicated. `dispatch_path_like` `Host =>` arm wired (carves `Host` out of the joined stub arm). `position_score` 1.0 and `source_prior` 0.85 for `ssh_host` kind. `tests/ssh_host_collector.rs`: 9 e2e tests; 4 inline parser unit tests in `src/engine.rs`. README Current MVP updated.
 
 ### ⏳ Pending — High priority (cold-start activation)
 
@@ -606,7 +607,7 @@ Stubs in `Engine::dispatch_path_like` for non-Directory/Path arg types. Each is 
 | # | ArgType | Implementation source | Status |
 |---|---|---|---|
 | 7.4 | `Branch` | `git for-each-ref refs/heads refs/remotes` cached per-repo | ✅ Done |
-| 7.5 | `Host` | parse `~/.ssh/config` + `~/.ssh/known_hosts` | ⏳ Pending |
+| 7.5 | `Host` | parse `~/.ssh/config` + `~/.ssh/known_hosts` | ✅ Done |
 | 7.6 | `Script` | parse `package.json` of cwd's nearest project root | ✅ Done |
 | 7.7 | `Resource` | cache `kubectl api-resources` output | ⏳ Pending |
 | 7.8 | `Image` | cache `docker images` output | ⏳ Pending |
