@@ -222,6 +222,9 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
     fi
     _shac_clear_menu_display
     _shac_reset_menu_state
+    # Drop any leftover inline state so a stale ghost-text accept can't fire after
+    # the menu was used. Safe even when no inline was active (early-return).
+    _shac_clear_inline
   }
 
   function _shac_preview_buffer_for_item() {

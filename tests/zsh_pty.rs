@@ -373,6 +373,124 @@ sys.exit(1)
     );
 }
 
+#[test]
+fn zsh_inline_ghost_text_show_and_accept() {
+    if !support::command_available("zsh") {
+        eprintln!("skipping zsh inline ghost-text test: zsh is unavailable");
+        return;
+    }
+
+    let script_path = std::env::current_dir()
+        .expect("current dir")
+        .join("shell")
+        .join("zsh")
+        .join("shac.zsh");
+
+    // Unit-style harness: deterministically exercise the ghost-text state
+    // machine without needing a live daemon. We bypass `_shac_fetch_inline`
+    // (which shells out to `shac complete`) and drive the renderer + accept
+    // widget by setting state directly.
+    let body = format!(
+        r#"
+set -e
+function assert_eq() {{
+  local actual="$1"
+  local expected="$2"
+  local message="$3"
+  if [[ "$actual" != "$expected" ]]; then
+    print -ru2 -- "assertion failed: $message"
+    print -ru2 -- "expected: <$expected>"
+    print -ru2 -- "actual:   <$actual>"
+    exit 1
+  fi
+}}
+function assert_starts_with() {{
+  local haystack="$1"
+  local prefix="$2"
+  local message="$3"
+  if [[ "$haystack" != "$prefix"* ]]; then
+    print -ru2 -- "assertion failed: $message"
+    print -ru2 -- "missing prefix: <$prefix>"
+    print -ru2 -- "haystack: <$haystack>"
+    exit 1
+  fi
+}}
+function assert_nonempty() {{
+  local value="$1"
+  local message="$2"
+  if [[ -z "$value" ]]; then
+    print -ru2 -- "assertion failed: $message (value was empty)"
+    exit 1
+  fi
+}}
+source "{script_path}"
+
+# Enable the inline ghost-text feature flag the adapter reads.
+_shac_ui_inline_zsh=1
+
+# 1. _shac_show_inline writes the dim ANSI prefix and ends with reset.
+POSTDISPLAY=""
+_shac_show_inline "ckout"
+assert_nonempty "$POSTDISPLAY" "show_inline must populate POSTDISPLAY"
+assert_starts_with "$POSTDISPLAY" $'\e[2m' "POSTDISPLAY must start with the dim ANSI escape"
+case "$POSTDISPLAY" in
+  *$'\e[0m') ;;
+  *)
+    print -ru2 -- "POSTDISPLAY must end with the ANSI reset escape"
+    print -ru2 -- "actual: <$POSTDISPLAY>"
+    exit 1
+    ;;
+esac
+
+# 2. With inline state primed and CURSOR at end-of-buffer, ^F (forward-char
+#    widget) accepts the ghost suffix by appending it to BUFFER.
+BUFFER="git che"
+CURSOR=${{#BUFFER}}
+_shac_inline_active=1
+_shac_inline_suffix="ckout"
+_shac_inline_item_key="git checkout"
+_shac_inline_request_id="req-42"
+
+before_len=${{#BUFFER}}
+_shac_forward_char_widget
+assert_eq "$BUFFER" "git checkout" "forward-char widget appends ghost suffix"
+assert_eq "$CURSOR" "${{#BUFFER}}" "cursor moves to new end of buffer"
+(( ${{#BUFFER}} > before_len )) || {{
+  print -ru2 -- "BUFFER did not grow after accept: <$BUFFER>"
+  exit 1
+}}
+assert_eq "$_shac_inline_active" "0" "inline state cleared after accept"
+assert_eq "$_shac_last_accepted_item_key" "git checkout" "accepted item key recorded"
+assert_eq "$_shac_input_provenance" "accepted_completion" "provenance set to accepted_completion"
+
+# 3. _shac_clear_inline wipes state and POSTDISPLAY when the menu is closed.
+_shac_inline_active=1
+_shac_inline_suffix="something"
+POSTDISPLAY=$'\e[2m\e[38;5;240msomething\e[0m'
+_shac_menu_open=0
+_shac_clear_inline
+assert_eq "$_shac_inline_active" "0" "clear_inline resets active flag"
+assert_eq "$_shac_inline_suffix" "" "clear_inline empties suffix"
+assert_eq "$POSTDISPLAY" "" "clear_inline empties POSTDISPLAY when menu closed"
+"#,
+        script_path = script_path.display()
+    );
+
+    let output = Command::new("zsh")
+        .arg("-f")
+        .arg("-c")
+        .arg(&body)
+        .env("SHAC_ZSH_TEST_MODE", "1")
+        .output()
+        .expect("run zsh inline ghost-text test");
+    assert!(
+        output.status.success(),
+        "zsh inline ghost-text test failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 fn should_skip_pty_on_ci_linux() -> bool {
     std::env::var_os("CI").is_some() && cfg!(target_os = "linux")
 }
