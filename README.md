@@ -61,6 +61,25 @@ shac reindex
 shac doctor
 ```
 
+`shac install --shell zsh --edit-rc` runs a quick first-run pass: it
+splices the shac block into your `~/.zshrc`, prompts (Y/n) before
+importing your `~/.zsh_history`, imports your `zoxide` jump list if
+present, and scans the standard project roots (`~/dev`,
+`~/Documents/dev`, `~/code`, `~/src`, `~/projects`) for git repos.
+Pass `--yes` to skip the history-import prompt, `--no-import` to skip
+the import phase entirely. Output looks like:
+
+```
+✓ Hooking shac into zsh                          ~/.zshrc  [0.0s]
+✓ Importing zsh history                          12,847 entries, 3 dup, 1 redacted  [1.8s]
+✓ Importing zoxide                               156 destinations  [0.1s]
+✓ Scanning project roots for git repos           23 found  [0.6s]
+
+Try: cd <Tab>
+  Run `shac doctor` if Tab feels off.
+  Run `shac stats` to see what was learned.
+```
+
 Open a new shell or run:
 
 ```zsh
