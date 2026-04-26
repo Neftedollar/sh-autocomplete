@@ -642,8 +642,18 @@ fn install(paths: &AppPaths, args: InstallArgs) -> Result<()> {
     fs::write(&shell_file, content)?;
     if edit_rc {
         let rc_file = rc_file_for_shell(shell)?;
-        install_rc_block(shell, &shell_file)?;
-        println!("installed  {}", rc_file.display());
+        // Run the rc-block edit inside print_step so users see the
+        // "Hooking shac into <shell>..." in-progress line followed by the
+        // checkmark + install location.
+        let shell_label = shell_kind_to_import(shell).label();
+        let rc_display = rc_file.display().to_string();
+        print_step(
+            &format!("Hooking shac into {shell_label}"),
+            || -> Result<String> {
+                install_rc_block(shell, &shell_file)?;
+                Ok(rc_display.clone())
+            },
+        );
 
         if !args.no_import {
             let db = shac::db::AppDb::open(&paths.db_file)?;
@@ -656,16 +666,16 @@ fn install(paths: &AppPaths, args: InstallArgs) -> Result<()> {
                 zoxide_path: None,
             };
             match shac::import::run_full_import(&db, opts) {
-                Ok(summaries) => print_import_summary(&summaries),
+                Ok(summaries) => print_first_run_summary(&summaries),
                 Err(err) => eprintln!("shac: import failed: {err:#}"),
             }
         }
 
         println!();
-        println!("next steps:");
-        println!("  1. open a new terminal (or run: source {})", rc_file.display());
-        println!("  2. try pressing Tab after: git <Tab>  or  cargo <Tab>");
-        println!("  3. run `shac doctor` if something looks off");
+        println!("Try: cd <Tab>");
+        println!("  Run `shac doctor` if Tab feels off.");
+        println!("  Run `shac stats` to see what was learned.");
+        println!("  (Open a new shell or run `source {rc_display}` to activate.)");
     } else {
         println!("{snippet}");
     }
@@ -680,6 +690,141 @@ fn shell_kind_to_import(shell: ShellKind) -> shac::import::ShellKind {
     }
 }
 
+/// First-run UX printer: render polished per-source output for the install
+/// flow's import results, mirroring the spec in PLAN §7.1.
+///
+/// Each summary maps to one line:
+///
+/// `✓ Importing zsh history... (12,847 entries)     [1.8s]`
+///
+/// When stdout is not a TTY (CI logs, redirected output), we fall back to a
+/// plain colorless render and skip ANSI escape sequences.
+fn print_first_run_summary(summaries: &[shac::import::ImportSummary]) {
+    let tty = std::io::stdout().is_terminal();
+    let check = if tty { "\x1b[32m\u{2713}\x1b[0m" } else { "\u{2713}" };
+    let dim_open = if tty { "\x1b[2m" } else { "" };
+    let dim_close = if tty { "\x1b[0m" } else { "" };
+
+    for s in summaries {
+        let (label, detail) = first_run_line(s);
+        println!(
+            "{check} {label:<46} {dim_open}{detail}  [{elapsed}]{dim_close}",
+            label = label,
+            detail = detail,
+            elapsed = format_elapsed(s.elapsed),
+        );
+    }
+}
+
+/// Compact human label and detail for one [`ImportSummary`], used both by the
+/// first-run printer and the standalone `shac import` subcommand.
+fn first_run_line(s: &shac::import::ImportSummary) -> (String, String) {
+    match s.source {
+        "zsh_history" => (
+            "Importing zsh history".into(),
+            format!(
+                "{} entries, {} dup, {} redacted",
+                fmt_count(s.inserted),
+                fmt_count(s.skipped_dup),
+                fmt_count(s.skipped_redacted)
+            ),
+        ),
+        "zoxide" => (
+            "Importing zoxide".into(),
+            format!("{} destinations", fmt_count(s.inserted)),
+        ),
+        "project_scan" => (
+            "Scanning project roots for git repos".into(),
+            format!("{} found", fmt_count(s.inserted)),
+        ),
+        other => (
+            format!("Importing {other}"),
+            format!("{} inserted", fmt_count(s.inserted)),
+        ),
+    }
+}
+
+/// Render an integer with simple thousands separators (e.g. `12,847`).
+fn fmt_count(n: usize) -> String {
+    let s = n.to_string();
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(bytes.len() + bytes.len() / 3);
+    for (i, b) in bytes.iter().enumerate() {
+        if i > 0 && (bytes.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(*b as char);
+    }
+    out
+}
+
+/// Render a [`Duration`] as `0.4s` / `1.8s` (>= 100ms), or `45ms` (< 100ms).
+fn format_elapsed(d: Duration) -> String {
+    let ms = d.as_millis();
+    if ms >= 100 {
+        let secs = ms as f64 / 1000.0;
+        format!("{secs:.1}s")
+    } else {
+        format!("{ms}ms")
+    }
+}
+
+/// Print a labelled step. On a TTY, write `label...` and overwrite with
+/// `\r✓ label  detail` once the closure resolves. On a non-TTY, just print
+/// the result line directly.
+///
+/// On error, prints `✗ label  detail` and returns the error string. Errors
+/// are not propagated — `print_step` is for UX only and never fails the
+/// surrounding flow.
+fn print_step<F>(label: &str, op: F)
+where
+    F: FnOnce() -> Result<String>,
+{
+    let tty = std::io::stdout().is_terminal();
+    if tty {
+        // In-progress line — we deliberately don't terminate with \n so we
+        // can overwrite with \r below.
+        print!("{label}...");
+        let _ = std::io::stdout().flush();
+    }
+    let started = Instant::now();
+    let outcome = op();
+    let elapsed = format_elapsed(started.elapsed());
+    match outcome {
+        Ok(detail) => {
+            if tty {
+                let check = "\x1b[32m\u{2713}\x1b[0m";
+                let dim_open = "\x1b[2m";
+                let dim_close = "\x1b[0m";
+                let detail_part = if detail.is_empty() {
+                    String::new()
+                } else {
+                    format!(" {dim_open}{detail}{dim_close}")
+                };
+                // \r + clear-to-EOL ("\x1b[2K") to fully replace the prior line.
+                println!("\r\x1b[2K{check} {label:<46}{detail_part} \x1b[2m[{elapsed}]\x1b[0m");
+            } else {
+                let detail_part = if detail.is_empty() {
+                    String::new()
+                } else {
+                    format!(" {detail}")
+                };
+                println!("\u{2713} {label}{detail_part}  [{elapsed}]");
+            }
+        }
+        Err(err) => {
+            if tty {
+                let cross = "\x1b[31m\u{2717}\x1b[0m";
+                println!("\r\x1b[2K{cross} {label:<46} \x1b[31m{err:#}\x1b[0m  [{elapsed}]");
+            } else {
+                println!("\u{2717} {label}  {err:#}  [{elapsed}]");
+            }
+        }
+    }
+}
+
+/// Simple summary used by the `shac import` / `shac scan-projects`
+/// subcommands (one summary at a time, no first-run framing).
 fn print_import_summary(summaries: &[shac::import::ImportSummary]) {
     let tty = std::io::stdout().is_terminal();
     let check = if tty { "\x1b[32m\u{2713}\x1b[0m" } else { "\u{2713}" };
@@ -1378,5 +1523,75 @@ fn wait_for_shutdown(paths: &AppPaths, timeout: Duration) {
             return;
         }
         thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[cfg(test)]
+mod first_run_ux_tests {
+    use super::*;
+    use shac::import::ImportSummary;
+
+    #[test]
+    fn fmt_count_inserts_thousands_separators() {
+        assert_eq!(fmt_count(0), "0");
+        assert_eq!(fmt_count(7), "7");
+        assert_eq!(fmt_count(847), "847");
+        assert_eq!(fmt_count(1_000), "1,000");
+        assert_eq!(fmt_count(12_847), "12,847");
+        assert_eq!(fmt_count(1_234_567), "1,234,567");
+    }
+
+    #[test]
+    fn format_elapsed_seconds_above_threshold() {
+        assert_eq!(format_elapsed(Duration::from_millis(100)), "0.1s");
+        assert_eq!(format_elapsed(Duration::from_millis(1_800)), "1.8s");
+        assert_eq!(format_elapsed(Duration::from_millis(12_000)), "12.0s");
+    }
+
+    #[test]
+    fn format_elapsed_milliseconds_below_threshold() {
+        assert_eq!(format_elapsed(Duration::from_millis(0)), "0ms");
+        assert_eq!(format_elapsed(Duration::from_millis(45)), "45ms");
+        assert_eq!(format_elapsed(Duration::from_millis(99)), "99ms");
+    }
+
+    #[test]
+    fn first_run_line_labels_match_spec() {
+        let s = ImportSummary {
+            source: "zsh_history",
+            seen: 12_847,
+            inserted: 12_847,
+            skipped_dup: 3,
+            skipped_redacted: 1,
+            elapsed: Duration::from_millis(1_800),
+        };
+        let (label, detail) = first_run_line(&s);
+        assert_eq!(label, "Importing zsh history");
+        assert!(detail.contains("12,847 entries"));
+        assert!(detail.contains("3 dup"));
+        assert!(detail.contains("1 redacted"));
+    }
+
+    #[test]
+    fn first_run_line_handles_zoxide_and_project_scan() {
+        let zox = ImportSummary {
+            source: "zoxide",
+            seen: 156, inserted: 156,
+            skipped_dup: 0, skipped_redacted: 0,
+            elapsed: Duration::from_millis(100),
+        };
+        let (label, detail) = first_run_line(&zox);
+        assert_eq!(label, "Importing zoxide");
+        assert_eq!(detail, "156 destinations");
+
+        let scan = ImportSummary {
+            source: "project_scan",
+            seen: 23, inserted: 23,
+            skipped_dup: 0, skipped_redacted: 0,
+            elapsed: Duration::from_millis(600),
+        };
+        let (label, detail) = first_run_line(&scan);
+        assert_eq!(label, "Scanning project roots for git repos");
+        assert_eq!(detail, "23 found");
     }
 }

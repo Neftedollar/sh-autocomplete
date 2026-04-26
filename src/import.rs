@@ -59,7 +59,7 @@ pub enum ShellKind {
 }
 
 impl ShellKind {
-    fn label(self) -> &'static str {
+    pub fn label(self) -> &'static str {
         match self {
             ShellKind::Bash => "bash",
             ShellKind::Fish => "fish",
