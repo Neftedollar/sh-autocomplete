@@ -58,7 +58,7 @@ fn shac_import_zsh_history_with_explicit_path() {
 
     let _ = run_ok(
         &env,
-        &[
+        [
             "import",
             "zsh-history",
             "--path",
@@ -86,7 +86,7 @@ fn shac_import_zsh_history_dry_run_does_not_write() {
 
     let _ = run_ok(
         &env,
-        &[
+        [
             "import",
             "zsh-history",
             "--path",
@@ -124,7 +124,7 @@ fn shac_import_zoxide_with_explicit_path() {
 
     let _ = run_ok(
         &env,
-        &[
+        [
             "import",
             "zoxide",
             "--path",
@@ -157,7 +157,7 @@ fn shac_import_all_runs_both() {
         &[("/tmp/aaa", 4.0, 100), ("/tmp/bbb", 2.0, 200)],
     );
 
-    let _ = run_ok(&env, &["import", "all", "--yes"]);
+    let _ = run_ok(&env, ["import", "all", "--yes"]);
 
     let paths = env.app_paths();
     let db = shac::db::AppDb::open(&paths.db_file).expect("open db");
@@ -187,7 +187,7 @@ fn shac_scan_projects_with_explicit_root() {
 
     let _ = run_ok(
         &env,
-        &[
+        [
             "scan-projects",
             "--root",
             &projects_root.to_string_lossy(),
@@ -224,7 +224,7 @@ fn shac_scan_projects_respects_depth_limit() {
     // Shallow run: depth=2 should not reach `e/.git`.
     let _ = run_ok(
         &env,
-        &[
+        [
             "scan-projects",
             "--root",
             &scan_root.to_string_lossy(),
@@ -247,7 +247,7 @@ fn shac_scan_projects_respects_depth_limit() {
     // Deep run: depth=6 reaches `e/.git` and inserts exactly one project.
     let _ = run_ok(
         &env,
-        &[
+        [
             "scan-projects",
             "--root",
             &scan_root.to_string_lossy(),
