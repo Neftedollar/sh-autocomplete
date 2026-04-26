@@ -54,27 +54,30 @@ brew install --build-from-source ./Formula/shac.rb
 Recommended beta path is `zsh`; `bash` is supported as best-effort list completion.
 
 ```bash
-cargo build --bins
-./target/debug/shac install --shell zsh --edit-rc
-./target/debug/shac daemon start
-./target/debug/shac reindex
-./target/debug/shac doctor
+brew install Neftedollar/shac/shac
+shac install --shell zsh --edit-rc
+shac daemon start
+shac reindex
+shac doctor
 ```
 
 Open a new shell or run:
 
 ```zsh
 source ~/.config/shac/shell/shac.zsh
-pyt<Tab>
+git commit -<Tab>
 ```
 
 Useful smoke checks:
 
 ```bash
-./target/debug/shac debug completion --shell zsh --line "pyt" --cursor 3
-./target/debug/shac explain --shell zsh --line "git ch" --cursor 6 --cwd "$PWD"
-./target/debug/shac recent-events --limit 20
+shac debug completion --shell zsh --line "git commit -" --cursor 12
+shac debug completion --shell zsh --line "docker run --" --cursor 13
+shac explain --shell zsh --line "kubectl get pods -n" --cursor 19 --cwd "$PWD"
+shac recent-events --limit 20
 ```
+
+For development builds, replace `shac` with `./target/debug/shac` after `cargo build --bins`.
 
 ## zsh menu UI
 

@@ -117,8 +117,8 @@
           <article class="card">
             <h3>Finish commands faster</h3>
             <p>
-              Use partial command input like `git ch`, `kubectl con`, or `pyt`,
-              then let `shac` surface the likely next move.
+              Type `git commit -`, `docker run --`, or `npm run ` and press Tab —
+              `shac` surfaces the flags and options you actually use.
             </p>
           </article>
           <article class="card">
@@ -154,12 +154,12 @@
           </div>
         </div>
         <div class="snippet-stack">
-          <pre><code>cargo build --bins
-./target/debug/shac install --shell zsh --edit-rc
-./target/debug/shac daemon start
-./target/debug/shac reindex</code></pre>
-          <pre><code>./target/debug/shac debug completion --shell zsh --line "git ch" --cursor 6
-./target/debug/shac explain --shell zsh --line "kubectl con" --cursor 11</code></pre>
+          <pre><code>brew install Neftedollar/shac/shac
+shac install --shell zsh --edit-rc
+shac daemon start
+shac reindex</code></pre>
+          <pre><code>shac debug completion --shell zsh --line "git commit -" --cursor 12
+shac explain --shell zsh --line "docker run --" --cursor 13</code></pre>
         </div>
       </section>
 
