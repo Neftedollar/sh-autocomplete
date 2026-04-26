@@ -64,17 +64,6 @@ pub struct IndexTarget {
 }
 
 #[derive(Debug, Clone)]
-pub struct PathFrecency {
-    pub path: String,
-    pub rank: f64,
-    pub last_visit: i64,
-    pub visit_count: i64,
-    pub source: String,
-    pub is_git_repo: bool,
-    pub project_marker: Option<String>,
-}
-
-#[derive(Debug, Clone)]
 pub struct LoggedCompletionItem {
     pub rank: usize,
     pub item_key: String,
@@ -1201,97 +1190,6 @@ impl AppDb {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
-    pub fn upsert_path_index(
-        &self,
-        path: &str,
-        source: &str,
-        is_git_repo: bool,
-        project_marker: Option<&str>,
-    ) -> Result<()> {
-        let now = unix_ts();
-        self.conn.execute(
-            "INSERT INTO paths_index(path, rank, last_visit, visit_count, source, is_git_repo, project_marker, created_ts, updated_ts)
-             VALUES (?1, 1.0, ?2, 1, ?3, ?4, ?5, ?2, ?2)
-             ON CONFLICT(path) DO UPDATE SET
-                rank = MIN(rank + 1.0, 1000.0),
-                last_visit = excluded.last_visit,
-                visit_count = visit_count + 1,
-                source = excluded.source,
-                is_git_repo = excluded.is_git_repo,
-                project_marker = COALESCE(excluded.project_marker, project_marker),
-                updated_ts = excluded.updated_ts",
-            params![path, now, source, if is_git_repo { 1 } else { 0 }, project_marker],
-        )?;
-        Ok(())
-    }
-
-    pub fn upsert_path_index_with_rank(
-        &self,
-        path: &str,
-        rank: f64,
-        last_visit: i64,
-        source: &str,
-        is_git_repo: bool,
-        project_marker: Option<&str>,
-    ) -> Result<()> {
-        let now = unix_ts();
-        self.conn.execute(
-            "INSERT INTO paths_index(path, rank, last_visit, visit_count, source, is_git_repo, project_marker, created_ts, updated_ts)
-             VALUES (?1, ?2, ?3, 0, ?4, ?5, ?6, ?7, ?7)
-             ON CONFLICT(path) DO UPDATE SET
-                rank = MAX(rank, excluded.rank),
-                last_visit = MAX(last_visit, excluded.last_visit),
-                source = excluded.source,
-                is_git_repo = excluded.is_git_repo,
-                project_marker = COALESCE(excluded.project_marker, project_marker),
-                updated_ts = excluded.updated_ts",
-            params![path, rank, last_visit, source, if is_git_repo { 1 } else { 0 }, project_marker, now],
-        )?;
-        Ok(())
-    }
-
-    pub fn top_paths(
-        &self,
-        prefix_filter: Option<&str>,
-        limit: usize,
-    ) -> Result<Vec<PathFrecency>> {
-        let mut rows: Vec<PathFrecency> = Vec::new();
-        if let Some(filter) = prefix_filter {
-            let like = format!("%{filter}%");
-            let mut stmt = self.conn.prepare(
-                "SELECT path, rank, last_visit, visit_count, source, is_git_repo, project_marker
-                 FROM paths_index
-                 WHERE path LIKE ?1
-                 ORDER BY rank DESC, last_visit DESC
-                 LIMIT ?2",
-            )?;
-            let mapped = stmt.query_map(params![like, limit as i64], |row| {
-                Ok(PathFrecency {
-                    path: row.get(0)?, rank: row.get(1)?, last_visit: row.get(2)?,
-                    visit_count: row.get(3)?, source: row.get(4)?,
-                    is_git_repo: row.get::<_, i64>(5)? != 0, project_marker: row.get(6)?,
-                })
-            })?;
-            for r in mapped { rows.push(r?); }
-        } else {
-            let mut stmt = self.conn.prepare(
-                "SELECT path, rank, last_visit, visit_count, source, is_git_repo, project_marker
-                 FROM paths_index
-                 ORDER BY rank DESC, last_visit DESC
-                 LIMIT ?1",
-            )?;
-            let mapped = stmt.query_map([limit as i64], |row| {
-                Ok(PathFrecency {
-                    path: row.get(0)?, rank: row.get(1)?, last_visit: row.get(2)?,
-                    visit_count: row.get(3)?, source: row.get(4)?,
-                    is_git_repo: row.get::<_, i64>(5)? != 0, project_marker: row.get(6)?,
-                })
-            })?;
-            for r in mapped { rows.push(r?); }
-        }
-        rows.truncate(limit);
-        Ok(rows)
-    }
 
     #[allow(clippy::too_many_arguments)]
     pub fn insert_imported_history(

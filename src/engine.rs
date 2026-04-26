@@ -462,23 +462,37 @@ impl Engine {
     fn dispatch_path_like(
         &self,
         parsed: &ParsedContext,
-        command: &str,
+        _command: &str,
         active: &str,
         cwd: &str,
         candidates: &mut Vec<Candidate>,
         seen: &mut HashSet<String>,
     ) -> Result<()> {
-        if matches!(parsed.role, TokenRole::Path)
-            || matches!(parsed.prev_token.as_deref(), Some("cd"))
-            || command == "cd"
-        {
-            let cd_like =
-                command == "cd" || matches!(parsed.prev_token.as_deref(), Some("cd"));
-            self.collect_path_candidates(active, cwd, cd_like, candidates, seen)?;
-            // Hybrid-cd: also surface frecent paths from the global index for
-            // cd-like contexts so deep directories can be jumped to from anywhere.
-            if is_cd_path_context(parsed) {
+        use crate::profiles::{self, ArgType};
+        let arg_type = profiles::arg_type_for(parsed).unwrap_or(ArgType::None);
+        match arg_type {
+            ArgType::Directory => {
+                // cd / pushd / popd: directories only, plus frecent jumps from
+                // the global paths_index.
+                self.collect_path_candidates(active, cwd, true, candidates, seen)?;
                 self.collect_global_path_candidates(active, cwd, candidates, seen)?;
+            }
+            ArgType::Path => {
+                // vim / cat / cp / etc.: files and directories under cwd.
+                self.collect_path_candidates(active, cwd, false, candidates, seen)?;
+            }
+            ArgType::Branch
+            | ArgType::Host
+            | ArgType::Script
+            | ArgType::Resource
+            | ArgType::Image
+            | ArgType::Workspace
+            | ArgType::Target => {
+                // Stubs for now — implementations land in subsequent PRs.
+            }
+            ArgType::Subcommand | ArgType::Flag | ArgType::None => {
+                // Subcommand / flag completion is handled elsewhere in
+                // collect_candidates.
             }
         }
         Ok(())
