@@ -356,6 +356,17 @@ impl AppDb {
         Ok(())
     }
 
+    pub fn command_has_docs(&self, command: &str) -> bool {
+        self.conn
+            .query_row(
+                "SELECT COUNT(*) FROM command_docs WHERE command = ?1",
+                [command],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap_or(0)
+            > 0
+    }
+
     pub fn docs_for_command(&self, command: &str) -> Result<Vec<StoredDoc>> {
         let mut stmt = self.conn.prepare(
             "SELECT command, item_type, item_value, description, source
@@ -1306,6 +1317,12 @@ fn detect_project_root(cwd: &str) -> Option<String> {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    use tempfile::NamedTempFile;
+
+    fn test_db() -> AppDb {
+        let tmp = NamedTempFile::new().unwrap();
+        AppDb::open(tmp.path()).unwrap()
+    }
 
     #[test]
     fn script_like_classifier_catches_shell_wrappers() {
@@ -1641,5 +1658,25 @@ mod tests {
         assert!(samples.iter().all(|sample| sample.kind == "command"));
 
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn command_has_docs_returns_false_when_empty() {
+        let db = test_db();
+        assert!(!db.command_has_docs("nonexistent_cmd"));
+    }
+
+    #[test]
+    fn command_has_docs_returns_true_after_replace() {
+        let db = test_db();
+        let doc = StoredDoc {
+            command: "mycmd".into(),
+            item_type: "subcommand".into(),
+            item_value: "run".into(),
+            description: "Run something".into(),
+            source: "help".into(),
+        };
+        db.replace_docs_for_command("mycmd", &[doc]).unwrap();
+        assert!(db.command_has_docs("mycmd"));
     }
 }
