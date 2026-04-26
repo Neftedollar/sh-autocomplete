@@ -41,6 +41,17 @@ pub struct TransitionEntry {
 }
 
 #[derive(Debug, Clone)]
+pub struct PathFrecency {
+    pub path: String,
+    pub rank: f64,
+    pub last_visit: i64,
+    pub visit_count: i64,
+    pub source: String,
+    pub is_git_repo: bool,
+    pub project_marker: Option<String>,
+}
+
+#[derive(Debug, Clone)]
 pub struct IndexTarget {
     pub id: i64,
     pub target_type: String,
@@ -642,6 +653,7 @@ impl AppDb {
                 ],
             )?;
             if self.conn.changes() > 0 {
+                let _ = self.set_meta_value_if_unset("first_accept_ts", &unix_ts().to_string());
                 return Ok(true);
             }
         }
@@ -707,11 +719,17 @@ impl AppDb {
                         request_id
                     ],
                 )?;
+                let _ = self.set_meta_value_if_unset("first_accept_ts", &unix_ts().to_string());
                 return Ok(true);
             }
         }
 
         Ok(false)
+    }
+
+    fn set_meta_value_if_unset(&self, key: &str, value: &str) -> Result<()> {
+        if self.meta_value(key)?.is_none() { self.set_meta_value(key, value)?; }
+        Ok(())
     }
 
     pub fn latest_command(&self) -> Result<Option<String>> {
@@ -870,6 +888,20 @@ impl AppDb {
     }
 
     pub fn stats(&self) -> Result<StatsResponse> {
+        let history_total = count(&self.conn, "history_events")?;
+        let imported_history = self.count_imported_history()?;
+        let imported_zoxide = self.count_paths_index_by_source("zoxide_import")?;
+        let scanned_projects = self.count_paths_index_by_source("project_scan")?;
+        let paths_index_rows = self.count_paths_index()?;
+        let install_ts: Option<i64> = self.meta_value("install_ts")?.and_then(|v| v.parse().ok());
+        let first_accept_ts: Option<i64> = self.meta_value("first_accept_ts")?.and_then(|v| v.parse().ok());
+        let time_to_first_accept_seconds = match (install_ts, first_accept_ts) {
+            (Some(install), Some(accept)) => Some(accept - install),
+            _ => None,
+        };
+        let import_coverage_pct = if history_total > 0 {
+            (imported_history as f64) / (history_total as f64) * 100.0
+        } else { 0.0 };
         Ok(StatsResponse {
             commands: count(&self.conn, "commands")?,
             docs: count(&self.conn, "command_docs")?,
@@ -927,6 +959,12 @@ impl AppDb {
                 "history_events",
                 "provenance = 'pasted' AND provenance_confidence = 'heuristic'",
             )?,
+            imported_history_events: imported_history,
+            imported_zoxide_paths: imported_zoxide,
+            scanned_project_paths: scanned_projects,
+            paths_index_rows,
+            time_to_first_accept_seconds,
+            import_coverage_pct,
         })
     }
 
@@ -1005,6 +1043,141 @@ impl AppDb {
             },
         )?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn upsert_path_index(
+        &self,
+        path: &str,
+        source: &str,
+        is_git_repo: bool,
+        project_marker: Option<&str>,
+    ) -> Result<()> {
+        let now = unix_ts();
+        self.conn.execute(
+            "INSERT INTO paths_index(path, rank, last_visit, visit_count, source, is_git_repo, project_marker, created_ts, updated_ts)
+             VALUES (?1, 1.0, ?2, 1, ?3, ?4, ?5, ?2, ?2)
+             ON CONFLICT(path) DO UPDATE SET
+                rank = MIN(rank + 1.0, 1000.0),
+                last_visit = excluded.last_visit,
+                visit_count = visit_count + 1,
+                source = excluded.source,
+                is_git_repo = excluded.is_git_repo,
+                project_marker = COALESCE(excluded.project_marker, project_marker),
+                updated_ts = excluded.updated_ts",
+            params![path, now, source, if is_git_repo { 1 } else { 0 }, project_marker],
+        )?;
+        Ok(())
+    }
+
+    pub fn upsert_path_index_with_rank(
+        &self,
+        path: &str,
+        rank: f64,
+        last_visit: i64,
+        source: &str,
+        is_git_repo: bool,
+        project_marker: Option<&str>,
+    ) -> Result<()> {
+        let now = unix_ts();
+        self.conn.execute(
+            "INSERT INTO paths_index(path, rank, last_visit, visit_count, source, is_git_repo, project_marker, created_ts, updated_ts)
+             VALUES (?1, ?2, ?3, 0, ?4, ?5, ?6, ?7, ?7)
+             ON CONFLICT(path) DO UPDATE SET
+                rank = MAX(rank, excluded.rank),
+                last_visit = MAX(last_visit, excluded.last_visit),
+                source = excluded.source,
+                is_git_repo = excluded.is_git_repo,
+                project_marker = COALESCE(excluded.project_marker, project_marker),
+                updated_ts = excluded.updated_ts",
+            params![path, rank, last_visit, source, if is_git_repo { 1 } else { 0 }, project_marker, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn top_paths(
+        &self,
+        prefix_filter: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<PathFrecency>> {
+        let mut rows: Vec<PathFrecency> = Vec::new();
+        if let Some(filter) = prefix_filter {
+            let like = format!("%{filter}%");
+            let mut stmt = self.conn.prepare(
+                "SELECT path, rank, last_visit, visit_count, source, is_git_repo, project_marker
+                 FROM paths_index
+                 WHERE path LIKE ?1
+                 ORDER BY rank DESC, last_visit DESC
+                 LIMIT ?2",
+            )?;
+            let mapped = stmt.query_map(params![like, limit as i64], |row| {
+                Ok(PathFrecency {
+                    path: row.get(0)?, rank: row.get(1)?, last_visit: row.get(2)?,
+                    visit_count: row.get(3)?, source: row.get(4)?,
+                    is_git_repo: row.get::<_, i64>(5)? != 0, project_marker: row.get(6)?,
+                })
+            })?;
+            for r in mapped { rows.push(r?); }
+        } else {
+            let mut stmt = self.conn.prepare(
+                "SELECT path, rank, last_visit, visit_count, source, is_git_repo, project_marker
+                 FROM paths_index
+                 ORDER BY rank DESC, last_visit DESC
+                 LIMIT ?1",
+            )?;
+            let mapped = stmt.query_map([limit as i64], |row| {
+                Ok(PathFrecency {
+                    path: row.get(0)?, rank: row.get(1)?, last_visit: row.get(2)?,
+                    visit_count: row.get(3)?, source: row.get(4)?,
+                    is_git_repo: row.get::<_, i64>(5)? != 0, project_marker: row.get(6)?,
+                })
+            })?;
+            for r in mapped { rows.push(r?); }
+        }
+        rows.truncate(limit);
+        Ok(rows)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_imported_history(
+        &self,
+        ts: i64, cwd: &str, command: &str, shell: Option<&str>,
+        import_hash: &str, trust: &str, provenance: &str,
+    ) -> Result<bool> {
+        let imported_at = unix_ts();
+        let changed = self.conn.execute(
+            "INSERT OR IGNORE INTO history_events(
+                ts, cwd, command, shell, trust, provenance,
+                provenance_source, provenance_confidence, origin, tty_present,
+                import_hash, imported_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, ?10, ?11)",
+            params![ts, cwd, command, shell, trust, provenance,
+                PROVENANCE_SOURCE_UNKNOWN, PROVENANCE_CONFIDENCE_UNKNOWN,
+                "import", import_hash, imported_at],
+        )?;
+        Ok(changed > 0)
+    }
+
+    pub fn begin_txn(&self) -> Result<()> { self.conn.execute_batch("BEGIN")?; Ok(()) }
+    pub fn commit_txn(&self) -> Result<()> { self.conn.execute_batch("COMMIT")?; Ok(()) }
+    pub fn rollback_txn(&self) -> Result<()> { self.conn.execute_batch("ROLLBACK")?; Ok(()) }
+
+    pub fn meta_get(&self, key: &str) -> Result<Option<String>> { self.meta_value(key) }
+    pub fn meta_set(&self, key: &str, value: &str) -> Result<()> { self.set_meta_value(key, value) }
+    pub fn meta_set_if_unset(&self, key: &str, value: &str) -> Result<()> {
+        if self.meta_value(key)?.is_none() { self.set_meta_value(key, value)?; }
+        Ok(())
+    }
+
+    pub fn count_paths_index(&self) -> Result<i64> { Ok(count(&self.conn, "paths_index")?) }
+    pub fn count_paths_index_by_source(&self, source: &str) -> Result<i64> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*) FROM paths_index WHERE source = ?1",
+            params![source], |row| row.get(0))?)
+    }
+    pub fn count_imported_history(&self) -> Result<i64> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*) FROM history_events WHERE import_hash IS NOT NULL",
+            [], |row| row.get(0))?)
     }
 
     pub fn reset_personalization(&self) -> Result<()> {
