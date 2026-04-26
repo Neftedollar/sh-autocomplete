@@ -17,6 +17,15 @@ const GIT_REF_TIMEOUT: Duration = Duration::from_millis(200);
 /// thousands of remote branches (e.g. mirrors of large monorepos).
 const GIT_REF_MAX: usize = 200;
 
+/// Maximum number of ancestor directories we walk while searching for a
+/// `package.json` in [`find_package_json_root`]. Caps work for pathological
+/// nested layouts and prevents accidentally escaping the project tree.
+const PACKAGE_JSON_WALK_LIMIT: usize = 8;
+
+/// Cap on the size of `package.json` we'll read; anything larger is treated
+/// as malformed (script lists are tiny — ~hundreds of bytes typical).
+const PACKAGE_JSON_MAX_BYTES: u64 = 1_048_576; // 1 MiB
+
 use anyhow::{Context, Result};
 
 use crate::config::{AppConfig, AppPaths};
@@ -496,8 +505,15 @@ impl Engine {
             ArgType::Branch => {
                 self.collect_git_branch_candidates(active, cwd, candidates, seen)?;
             }
+            ArgType::Script => {
+                self.collect_npm_script_candidates(
+                    active,
+                    Path::new(cwd),
+                    candidates,
+                    seen,
+                )?;
+            }
             ArgType::Host
-            | ArgType::Script
             | ArgType::Resource
             | ArgType::Image
             | ArgType::Workspace
@@ -626,6 +642,57 @@ impl Engine {
                     kind: "branch".to_string(),
                     source: "git_branch".to_string(),
                     description,
+                },
+            );
+            emitted += 1;
+        }
+        Ok(())
+    }
+
+    /// Emit npm/pnpm/yarn script candidates for `<pm> run` from the cwd's
+    /// nearest `package.json`. Walks up at most [`PACKAGE_JSON_WALK_LIMIT`]
+    /// ancestors and stops at any directory containing `.git` (project
+    /// boundary). On any failure (no `package.json`, malformed JSON,
+    /// I/O error) we return Ok(()) silently — script completion is
+    /// best-effort and must never block other candidate sources.
+    fn collect_npm_script_candidates(
+        &self,
+        active: &str,
+        cwd: &Path,
+        candidates: &mut Vec<Candidate>,
+        seen: &mut HashSet<String>,
+    ) -> Result<()> {
+        let pkg_json = match find_package_json_root(cwd) {
+            Some(root) => root.join("package.json"),
+            None => return Ok(()),
+        };
+        let scripts = parse_package_json_scripts(&pkg_json).unwrap_or_default();
+        if scripts.is_empty() {
+            return Ok(());
+        }
+
+        let limit = self.config.max_results.saturating_mul(2).max(8);
+        let mut emitted = 0usize;
+        for (name, command) in scripts {
+            if emitted >= limit {
+                break;
+            }
+            // Case-sensitive prefix match keeps the v1 contract crisp:
+            // typing `de<Tab>` should match `dev` but not `Develop`.
+            // Empty active still surfaces all scripts.
+            if !active.is_empty() && !name.starts_with(active) {
+                continue;
+            }
+            let description = format!("script \u{00b7} {}", truncate_command(&command, 60));
+            push_candidate(
+                candidates,
+                seen,
+                Candidate {
+                    insert_text: name.clone(),
+                    display: name,
+                    kind: "npm_script".to_string(),
+                    source: "npm_script".to_string(),
+                    description: Some(description),
                 },
             );
             emitted += 1;
@@ -981,6 +1048,7 @@ fn position_score(parsed: &ParsedContext, candidate: &Candidate) -> f64 {
         _ if is_cd_path_context(parsed) && candidate.kind == "path" => 1.0,
         _ if is_cd_path_context(parsed) && candidate.kind == "path_jump" => 1.0,
         _ if candidate.kind == "branch" => 1.0,
+        _ if candidate.kind == "npm_script" => 1.0,
         TokenRole::SubcommandOrArg if candidate.kind == "module" => 1.0,
         TokenRole::SubcommandOrArg if candidate.kind == "subcommand" => 0.9,
         TokenRole::SubcommandOrArg if candidate.kind == "history" => 0.6,
@@ -1005,6 +1073,7 @@ fn source_prior(source: &str, kind: &str) -> f64 {
         ("path_cache", _) => 0.9,
         ("path_jump", _) => 0.85,
         ("git_branch", "branch") => 0.85,
+        ("npm_script", _) => 0.85,
         _ => 0.4,
     }
 }
@@ -1143,6 +1212,79 @@ fn list_git_refs(repo_root: &Path, timeout: Duration) -> Option<Vec<String>> {
         }
     }
     Some(refs)
+}
+
+/// Walk up at most [`PACKAGE_JSON_WALK_LIMIT`] ancestors from `start` looking
+/// for a directory that contains `package.json`. Stops on either:
+///
+/// * the filesystem root,
+/// * the walk limit, or
+/// * the first ancestor whose `.git` exists, returning the package.json on
+///   that boundary if present (we never escape past a project boundary).
+///
+/// Returns the **directory** containing `package.json`, not the file itself.
+fn find_package_json_root(start: &Path) -> Option<PathBuf> {
+    let mut cur: Option<&Path> = Some(start);
+    let mut steps = 0usize;
+    while let Some(dir) = cur {
+        if steps >= PACKAGE_JSON_WALK_LIMIT {
+            return None;
+        }
+        if dir.join("package.json").is_file() {
+            return Some(dir.to_path_buf());
+        }
+        // Project boundary: a `.git` here means we should not escape further.
+        if dir.join(".git").exists() {
+            return None;
+        }
+        cur = dir.parent();
+        steps += 1;
+    }
+    None
+}
+
+/// Read `package.json` and extract `(name, command)` pairs from its `scripts`
+/// object. Returns an empty Vec on any read or parse failure (caller is
+/// expected to treat absence as "no candidates" rather than an error — script
+/// completion must never block other sources).
+fn parse_package_json_scripts(path: &Path) -> Result<Vec<(String, String)>> {
+    let meta = match fs::metadata(path) {
+        Ok(meta) => meta,
+        Err(_) => return Ok(Vec::new()),
+    };
+    if meta.len() > PACKAGE_JSON_MAX_BYTES {
+        return Ok(Vec::new());
+    }
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(_) => return Ok(Vec::new()),
+    };
+    let value: serde_json::Value = match serde_json::from_str(&text) {
+        Ok(value) => value,
+        Err(_) => return Ok(Vec::new()),
+    };
+    let scripts = match value.get("scripts").and_then(|v| v.as_object()) {
+        Some(obj) => obj,
+        None => return Ok(Vec::new()),
+    };
+    let mut out = Vec::with_capacity(scripts.len());
+    for (name, cmd) in scripts {
+        let command = cmd.as_str().unwrap_or("").to_string();
+        out.push((name.clone(), command));
+    }
+    Ok(out)
+}
+
+/// Truncate a script command for display in the description column. Trims
+/// whitespace and replaces newlines with spaces so multiline scripts render
+/// inline. Adds a single ellipsis when truncated.
+fn truncate_command(command: &str, max_len: usize) -> String {
+    let normalized = command.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.chars().count() <= max_len {
+        return normalized;
+    }
+    let truncated: String = normalized.chars().take(max_len).collect();
+    format!("{truncated}\u{2026}")
 }
 
 fn format_path_jump_description(is_git_repo: bool, last_visit: i64, now: i64) -> String {
@@ -1580,6 +1722,129 @@ mod tests {
         std::fs::create_dir_all(repo.join(".git")).expect("mkdir .git");
         let found = find_git_repo_root(&nested).expect("repo root");
         assert_eq!(found.canonicalize().unwrap(), repo.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn find_package_json_root_walks_up() {
+        let scratch = unique_tmp("shac-engine-pkg-walk-up");
+        let root = scratch.join("project");
+        let nested = root.join("src/components");
+        std::fs::create_dir_all(&nested).expect("mkdir nested");
+        std::fs::write(root.join("package.json"), "{}").expect("seed package.json");
+        let found = find_package_json_root(&nested).expect("package root");
+        assert_eq!(
+            found.canonicalize().unwrap(),
+            root.canonicalize().unwrap(),
+            "expected nearest package.json directory"
+        );
+    }
+
+    #[test]
+    fn find_package_json_root_stops_at_git_boundary() {
+        // outer/package.json     <- should NOT be reached
+        // outer/inner/.git
+        // outer/inner/package.json (none here)
+        // outer/inner/src        <- start here, must stop at inner/.git boundary
+        let scratch = unique_tmp("shac-engine-pkg-git-boundary");
+        let outer = scratch.join("outer");
+        let inner = outer.join("inner");
+        let leaf = inner.join("src");
+        std::fs::create_dir_all(&leaf).expect("mkdir leaf");
+        std::fs::create_dir_all(inner.join(".git")).expect("mkdir .git");
+        std::fs::write(outer.join("package.json"), "{}").expect("seed outer pkg");
+        // inner has no package.json, but it does have .git — walk must stop
+        // at inner and refuse to escape into outer.
+        let found = find_package_json_root(&leaf);
+        assert!(
+            found.is_none(),
+            "walk should stop at .git boundary instead of escaping to {found:?}"
+        );
+    }
+
+    #[test]
+    fn find_package_json_root_returns_root_when_pkg_at_git_boundary() {
+        // Same .git boundary, but package.json sits *at* the boundary —
+        // we must still return it (the boundary itself is in-scope).
+        let scratch = unique_tmp("shac-engine-pkg-at-boundary");
+        let inner = scratch.join("project");
+        let leaf = inner.join("src");
+        std::fs::create_dir_all(&leaf).expect("mkdir leaf");
+        std::fs::create_dir_all(inner.join(".git")).expect("mkdir .git");
+        std::fs::write(inner.join("package.json"), "{}").expect("seed pkg");
+        let found = find_package_json_root(&leaf).expect("found");
+        assert_eq!(
+            found.canonicalize().unwrap(),
+            inner.canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn parse_package_json_scripts_extracts_keys() {
+        let scratch = unique_tmp("shac-engine-pkg-parse");
+        let pkg = scratch.join("package.json");
+        std::fs::write(
+            &pkg,
+            r#"{"name":"x","scripts":{"dev":"vite","build":"vite build","test":"vitest"}}"#,
+        )
+        .expect("seed pkg");
+        let scripts = parse_package_json_scripts(&pkg).expect("parse ok");
+        let names: Vec<&str> = scripts.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(names.contains(&"dev"), "missing dev: {names:?}");
+        assert!(names.contains(&"build"), "missing build: {names:?}");
+        assert!(names.contains(&"test"), "missing test: {names:?}");
+        let dev_cmd = scripts
+            .iter()
+            .find(|(n, _)| n == "dev")
+            .map(|(_, c)| c.as_str())
+            .unwrap();
+        assert_eq!(dev_cmd, "vite");
+    }
+
+    #[test]
+    fn parse_package_json_scripts_tolerates_malformed_json() {
+        let scratch = unique_tmp("shac-engine-pkg-bad-json");
+        let pkg = scratch.join("package.json");
+        std::fs::write(&pkg, "{ this is not json").expect("seed pkg");
+        let scripts = parse_package_json_scripts(&pkg).expect("never errors");
+        assert!(
+            scripts.is_empty(),
+            "malformed JSON must yield empty Vec, got {scripts:?}"
+        );
+    }
+
+    #[test]
+    fn parse_package_json_scripts_missing_file_returns_empty() {
+        let scratch = unique_tmp("shac-engine-pkg-missing");
+        let pkg = scratch.join("package.json");
+        let scripts = parse_package_json_scripts(&pkg).expect("never errors");
+        assert!(scripts.is_empty());
+    }
+
+    #[test]
+    fn parse_package_json_scripts_no_scripts_object() {
+        let scratch = unique_tmp("shac-engine-pkg-no-scripts");
+        let pkg = scratch.join("package.json");
+        std::fs::write(&pkg, r#"{"name":"x","version":"1.0.0"}"#).expect("seed");
+        let scripts = parse_package_json_scripts(&pkg).expect("ok");
+        assert!(scripts.is_empty());
+    }
+
+    #[test]
+    fn truncate_command_truncates_long_strings() {
+        let s = "node ./scripts/very-long-build-script-with-many-flags --foo --bar --baz";
+        let out = truncate_command(s, 20);
+        assert!(out.chars().count() <= 21, "{out:?}");
+        assert!(out.ends_with('\u{2026}'), "expected ellipsis: {out:?}");
+    }
+
+    #[test]
+    fn truncate_command_preserves_short_strings() {
+        assert_eq!(truncate_command("vite", 60), "vite");
+    }
+
+    #[test]
+    fn truncate_command_collapses_whitespace() {
+        assert_eq!(truncate_command("a  b\n\tc", 60), "a b c");
     }
 
     #[test]

@@ -605,7 +605,7 @@ Stubs in `Engine::dispatch_path_like` for non-Directory/Path arg types. Each is 
 |---|---|---|---|
 | 7.4 | `Branch` | `git for-each-ref refs/heads refs/remotes` cached per-repo | ✅ Done |
 | 7.5 | `Host` | parse `~/.ssh/config` + `~/.ssh/known_hosts` | ⏳ Pending |
-| 7.6 | `Script` | parse `package.json` of cwd's nearest project root | ⏳ Pending |
+| 7.6 | `Script` | parse `package.json` of cwd's nearest project root | ✅ Done |
 | 7.7 | `Resource` | cache `kubectl api-resources` output | ⏳ Pending |
 | 7.8 | `Image` | cache `docker images` output | ⏳ Pending |
 | 7.9 | `Workspace` | parse VS Code `~/Library/Application Support/Code/storage.json` for recent workspaces | ⏳ Pending |
