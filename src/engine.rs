@@ -1,9 +1,21 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+/// Hard timeout on the `git for-each-ref` invocation that backs
+/// `collect_git_branch_candidates`. Branch completion is best-effort —
+/// missing it never blocks completion of other candidate sources.
+const GIT_REF_TIMEOUT: Duration = Duration::from_millis(200);
+
+/// Cap on number of refs we consume from `git for-each-ref` output. Most
+/// repos have < 50 branches; this is a defensive bound for repos with
+/// thousands of remote branches (e.g. mirrors of large monorepos).
+const GIT_REF_MAX: usize = 200;
 
 use anyhow::{Context, Result};
 
@@ -481,8 +493,10 @@ impl Engine {
                 // vim / cat / cp / etc.: files and directories under cwd.
                 self.collect_path_candidates(active, cwd, false, candidates, seen)?;
             }
-            ArgType::Branch
-            | ArgType::Host
+            ArgType::Branch => {
+                self.collect_git_branch_candidates(active, cwd, candidates, seen)?;
+            }
+            ArgType::Host
             | ArgType::Script
             | ArgType::Resource
             | ArgType::Image
@@ -558,6 +572,63 @@ impl Engine {
                     description: Some(description),
                 },
             );
+        }
+        Ok(())
+    }
+
+    /// Emit git branch / ref candidates for `git checkout|switch|branch|merge|rebase`
+    /// from the cwd's nearest git repo. Reads `git for-each-ref` over local
+    /// branches and `origin` remotes, sorted by committerdate (most recent
+    /// first). Bounded by a 200ms timeout; on any failure (no repo, git not
+    /// installed, command timeout) we return Ok(()) silently — branch
+    /// completion is best-effort.
+    fn collect_git_branch_candidates(
+        &self,
+        active: &str,
+        cwd: &str,
+        candidates: &mut Vec<Candidate>,
+        seen: &mut HashSet<String>,
+    ) -> Result<()> {
+        let repo_root = match find_git_repo_root(Path::new(cwd)) {
+            Some(root) => root,
+            None => return Ok(()),
+        };
+        let refs = match list_git_refs(&repo_root, GIT_REF_TIMEOUT) {
+            Some(refs) => refs,
+            None => return Ok(()),
+        };
+
+        let limit = self.config.max_results.saturating_mul(2).max(8);
+        let mut emitted = 0usize;
+        for refname in refs {
+            if emitted >= limit {
+                break;
+            }
+            // Filter: prefix or fuzzy match. Empty `active` keeps everything.
+            if !active.is_empty()
+                && !refname.starts_with(active)
+                && fuzzy_match_score(active, &refname) <= 0.0
+            {
+                continue;
+            }
+            let display = refname.clone();
+            let description = if refname.starts_with("origin/") {
+                Some("remote-tracking branch".to_string())
+            } else {
+                Some("local branch".to_string())
+            };
+            push_candidate(
+                candidates,
+                seen,
+                Candidate {
+                    insert_text: refname,
+                    display,
+                    kind: "branch".to_string(),
+                    source: "git_branch".to_string(),
+                    description,
+                },
+            );
+            emitted += 1;
         }
         Ok(())
     }
@@ -909,6 +980,7 @@ fn position_score(parsed: &ParsedContext, candidate: &Candidate) -> f64 {
         TokenRole::Path if candidate.kind == "path" => 1.0,
         _ if is_cd_path_context(parsed) && candidate.kind == "path" => 1.0,
         _ if is_cd_path_context(parsed) && candidate.kind == "path_jump" => 1.0,
+        _ if candidate.kind == "branch" => 1.0,
         TokenRole::SubcommandOrArg if candidate.kind == "module" => 1.0,
         TokenRole::SubcommandOrArg if candidate.kind == "subcommand" => 0.9,
         TokenRole::SubcommandOrArg if candidate.kind == "history" => 0.6,
@@ -932,6 +1004,7 @@ fn source_prior(source: &str, kind: &str) -> f64 {
         ("transition", _) => 0.7,
         ("path_cache", _) => 0.9,
         ("path_jump", _) => 0.85,
+        ("git_branch", "branch") => 0.85,
         _ => 0.4,
     }
 }
@@ -981,6 +1054,95 @@ fn expand_with_home(path: &str) -> String {
             .unwrap_or_else(|| path.to_string());
     }
     path.to_string()
+}
+
+/// Walk up from `start` looking for a `.git` directory or file (worktree).
+/// Returns the repo root (the parent of the `.git` entry) on success, `None`
+/// if no repo is found before reaching `/`.
+fn find_git_repo_root(start: &Path) -> Option<PathBuf> {
+    let mut cur: Option<&Path> = Some(start);
+    while let Some(dir) = cur {
+        let dot_git = dir.join(".git");
+        if dot_git.exists() {
+            return Some(dir.to_path_buf());
+        }
+        cur = dir.parent();
+    }
+    None
+}
+
+/// Run `git for-each-ref --format=%(refname:short) refs/heads refs/remotes
+/// --sort=-committerdate` in `repo_root`, with a hard timeout. Returns
+/// `None` on any failure (git not installed, command nonzero, timeout).
+///
+/// The returned vector is deduped (some refs appear under both heads and
+/// remotes/origin) and capped at [`GIT_REF_MAX`].
+fn list_git_refs(repo_root: &Path, timeout: Duration) -> Option<Vec<String>> {
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args([
+            "for-each-ref",
+            "--format=%(refname:short)",
+            "--sort=-committerdate",
+            "refs/heads",
+            "refs/remotes",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .stdin(Stdio::null())
+        .spawn()
+        .ok()?;
+
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() {
+                    return None;
+                }
+                break;
+            }
+            Ok(None) => {
+                if started.elapsed() >= timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+
+    let mut buf = String::new();
+    if let Some(mut out) = child.stdout.take() {
+        out.read_to_string(&mut buf).ok()?;
+    }
+
+    let mut seen = HashSet::new();
+    let mut refs = Vec::new();
+    for line in buf.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        // Skip `origin/HEAD` — it's an alias, not a real branch.
+        if trimmed == "origin/HEAD" || trimmed.ends_with("/HEAD") {
+            continue;
+        }
+        if seen.insert(trimmed.to_string()) {
+            refs.push(trimmed.to_string());
+            if refs.len() >= GIT_REF_MAX {
+                break;
+            }
+        }
+    }
+    Some(refs)
 }
 
 fn format_path_jump_description(is_git_repo: bool, last_visit: i64, now: i64) -> String {
@@ -1388,5 +1550,50 @@ mod tests {
             contextual_candidate_key(&parsed, &candidate),
             "git checkout"
         );
+    }
+
+    fn unique_tmp(prefix: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::time::{SystemTime, UNIX_EPOCH};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let path = std::env::temp_dir().join(format!(
+            "{prefix}-{}-{}-{}",
+            std::process::id(),
+            nanos,
+            n
+        ));
+        std::fs::create_dir_all(&path).expect("create unique tmp");
+        path
+    }
+
+    #[test]
+    fn find_git_repo_root_walks_up_from_subdir() {
+        let scratch = unique_tmp("shac-engine-fake-repo");
+        let repo = scratch.join("repo");
+        let nested = repo.join("a/b");
+        std::fs::create_dir_all(&nested).expect("mkdir nested");
+        std::fs::create_dir_all(repo.join(".git")).expect("mkdir .git");
+        let found = find_git_repo_root(&nested).expect("repo root");
+        assert_eq!(found.canonicalize().unwrap(), repo.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn find_git_repo_root_returns_none_when_no_dot_git_anywhere() {
+        // Use a fresh scratch dir we control, point the start path at a
+        // subdir that has no `.git` and whose parents we control too.
+        let scratch = unique_tmp("shac-engine-no-repo");
+        let inner = scratch.join("a/b");
+        std::fs::create_dir_all(&inner).expect("mkdir nested");
+        let result = find_git_repo_root(&inner);
+        // Either None (clean) or — if some ancestor of /tmp happens to have
+        // .git — a real ancestor with .git. Accept both.
+        if let Some(root) = result {
+            assert!(root.join(".git").exists(), "claimed repo root has no .git");
+        }
     }
 }
