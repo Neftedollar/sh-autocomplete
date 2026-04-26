@@ -14,7 +14,7 @@ use shac::engine::Engine;
 use shac::indexer;
 use shac::ml::{train_model, TrainOptions};
 use shac::protocol::{CompletionRequest, ExplainResponse, RecordCommandRequest, SessionInfo};
-use shac::shell::{BASH_COMPLETION, ZSH_COMPLETION};
+use shac::shell::{BASH_COMPLETION, FISH_COMPLETION, ZSH_COMPLETION};
 
 #[derive(Debug, Parser)]
 #[command(version, about = "Shell autocomplete engine CLI")]
@@ -75,6 +75,7 @@ enum DebugAction {
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum ShellKind {
     Bash,
+    Fish,
     Zsh,
 }
 
@@ -582,6 +583,11 @@ fn install(paths: &AppPaths, shell: ShellKind, edit_rc: bool) -> Result<()> {
             BASH_COMPLETION,
             format!("source {}", paths.shell_dir.join("shac.bash").display()),
         ),
+        ShellKind::Fish => (
+            "shac.fish",
+            FISH_COMPLETION,
+            format!("source {}", paths.shell_dir.join("shac.fish").display()),
+        ),
         ShellKind::Zsh => (
             "shac.zsh",
             ZSH_COMPLETION,
@@ -608,6 +614,7 @@ fn install(paths: &AppPaths, shell: ShellKind, edit_rc: bool) -> Result<()> {
 fn uninstall(paths: &AppPaths, shell: ShellKind, edit_rc: bool) -> Result<()> {
     let file_name = match shell {
         ShellKind::Bash => "shac.bash",
+        ShellKind::Fish => "shac.fish",
         ShellKind::Zsh => "shac.zsh",
     };
     fs::remove_file(paths.shell_dir.join(file_name)).ok();
@@ -621,7 +628,7 @@ fn uninstall(paths: &AppPaths, shell: ShellKind, edit_rc: bool) -> Result<()> {
 fn install_rc_block(shell: ShellKind, shell_file: &Path) -> Result<()> {
     let rc_file = rc_file_for_shell(shell)?;
     let mut content = fs::read_to_string(&rc_file).unwrap_or_default();
-    let block = managed_rc_block(shell_file);
+    let block = managed_rc_block(shell, shell_file);
     if !content.contains(SHAC_RC_BEGIN) {
         if !content.ends_with('\n') && !content.is_empty() {
             content.push('\n');
@@ -642,12 +649,16 @@ fn uninstall_rc_block(shell: ShellKind) -> Result<()> {
     Ok(())
 }
 
-fn managed_rc_block(shell_file: &Path) -> String {
-    format!(
-        "{SHAC_RC_BEGIN}\nif [ -f {} ]; then\n  source {}\nfi\n{SHAC_RC_END}\n",
-        shell_escape(&shell_file.to_string_lossy()),
-        shell_escape(&shell_file.to_string_lossy())
-    )
+fn managed_rc_block(shell: ShellKind, shell_file: &Path) -> String {
+    let path = shell_escape(&shell_file.to_string_lossy());
+    match shell {
+        ShellKind::Fish => format!(
+            "{SHAC_RC_BEGIN}\nif test -f {path}\n  source {path}\nend\n{SHAC_RC_END}\n"
+        ),
+        _ => format!(
+            "{SHAC_RC_BEGIN}\nif [ -f {path} ]; then\n  source {path}\nfi\n{SHAC_RC_END}\n"
+        ),
+    }
 }
 
 fn remove_managed_rc_block(content: &str) -> String {
@@ -677,6 +688,9 @@ fn rc_file_for_shell(shell: ShellKind) -> Result<PathBuf> {
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
     Ok(match shell {
         ShellKind::Bash => home.join(".bashrc"),
+        ShellKind::Fish => dirs::config_dir()
+            .unwrap_or_else(|| home.join(".config"))
+            .join("fish/config.fish"),
         ShellKind::Zsh => home.join(".zshrc"),
     })
 }
@@ -932,6 +946,7 @@ fn migration_status(paths: &AppPaths) -> Result<()> {
 fn shell_env(paths: &AppPaths, args: ShellEnvArgs) -> Result<()> {
     let config = AppConfig::load(paths)?;
     match args.shell {
+        ShellKind::Fish => {}
         ShellKind::Zsh => {
             let zsh = config.ui.zsh;
             println!(
@@ -955,6 +970,10 @@ fn shell_env(paths: &AppPaths, args: ShellEnvArgs) -> Result<()> {
                 zsh.max_description_width
             );
             println!("typeset -gi _shac_ui_max_items={}", zsh.max_items);
+            println!(
+                "typeset -gi _shac_ui_inline_zsh={}",
+                if config.features.inline_zsh { 1 } else { 0 }
+            );
         }
         ShellKind::Bash => {}
     }

@@ -35,6 +35,11 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
   typeset -gi _shac_ui_show_description=1
   typeset -gi _shac_ui_max_description_width=72
   typeset -gi _shac_ui_max_items=8
+  typeset -gi _shac_ui_inline_zsh=0
+  typeset -gi _shac_inline_active=0
+  typeset -g _shac_inline_suffix=""
+  typeset -g _shac_inline_item_key=""
+  typeset -g _shac_inline_request_id=""
 
   if command -v shac >/dev/null 2>&1; then
     eval "$(shac shell-env --shell zsh 2>/dev/null)"
@@ -123,6 +128,89 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
     POSTDISPLAY=""
     if zle; then
       zle -R -c
+    fi
+  }
+
+  function _shac_clear_inline() {
+    if (( _shac_inline_active )); then
+      _shac_inline_active=0
+      _shac_inline_suffix=""
+      _shac_inline_item_key=""
+      _shac_inline_request_id=""
+      if ! (( _shac_menu_open )); then
+        POSTDISPLAY=""
+        if zle; then
+          zle -R -c
+        fi
+      fi
+    fi
+  }
+
+  function _shac_show_inline() {
+    local suffix="$1"
+    [[ -z "$suffix" ]] && return
+    POSTDISPLAY=$'\e[2m\e[38;5;240m'"$suffix"$'\e[0m'
+    if zle; then
+      zle -R
+    fi
+  }
+
+  function _shac_fetch_inline() {
+    [[ -z "$BUFFER" ]] && return 1
+    (( ${#BUFFER} < 2 )) && return 1
+    [[ "$BUFFER" == *$'\n'* ]] && return 1
+    local tty_value
+    tty_value="$(tty 2>/dev/null || true)"
+    local found_item=0 insert_text="" item_key="" request_id="" line
+    while IFS= read -r line; do
+      [[ -z "$line" ]] && continue
+      if [[ "$line" == __shac_request_id$'\t'* ]]; then
+        local -a header=("${(ps:\t:)line}")
+        request_id="${header[2]:-}"
+      elif (( !found_item )); then
+        local -a fields=("${(ps:\t:)line}")
+        item_key="${fields[1]:-}"
+        insert_text="${fields[2]:-}"
+        found_item=1
+      fi
+    done < <(
+      TTY="$tty_value" shac complete \
+        --shell zsh \
+        --line "$BUFFER" \
+        --cursor "$CURSOR" \
+        --cwd "$PWD" \
+        --format shell-tsv-v2 \
+        2>/dev/null | head -n2
+    )
+    (( found_item )) && [[ -n "$insert_text" ]] || return 1
+    _shac_preview_buffer_for_item "$BUFFER" "$CURSOR" "$insert_text"
+    local preview="$REPLY"
+    [[ "$preview" == "$BUFFER" ]] && return 1
+    local suffix
+    if [[ "$preview" == ${BUFFER}* ]]; then
+      suffix="${preview[$((${#BUFFER}+1)),-1]}"
+    else
+      local token_prefix="${BUFFER##*[[:space:]]}"
+      if [[ -n "$token_prefix" && "$insert_text" == ${token_prefix}* ]]; then
+        suffix="${insert_text[$((${#token_prefix}+1)),-1]}"
+      else
+        return 1
+      fi
+    fi
+    [[ -z "$suffix" ]] && return 1
+    _shac_inline_active=1
+    _shac_inline_suffix="$suffix"
+    _shac_inline_item_key="$item_key"
+    _shac_inline_request_id="$request_id"
+    return 0
+  }
+
+  function _shac_update_inline() {
+    (( _shac_ui_inline_zsh )) || return 0
+    (( _shac_menu_open )) && return 0
+    _shac_clear_inline
+    if _shac_fetch_inline; then
+      _shac_show_inline "$_shac_inline_suffix"
     fi
   }
 
@@ -447,6 +535,7 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
   }
 
   function _shac_tab_widget() {
+    _shac_clear_inline
     if (( _shac_menu_open )); then
       _shac_menu_step 1
       return $?
@@ -511,6 +600,7 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
   }
 
   function _shac_cancel_menu_widget() {
+    _shac_clear_inline
     if (( _shac_menu_open )); then
       _shac_close_menu 1
       _shac_reset_accept_state
@@ -524,6 +614,7 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
   }
 
   function _shac_note_manual_edit() {
+    _shac_clear_inline
     if (( _shac_menu_open )); then
       _shac_close_menu 1
     fi
@@ -535,10 +626,12 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
     if (( _shac_menu_open )); then
       _shac_close_menu 1
     fi
+    _shac_clear_inline
     zle _shac_orig_self_insert -- "$@"
     if ! _shac_maybe_mark_heuristic_paste_from_diff "$before_buffer" "$BUFFER"; then
       _shac_mark_typed_manual
     fi
+    _shac_update_inline
   }
 
   function _shac_backward_delete_char_widget() {
@@ -566,10 +659,29 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
       _shac_commit_selected_item never
       return $?
     fi
+    if (( _shac_inline_active )) && (( CURSOR >= ${#BUFFER} )); then
+      local suffix="$_shac_inline_suffix"
+      local item_key="$_shac_inline_item_key"
+      local request_id="$_shac_inline_request_id"
+      _shac_clear_inline
+      BUFFER="${BUFFER}${suffix}"
+      CURSOR=${#BUFFER}
+      _shac_last_request_id="$request_id"
+      _shac_last_accepted_item_key="$item_key"
+      _shac_last_accepted_rank="0"
+      _shac_set_input_provenance "accepted_completion" "unknown" "unknown"
+      _shac_completion_edited=0
+      if zle; then
+        zle -R
+      fi
+      return 0
+    fi
+    _shac_clear_inline
     zle _shac_orig_forward_char -- "$@"
   }
 
   function _shac_backward_char_widget() {
+    _shac_clear_inline
     if (( _shac_menu_open )); then
       _shac_close_menu 1
     fi
@@ -577,6 +689,7 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
   }
 
   function _shac_bracketed_paste_widget() {
+    _shac_clear_inline
     if (( _shac_menu_open )); then
       _shac_close_menu 1
     fi
@@ -585,6 +698,7 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
   }
 
   function _shac_accept_line_widget() {
+    _shac_clear_inline
     if (( _shac_menu_open )); then
       local source item_key
       _shac_selected_source
@@ -645,7 +759,9 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
       _shac_commit_selected_item always
       return $?
     fi
+    _shac_clear_inline
     zle _shac_orig_self_insert -- "$@"
+    _shac_update_inline
   }
 
   function _shac_record_precmd() {
@@ -687,6 +803,7 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
     _shac_preexec_rank=""
     _shac_reset_accept_state
     _shac_close_menu 0
+    _shac_clear_inline
     _shac_set_input_provenance "unknown" "unknown" "unknown"
   }
 
