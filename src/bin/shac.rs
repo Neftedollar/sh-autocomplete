@@ -43,6 +43,8 @@ enum Commands {
     ResetPersonalization,
     ExportTrainingData(TrainingDataArgs),
     TrainModel(TrainModelArgs),
+    Import(ImportArgs),
+    ScanProjects(ScanProjectsArgs),
 }
 
 #[derive(Debug, Args)]
@@ -51,6 +53,44 @@ struct InstallArgs {
     shell: ShellKind,
     #[arg(long)]
     edit_rc: bool,
+    #[arg(long)]
+    no_import: bool,
+    #[arg(long)]
+    yes: bool,
+}
+
+#[derive(Debug, Args)]
+struct ImportArgs {
+    #[command(subcommand)]
+    action: ImportAction,
+}
+
+#[derive(Debug, Subcommand)]
+enum ImportAction {
+    ZshHistory {
+        #[arg(long)]
+        path: Option<String>,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    Zoxide {
+        #[arg(long)]
+        path: Option<String>,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    All {
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+#[derive(Debug, Args)]
+struct ScanProjectsArgs {
+    #[arg(long)]
+    root: Vec<String>,
+    #[arg(long, default_value_t = 3)]
+    depth: usize,
 }
 
 #[derive(Debug, Args)]
@@ -216,7 +256,7 @@ fn main() -> Result<()> {
     paths.ensure()?;
 
     match cli.command {
-        Commands::Install(args) => install(&paths, args.shell, args.edit_rc),
+        Commands::Install(args) => install(&paths, args),
         Commands::Uninstall(args) => uninstall(&paths, args.shell, args.edit_rc),
         Commands::Daemon(args) => daemon_action(&paths, args.action),
         Commands::Index(args) => index_action(&paths, args.action),
@@ -270,6 +310,8 @@ fn main() -> Result<()> {
         Commands::ResetPersonalization => reset_personalization(&paths),
         Commands::ExportTrainingData(args) => export_training_data(&paths, args),
         Commands::TrainModel(args) => train_model_file(&paths, args),
+        Commands::Import(args) => import_action(&paths, args),
+        Commands::ScanProjects(args) => scan_projects_action(&paths, args),
     }
 }
 
@@ -576,7 +618,9 @@ fn debug_completion(paths: &AppPaths, args: CompletionArgs) -> Result<()> {
     Ok(())
 }
 
-fn install(paths: &AppPaths, shell: ShellKind, edit_rc: bool) -> Result<()> {
+fn install(paths: &AppPaths, args: InstallArgs) -> Result<()> {
+    let shell = args.shell;
+    let edit_rc = args.edit_rc;
     let (file_name, content, snippet) = match shell {
         ShellKind::Bash => (
             "shac.bash",
@@ -600,6 +644,23 @@ fn install(paths: &AppPaths, shell: ShellKind, edit_rc: bool) -> Result<()> {
         let rc_file = rc_file_for_shell(shell)?;
         install_rc_block(shell, &shell_file)?;
         println!("installed  {}", rc_file.display());
+
+        if !args.no_import {
+            let db = shac::db::AppDb::open(&paths.db_file)?;
+            let opts = shac::import::ImportOpts {
+                yes: args.yes,
+                roots: shac::import::default_project_roots(),
+                depth: 3,
+                shell: shell_kind_to_import(shell),
+                history_path: None,
+                zoxide_path: None,
+            };
+            match shac::import::run_full_import(&db, opts) {
+                Ok(summaries) => print_import_summary(&summaries),
+                Err(err) => eprintln!("shac: import failed: {err:#}"),
+            }
+        }
+
         println!();
         println!("next steps:");
         println!("  1. open a new terminal (or run: source {})", rc_file.display());
@@ -608,6 +669,80 @@ fn install(paths: &AppPaths, shell: ShellKind, edit_rc: bool) -> Result<()> {
     } else {
         println!("{snippet}");
     }
+    Ok(())
+}
+
+fn shell_kind_to_import(shell: ShellKind) -> shac::import::ShellKind {
+    match shell {
+        ShellKind::Bash => shac::import::ShellKind::Bash,
+        ShellKind::Fish => shac::import::ShellKind::Fish,
+        ShellKind::Zsh => shac::import::ShellKind::Zsh,
+    }
+}
+
+fn print_import_summary(summaries: &[shac::import::ImportSummary]) {
+    let tty = std::io::stdout().is_terminal();
+    let check = if tty { "\x1b[32m\u{2713}\x1b[0m" } else { "\u{2713}" };
+    for s in summaries {
+        println!(
+            "{check} {}: {} inserted, {} dup, {} redacted ({}ms)",
+            s.source, s.inserted, s.skipped_dup, s.skipped_redacted,
+            s.elapsed.as_millis()
+        );
+    }
+}
+
+fn import_action(paths: &AppPaths, args: ImportArgs) -> Result<()> {
+    let db = shac::db::AppDb::open(&paths.db_file)?;
+    match args.action {
+        ImportAction::ZshHistory { path, dry_run } => {
+            let resolved = path.map(PathBuf::from)
+                .or_else(shac::import::default_zsh_history_path)
+                .ok_or_else(|| anyhow::anyhow!("could not resolve zsh history path"))?;
+            if dry_run {
+                println!("would import zsh history from {}", resolved.display());
+                return Ok(());
+            }
+            let red = shac::import::Redactor::new();
+            let summary = shac::import::import_zsh_history(&db, &resolved, &red)?;
+            print_import_summary(std::slice::from_ref(&summary));
+        }
+        ImportAction::Zoxide { path, dry_run } => {
+            let resolved = path.map(PathBuf::from)
+                .or_else(shac::import::default_zoxide_path)
+                .ok_or_else(|| anyhow::anyhow!("could not resolve zoxide path"))?;
+            if dry_run {
+                println!("would import zoxide DB from {}", resolved.display());
+                return Ok(());
+            }
+            let summary = shac::import::import_zoxide(&db, &resolved)?;
+            print_import_summary(std::slice::from_ref(&summary));
+        }
+        ImportAction::All { yes } => {
+            let opts = shac::import::ImportOpts {
+                yes,
+                roots: shac::import::default_project_roots(),
+                depth: 3,
+                shell: shac::import::ShellKind::Zsh,
+                history_path: None,
+                zoxide_path: None,
+            };
+            let summaries = shac::import::run_full_import(&db, opts)?;
+            print_import_summary(&summaries);
+        }
+    }
+    Ok(())
+}
+
+fn scan_projects_action(paths: &AppPaths, args: ScanProjectsArgs) -> Result<()> {
+    let db = shac::db::AppDb::open(&paths.db_file)?;
+    let roots: Vec<PathBuf> = if args.root.is_empty() {
+        shac::import::default_project_roots()
+    } else {
+        args.root.into_iter().map(PathBuf::from).collect()
+    };
+    let summary = shac::import::scan_projects(&db, &roots, args.depth)?;
+    print_import_summary(std::slice::from_ref(&summary));
     Ok(())
 }
 
