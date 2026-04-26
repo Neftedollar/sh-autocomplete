@@ -9,3 +9,4 @@ pub mod priors;
 pub mod profiles;
 pub mod protocol;
 pub mod shell;
+pub mod tools;

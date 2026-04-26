@@ -729,8 +729,13 @@ fn install(paths: &AppPaths, args: InstallArgs) -> Result<()> {
             }
         }
 
-        match shac::priors::seed_priors_into_docs(&db) {
-            Ok(seeded) => print_priors_seeded_line(seeded),
+        // Detect installed CLIs so we only seed priors for tools the user can
+        // actually run. Commands not found on PATH (kubectl, docker, dotnet…)
+        // produce noise in completion menus on machines that don't have them.
+        let detection = shac::tools::detect_tools();
+        let n_detected = detection.installed.len();
+        match shac::priors::seed_priors_into_docs_filtered(&db, &detection) {
+            Ok(seeded) => print_priors_seeded_line(n_detected, seeded),
             Err(err) => eprintln!("shac: priors seeding failed: {err:#}"),
         }
 
@@ -784,13 +789,20 @@ fn print_first_run_summary(summaries: &[shac::import::ImportSummary]) {
 /// [`print_first_run_summary`] (green check on TTY, plain on non-TTY).
 /// Decoupled from `ImportSummary` because priors are not a per-user import —
 /// they're a static corpus shipped in the binary.
-fn print_priors_seeded_line(count: usize) {
+///
+/// `n_detected` is the number of installed CLIs detected; `seeded` is the
+/// number of prior rows actually written (filtered to those CLIs).
+fn print_priors_seeded_line(n_detected: usize, seeded: usize) {
     let tty = std::io::stdout().is_terminal();
     let check = if tty { "\x1b[32m\u{2713}\x1b[0m" } else { "\u{2713}" };
     let dim_open = if tty { "\x1b[2m" } else { "" };
     let dim_close = if tty { "\x1b[0m" } else { "" };
     let label = "Loaded command priors";
-    let detail = format!("{} grammar pairs", fmt_count(count));
+    let detail = format!(
+        "Detected {} installed CLIs · seeded {} command priors",
+        fmt_count(n_detected),
+        fmt_count(seeded),
+    );
     println!("{check} {label:<46} {dim_open}{detail}{dim_close}");
 }
 

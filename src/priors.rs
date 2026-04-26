@@ -24,6 +24,7 @@ use anyhow::Result;
 use std::collections::HashMap;
 
 use crate::db::{AppDb, StoredDoc};
+use crate::tools::ToolFilter;
 
 /// One bundled prior. Matches the column layout of `command_docs`.
 #[derive(Debug, Clone, Copy)]
@@ -215,11 +216,29 @@ fn prior_to_stored_doc(p: &Prior) -> StoredDoc {
 /// Subsequent `shac install` runs do not change `command_docs` net of priors.
 ///
 /// Returns the total number of prior rows seeded.
+///
+/// For the filtered variant that only seeds priors for installed CLIs, use
+/// [`seed_priors_into_docs_filtered`].
 pub fn seed_priors_into_docs(db: &AppDb) -> Result<usize> {
+    seed_priors_into_docs_filtered(db, &crate::tools::AdmitAll)
+}
+
+/// Seed only those prior entries whose command is considered installed by
+/// `filter`.
+///
+/// Callers at install time should pass a [`crate::tools::ToolDetection`]
+/// obtained from [`crate::tools::detect_tools()`]. To seed everything
+/// (e.g. for tests or explicit user requests), pass
+/// [`crate::tools::AdmitAll`].
+///
+/// Returns the number of prior rows actually written to the DB.
+pub fn seed_priors_into_docs_filtered<F: ToolFilter>(db: &AppDb, filter: &F) -> Result<usize> {
     // Group priors by command — `replace_docs_for_command` is per-command.
     let mut grouped: HashMap<&'static str, Vec<StoredDoc>> = HashMap::new();
     for p in PRIORS {
-        grouped.entry(p.command).or_default().push(prior_to_stored_doc(p));
+        if filter.has(p.command) {
+            grouped.entry(p.command).or_default().push(prior_to_stored_doc(p));
+        }
     }
     let mut total = 0usize;
     for (cmd, docs) in &grouped {
@@ -307,5 +326,56 @@ mod tests {
         seed_priors_into_docs(&db).expect("seed priors first time");
         seed_priors_into_docs(&db).expect("seed priors second time");
         assert_eq!(count_seeded_priors(&db), PRIORS.len());
+    }
+
+    #[test]
+    fn seed_priors_filtered_excludes_uninstalled() {
+        use std::collections::HashSet;
+        use crate::tools::ToolDetection;
+
+        // Detection with only "git" installed.
+        let mut installed = HashSet::new();
+        installed.insert("git".to_string());
+        let detection = ToolDetection { installed };
+
+        let db = AppDb::open(std::path::Path::new(":memory:")).expect("open in-memory db");
+        let seeded = seed_priors_into_docs_filtered(&db, &detection)
+            .expect("seed filtered priors");
+
+        // Only git priors should be seeded.
+        let git_count = PRIORS.iter().filter(|p| p.command == "git").count();
+        assert_eq!(seeded, git_count, "expected only git priors, got {seeded}");
+
+        // No other command should have rows.
+        for p in PRIORS {
+            if p.command == "git" {
+                continue;
+            }
+            let docs = db.docs_for_command(p.command).expect("docs_for_command");
+            let priors_rows: Vec<_> = docs
+                .iter()
+                .filter(|d| d.source == PRIORS_SOURCE)
+                .collect();
+            assert!(
+                priors_rows.is_empty(),
+                "expected no priors rows for '{}', got {:?}",
+                p.command,
+                priors_rows
+            );
+        }
+    }
+
+    #[test]
+    fn seed_priors_filtered_admits_all_with_admit_all() {
+        use crate::tools::AdmitAll;
+
+        let db = AppDb::open(std::path::Path::new(":memory:")).expect("open in-memory db");
+        let seeded = seed_priors_into_docs_filtered(&db, &AdmitAll)
+            .expect("seed with AdmitAll");
+        assert_eq!(
+            seeded,
+            PRIORS.len(),
+            "AdmitAll should seed every prior; got {seeded}"
+        );
     }
 }

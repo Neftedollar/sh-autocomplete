@@ -589,6 +589,7 @@ Status as of integration commit `e31edde` + cleanup/tests `f68ac43` + Section 7 
 - **7.14** Performance tuning of zsh-history import (`feat/section-7-14-perf` `bc9e89d`, +2 perf tests). Switched dedupe hash from `sha2::Sha256` to `blake3` and batched `INSERT OR IGNORE INTO history_events` into multi-VALUES statements of 500 rows. Measured release-mode: 10k lines in ~50ms, 200k lines in ~1.6s (under 2.5s budget). Tests `perf_10k_history_lines_under_800ms_release` and `perf_200k_history_lines_under_2500ms_release` lock in budgets. `sha2` dep removed.
 - **7.6** Script collector (`feat/section-7-6-script-collector` `695622f`, +6 tests). `collect_npm_script_candidates` in `src/engine.rs` walks up from cwd to nearest `package.json` (capped at 8 levels, stops at `.git`), parses `scripts` object, emits each name with `kind=npm_script` (position_score 1.0, source_prior 0.85). `dispatch_path_like` `Script =>` arm wired up. Covers `npm run`, `pnpm run`, `yarn run`. README Current MVP updated.
 - **7.2** Bundled command priors (`feat/section-7-2-priors`, +6 tests). `src/priors.rs` ships a hand-curated static corpus of ~60 `(command, item_type, item_value, description)` rows covering `git`, `npm`, `pnpm`, `yarn`, `cargo`, `docker`, `kubectl`, `gh`, `brew`, `make`, `python`/`python3`, `pip`. `seed_priors_into_docs(&db)` writes them with `source = "priors"` via `replace_docs_for_command` (idempotent). `shac install` seeds priors after `run_full_import` and prints `Loaded N command priors`. README Current MVP updated.
+- **7.3** `detect_tools()` + tool-aware priors filtering (`feat/section-7-3-detect-tools`, +13 tests). `src/tools.rs` (NEW): `detect_tools()` scans `$PATH` for ~38 known CLI names via `stat` + permission-bit check, then applies ecosystem indicators (`~/.cargo/bin/` → cargo/rustc/rustup, `~/.dotnet/` → dotnet, `~/.nvm/` → nvm, `~/.rbenv/` → ruby/gem, VS Code app → code, `brew list --formula` for any brew-installed CLIs). `ToolFilter` trait abstracts over `ToolDetection` and `AdmitAll`. `src/priors.rs`: `seed_priors_into_docs_filtered(db, &impl ToolFilter)` filters `PRIORS` by `filter.has(entry.command)` before insert; `seed_priors_into_docs` now delegates to it via `AdmitAll`. `shac install` calls `detect_tools()` after import, passes detection to filtered seeder, prints `"Detected N installed CLIs · seeded M command priors"`. Profiles are pure-runtime (lookup-only in `engine.rs`); no profile seeding code exists, so no filtering needed there. README Current MVP updated.
 
 ### ⏳ Pending — High priority (cold-start activation)
 
@@ -596,8 +597,7 @@ Status as of integration commit `e31edde` + cleanup/tests `f68ac43` + Section 7 
 
 ~~**7.2 Bundled command priors**~~ — ✅ Done (see above).
 
-**7.3 `detect_tools()` + tool-aware profile loading**
-B intentionally skipped this (PLAN §B5). Detect installed CLIs (homebrew, cargo, dotnet, nvm, etc.) and load only relevant profiles into `command_docs`. Reduces noise for users without those tools. **File:** `src/import.rs::detect_tools`.
+~~**7.3 `detect_tools()` + tool-aware profile loading**~~ — ✅ Done (see above).
 
 ### ⏳ Pending — Medium priority (extend dispatch coverage)
 
