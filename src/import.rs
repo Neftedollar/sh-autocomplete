@@ -11,7 +11,6 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use regex::{Regex, RegexSet};
-use sha2::{Digest, Sha256};
 
 use crate::db::AppDb;
 use crate::protocol::{PROVENANCE_LEGACY, TRUST_LEGACY};
@@ -205,16 +204,19 @@ fn parse_cd_command(cmd: &str) -> Option<Option<String>> {
     None
 }
 
-fn sha256_hex(input: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(input.as_bytes());
-    let digest = hasher.finalize();
-    let mut out = String::with_capacity(64);
-    for byte in digest.iter() {
-        use std::fmt::Write;
-        let _ = write!(&mut out, "{:02x}", byte);
-    }
-    out
+/// Compute the dedupe hash for an imported history event.
+///
+/// Uses blake3 (3-5× faster than sha2 on small inputs); output is 64 hex
+/// chars (256 bits) so the on-disk `import_hash TEXT` column stays the
+/// same size as the previous sha256 implementation. Only equality matters
+/// at the partial unique index `idx_history_import_hash`, so the change in
+/// hash function is opaque to SQLite — old sha256 hashes simply never
+/// collide with new blake3 hashes (acceptable one-time noise).
+fn import_hash(ts: i64, cmd: &str) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(format!("{ts}|").as_bytes());
+    hasher.update(cmd.as_bytes());
+    hasher.finalize().to_hex().to_string()
 }
 
 /// Read raw history lines, joining `\\\n` continuations conservatively.
@@ -265,6 +267,15 @@ pub fn import_zsh_history(
     let mut seen_hashes: HashSet<[u8; 32]> = HashSet::with_capacity(lines.len());
     let mut path_targets: Vec<String> = Vec::new();
 
+    /// Multi-VALUES batch size for `INSERT OR IGNORE INTO history_events`.
+    /// SQLite's default `SQLITE_MAX_COMPOUND_SELECT` is 500; we stay strictly
+    /// under it. Each row uses 11 placeholders (one column is the literal
+    /// `0` for `tty_present`), so 500 rows × 11 = 5500 binds — well below
+    /// the 32k SQLite default for `SQLITE_MAX_VARIABLE_NUMBER`.
+    const BATCH_SIZE: usize = 500;
+    type HistoryEventRow = (i64, String, String, Option<String>, String, String, String);
+    let mut batch: Vec<HistoryEventRow> = Vec::with_capacity(BATCH_SIZE);
+
     db.begin_txn()?;
     let result = (|| -> Result<()> {
         for raw_line in lines {
@@ -298,7 +309,7 @@ pub fn import_zsh_history(
             }
 
             // Idempotency: in-memory hash + DB partial unique index.
-            let hash_hex = sha256_hex(&format!("{ts}|{cmd}"));
+            let hash_hex = import_hash(ts, cmd);
             let mut hash_bytes = [0u8; 32];
             for (i, chunk) in hash_hex.as_bytes().chunks(2).enumerate().take(32) {
                 hash_bytes[i] = u8::from_str_radix(
@@ -313,20 +324,27 @@ pub fn import_zsh_history(
             }
 
             let cwd = last_cd_target.clone().unwrap_or_default();
-            let inserted = db.insert_imported_history(
+            batch.push((
                 ts,
-                &cwd,
-                cmd,
-                Some("zsh"),
-                &hash_hex,
-                TRUST_LEGACY,
-                PROVENANCE_LEGACY,
-            )?;
-            if inserted {
-                summary.inserted += 1;
-            } else {
-                summary.skipped_dup += 1;
+                cwd,
+                cmd.to_string(),
+                Some("zsh".to_string()),
+                hash_hex,
+                TRUST_LEGACY.to_string(),
+                PROVENANCE_LEGACY.to_string(),
+            ));
+            if batch.len() >= BATCH_SIZE {
+                let inserted = db.insert_imported_history_batch(&batch)?;
+                summary.inserted += inserted;
+                summary.skipped_dup += batch.len() - inserted;
+                batch.clear();
             }
+        }
+        if !batch.is_empty() {
+            let inserted = db.insert_imported_history_batch(&batch)?;
+            summary.inserted += inserted;
+            summary.skipped_dup += batch.len() - inserted;
+            batch.clear();
         }
         Ok(())
     })();
@@ -795,7 +813,7 @@ mod tests {
     }
 
     #[test]
-    fn perf_10k_history_lines_under_250ms() {
+    fn perf_10k_history_lines_under_800ms_release() {
         let (dir, db) = open_test_db();
         let mut content = String::with_capacity(10_000 * 40);
         for i in 0..10_000 {
@@ -804,17 +822,57 @@ mod tests {
         let history_path = dir.path().join(".zsh_history");
         std::fs::write(&history_path, content.as_bytes()).unwrap();
         let red = Redactor::new();
+        // Time only the import call itself, not file setup.
         let started = Instant::now();
         let summary = import_zsh_history(&db, &history_path, &red).unwrap();
         let elapsed = started.elapsed();
         assert_eq!(summary.inserted, 10_000);
-        // Generous budget; CI hosts can be slow.
+        // Tightened post-7.14 (blake3 + batched INSERT). Budget reflects
+        // release-mode reality with headroom for slow CI hosts.
+        let budget = if cfg!(debug_assertions) {
+            Duration::from_millis(2_500)
+        } else {
+            Duration::from_millis(800)
+        };
         assert!(
-            elapsed < Duration::from_millis(2_500),
-            "10k zsh-history lines took {:?}",
-            elapsed
+            elapsed < budget,
+            "10k zsh-history lines took {:?} (budget {:?})",
+            elapsed,
+            budget
         );
         eprintln!("perf_10k_history_lines: {:?}", elapsed);
+    }
+
+    #[test]
+    fn perf_200k_history_lines_under_2500ms_release() {
+        let (dir, db) = open_test_db();
+        // 200k synthetic extended-history lines.
+        let mut content = String::with_capacity(200_000 * 40);
+        for i in 0..200_000 {
+            content.push_str(&format!(": 17{:08}:0;echo line{i}\n", i));
+        }
+        let history_path = dir.path().join(".zsh_history");
+        std::fs::write(&history_path, content.as_bytes()).unwrap();
+        let red = Redactor::new();
+        // Time only the import call itself.
+        let started = Instant::now();
+        let summary = import_zsh_history(&db, &history_path, &red).unwrap();
+        let elapsed = started.elapsed();
+        assert_eq!(summary.inserted, 200_000);
+        // Plan §7.14 budget: 200k lines under 2.5s in release. Debug builds
+        // get a much wider budget (this test is slow in debug; run release).
+        let budget = if cfg!(debug_assertions) {
+            Duration::from_secs(60)
+        } else {
+            Duration::from_millis(2_500)
+        };
+        assert!(
+            elapsed < budget,
+            "200k zsh-history lines took {:?} (budget {:?})",
+            elapsed,
+            budget
+        );
+        eprintln!("perf_200k_history_lines: {:?}", elapsed);
     }
 }
 
