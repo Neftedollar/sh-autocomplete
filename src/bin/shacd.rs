@@ -79,7 +79,7 @@ fn main() -> Result<()> {
             let mut fail_count: usize = 0;
             loop {
                 match AppDb::open(&db_path)
-                    .and_then(|db| indexer::reindex_path_commands(&db, path_env.as_deref(), false, true))
+                    .and_then(|db| indexer::reindex_path_commands(&db, path_env.as_deref(), true, true))
                 {
                     Ok(n) => {
                         eprintln!("shac: background indexed {} commands", n);

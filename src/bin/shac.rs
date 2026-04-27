@@ -294,7 +294,10 @@ fn main() -> Result<()> {
         }
         Commands::InvalidateCaches => {
             ensure_daemon(&paths)?;
-            send_request(&paths, "invalidate-caches", serde_json::json!({}))?;
+            let resp = send_request(&paths, "invalidate-caches", serde_json::json!({}))?;
+            if let Some(err) = resp.get("error").and_then(|e| e.as_str()) {
+                bail!("daemon error: {err}");
+            }
             println!("caches invalidated");
             Ok(())
         }
