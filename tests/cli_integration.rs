@@ -3,6 +3,7 @@ mod support;
 use std::fs;
 
 use serde_json::Value;
+use shac::db::AppDb;
 
 #[test]
 fn cli_daemon_records_exact_accept_and_recent_events() {
@@ -188,5 +189,97 @@ fn cli_daemon_records_exact_accept_and_recent_events() {
             .lines()
             .any(|line| line.split('\t').collect::<Vec<_>>().get(1) == Some(&"tools/")),
         "nested cd completion must not drop the active path prefix:\n{nested_cd_completion}"
+    );
+}
+
+#[test]
+fn path_jump_appears_when_paths_index_seeded() {
+    let env = support::TestEnv::new("path-jump-seeded");
+
+    // A target dir somewhere not under the cwd.
+    let target = env.root.join("elsewhere");
+    fs::create_dir_all(&target).expect("create target");
+
+    // Seed paths_index BEFORE spawning daemon (which opens the DB).
+    {
+        let paths = env.app_paths();
+        fs::create_dir_all(&paths.data_dir).expect("data dir");
+        let db = AppDb::open(&paths.db_file).expect("open db");
+        db.upsert_path_index_with_rank(
+            target.to_str().expect("utf8 target"),
+            7.0,
+            0,
+            "test_seed",
+            false,
+            None,
+        )
+        .expect("seed paths_index");
+    }
+
+    let cwd = env.root.join("cwd-not-elsewhere");
+    fs::create_dir_all(&cwd).expect("create cwd");
+
+    let _daemon = env.spawn_daemon();
+
+    let output = support::run_ok(
+        &env,
+        [
+            "complete",
+            "--shell",
+            "zsh",
+            "--line",
+            "cd ",
+            "--cursor",
+            "3",
+            "--cwd",
+            cwd.to_str().expect("utf8 cwd"),
+            "--format",
+            "shell-tsv-v2",
+        ],
+    );
+
+    let has_path_jump = output.lines().any(|line| {
+        let fields: Vec<&str> = line.split('\t').collect();
+        fields.get(3) == Some(&"path_jump") && fields.get(4) == Some(&"path_jump")
+    });
+    assert!(
+        has_path_jump,
+        "expected a path_jump row when paths_index is seeded:\n{output}"
+    );
+}
+
+#[test]
+fn path_jump_absent_when_paths_index_empty() {
+    let env = support::TestEnv::new("path-jump-empty");
+
+    let cwd = env.root.join("emptycwd");
+    fs::create_dir_all(&cwd).expect("create cwd");
+
+    let _daemon = env.spawn_daemon();
+
+    let output = support::run_ok(
+        &env,
+        [
+            "complete",
+            "--shell",
+            "zsh",
+            "--line",
+            "cd ",
+            "--cursor",
+            "3",
+            "--cwd",
+            cwd.to_str().expect("utf8 cwd"),
+            "--format",
+            "shell-tsv-v2",
+        ],
+    );
+
+    let any_path_jump = output.lines().any(|line| {
+        let fields: Vec<&str> = line.split('\t').collect();
+        fields.get(3) == Some(&"path_jump")
+    });
+    assert!(
+        !any_path_jump,
+        "expected no path_jump rows when paths_index is empty:\n{output}"
     );
 }
