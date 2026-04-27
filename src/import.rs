@@ -212,9 +212,22 @@ fn parse_cd_command(cmd: &str) -> Option<Option<String>> {
 /// at the partial unique index `idx_history_import_hash`, so the change in
 /// hash function is opaque to SQLite — old sha256 hashes simply never
 /// collide with new blake3 hashes (acceptable one-time noise).
-fn import_hash(ts: i64, cmd: &str) -> String {
+///
+/// When `ts == 0` (plain, non-extended zsh history line) a stable monotonic
+/// `line_no` is mixed into the hash so that the same command repeated N times
+/// in a plain history file produces N distinct hashes and is NOT collapsed
+/// to a single row.  For extended-format lines (real ts > 0) the hash is
+/// `ts|cmd` as before, preserving idempotency across re-imports of the same
+/// timestamped entry.
+fn import_hash(ts: i64, cmd: &str, line_no: usize) -> String {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(format!("{ts}|").as_bytes());
+    if ts == 0 {
+        // Plain format: include the line position so repeated identical
+        // commands yield distinct hashes and are preserved as separate rows.
+        hasher.update(format!("0|{line_no}|").as_bytes());
+    } else {
+        hasher.update(format!("{ts}|").as_bytes());
+    }
     hasher.update(cmd.as_bytes());
     hasher.finalize().to_hex().to_string()
 }
@@ -278,7 +291,7 @@ pub fn import_zsh_history(
 
     db.begin_txn()?;
     let result = (|| -> Result<()> {
-        for raw_line in lines {
+        for (line_no, raw_line) in lines.iter().enumerate() {
             let line = raw_line.trim_end_matches('\n');
             if line.is_empty() {
                 continue;
@@ -309,7 +322,9 @@ pub fn import_zsh_history(
             }
 
             // Idempotency: in-memory hash + DB partial unique index.
-            let hash_hex = import_hash(ts, cmd);
+            // For plain-format lines (ts == 0) the line position is mixed in
+            // so that repeated identical commands produce distinct hashes.
+            let hash_hex = import_hash(ts, cmd, line_no);
             let mut hash_bytes = [0u8; 32];
             for (i, chunk) in hash_hex.as_bytes().chunks(2).enumerate().take(32) {
                 hash_bytes[i] = u8::from_str_radix(
@@ -873,6 +888,50 @@ mod tests {
             budget
         );
         eprintln!("perf_200k_history_lines: {:?}", elapsed);
+    }
+
+    /// Plain (non-extended) zsh history: the same command repeated N times
+    /// must produce N distinct rows in `history_events`, not be collapsed to 1.
+    ///
+    /// Regression for the P1 finding: when `ts == 0` the hash was `0|cmd`,
+    /// so every occurrence of the same command in a plain history file hashed
+    /// identically and was treated as a duplicate — silently discarding
+    /// N-1 of N occurrences, corrupting visit-frequency signals.
+    ///
+    /// The fix mixes the line index into the hash when ts == 0, making each
+    /// plain-format occurrence produce a distinct hash and therefore a separate
+    /// row.
+    #[test]
+    fn plain_history_repeated_command_inserts_all_occurrences() {
+        let (dir, db) = open_test_db();
+
+        // Five identical plain-history lines — all should be inserted.
+        let contents = b"ls -la\nls -la\nls -la\nls -la\nls -la\n";
+        let history = write_history_file(dir.path(), contents);
+        let red = Redactor::new();
+
+        let summary = import_zsh_history(&db, &history, &red)
+            .expect("import must succeed");
+
+        assert_eq!(
+            summary.inserted, 5,
+            "all 5 repeated plain-history commands must be inserted as distinct rows; \
+             got inserted={}, skipped_dup={}",
+            summary.inserted, summary.skipped_dup
+        );
+        assert_eq!(
+            summary.skipped_dup, 0,
+            "no rows should be treated as duplicates in a plain history file; \
+             got skipped_dup={}",
+            summary.skipped_dup
+        );
+
+        // Confirm the DB actually has 5 rows.
+        let total = db.count_imported_history().expect("count");
+        assert_eq!(
+            total, 5,
+            "history_events table must contain 5 rows, got {total}"
+        );
     }
 }
 
