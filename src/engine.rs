@@ -30,6 +30,15 @@ const PACKAGE_JSON_MAX_BYTES: u64 = 1_048_576; // 1 MiB
 /// Real files rarely exceed a few KB; 1 MiB is a very conservative guard.
 const SSH_FILE_MAX_BYTES: u64 = 1_048_576; // 1 MiB
 
+/// Hard timeout on `docker images` invocation used by
+/// [`collect_docker_image_candidates`]. Docker daemon calls are cheap on a
+/// healthy setup; 500ms is generous.
+const DOCKER_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Cap on the number of image lines consumed from `docker images` output.
+/// A user with 200+ images is unusual but possible on a build machine.
+const DOCKER_IMAGE_LIMIT: usize = 200;
+
 /// Maximum number of ancestor directories walked while searching for a build
 /// file (Makefile / justfile / Taskfile). Mirrors [`PACKAGE_JSON_WALK_LIMIT`].
 const BUILD_FILE_WALK_LIMIT: usize = 8;
@@ -538,8 +547,11 @@ impl Engine {
                 // surfaces directories the user is typing directly.
                 self.collect_path_candidates(active, cwd, true, candidates, seen)?;
             }
-            ArgType::Resource | ArgType::Image => {
-                // Stubs for now — implementations land in subsequent PRs.
+            ArgType::Resource => {
+                // TODO: 7.7 — left as stub; 7.7 implements collect_kubectl_resource_candidates.
+            }
+            ArgType::Image => {
+                self.collect_docker_image_candidates(active, candidates, seen)?;
             }
             ArgType::Subcommand | ArgType::Flag | ArgType::None => {
                 // Subcommand / flag completion is handled elsewhere in
@@ -956,6 +968,45 @@ impl Engine {
         Ok(())
     }
 
+    /// Emit `docker_image` candidates for `docker run|pull|push|rmi <Tab>`.
+    ///
+    /// Shells out to `docker images --format {{.Repository}}:{{.Tag}}` with a
+    /// [`DOCKER_TIMEOUT`] deadline. If docker is unavailable or the daemon is
+    /// not running the call returns `Ok(())` with no candidates — there is no
+    /// static fallback because docker images are user-specific.
+    fn collect_docker_image_candidates(
+        &self,
+        active: &str,
+        candidates: &mut Vec<Candidate>,
+        seen: &mut HashSet<String>,
+    ) -> Result<()> {
+        let images = list_docker_images();
+        for image_ref in images {
+            // image_ref is "repo:tag". Split to extract the tag for the description.
+            let tag = image_ref
+                .find(':')
+                .map(|i| &image_ref[i + 1..])
+                .unwrap_or("unknown");
+
+            if !active.is_empty() && !image_ref.starts_with(active) {
+                continue;
+            }
+
+            push_candidate(
+                candidates,
+                seen,
+                Candidate {
+                    insert_text: image_ref.clone(),
+                    display: image_ref.clone(),
+                    kind: "docker_image".to_string(),
+                    source: "docker_image".to_string(),
+                    description: Some(format!("docker image · {tag}")),
+                },
+            );
+        }
+        Ok(())
+    }
+
     fn collect_path_candidates(
         &self,
         token: &str,
@@ -1308,6 +1359,7 @@ fn position_score(parsed: &ParsedContext, candidate: &Candidate) -> f64 {
         _ if candidate.kind == "ssh_host" => 1.0,
         _ if candidate.kind == "build_target" => 1.0,
         _ if candidate.kind == "workspace" => 1.0,
+        _ if candidate.kind == "docker_image" => 1.0,
         TokenRole::SubcommandOrArg if candidate.kind == "module" => 1.0,
         TokenRole::SubcommandOrArg if candidate.kind == "subcommand" => 0.9,
         TokenRole::SubcommandOrArg if candidate.kind == "history" => 0.6,
@@ -1336,6 +1388,7 @@ fn source_prior(source: &str, kind: &str) -> f64 {
         ("ssh_host", _) => 0.85,
         ("build_target", _) => 0.85,
         ("workspace", _) => 0.85,
+        ("docker_image", _) => 0.85,
         _ => 0.4,
     }
 }
@@ -1474,6 +1527,83 @@ fn list_git_refs(repo_root: &Path, timeout: Duration) -> Option<Vec<String>> {
         }
     }
     Some(refs)
+}
+
+/// Shell out to `docker images --format {{.Repository}}:{{.Tag}}` with a
+/// [`DOCKER_TIMEOUT`] deadline and return up to [`DOCKER_IMAGE_LIMIT`] image
+/// refs. Dangling images (`<none>:<none>`) and images whose repository is
+/// `<none>` are skipped. Returns an empty `Vec` when docker is unavailable,
+/// the daemon is not running, or the command exits non-zero.
+fn list_docker_images() -> Vec<String> {
+    let mut child = match Command::new("docker")
+        .args(["images", "--format", "{{.Repository}}:{{.Tag}}"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .stdin(Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() {
+                    return Vec::new();
+                }
+                break;
+            }
+            Ok(None) => {
+                if started.elapsed() >= DOCKER_TIMEOUT {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Vec::new();
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Vec::new();
+            }
+        }
+    }
+
+    let mut buf = String::new();
+    if let Some(mut out) = child.stdout.take() {
+        out.read_to_string(&mut buf).ok();
+    }
+
+    parse_docker_images_output(&buf)
+}
+
+/// Parse raw `docker images` output (one `repo:tag` per line) into a deduplicated
+/// Vec, skipping dangling images and capping at [`DOCKER_IMAGE_LIMIT`].
+fn parse_docker_images_output(output: &str) -> Vec<String> {
+    let mut images = Vec::new();
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        // Skip dangling images: repo == "<none>" or tag == "<none>"
+        // The format is always "repo:tag", so split at ':'
+        let repo = trimmed.split(':').next().unwrap_or("");
+        if repo == "<none>" {
+            continue;
+        }
+        let tag = trimmed.split(':').nth(1).unwrap_or("");
+        if tag == "<none>" {
+            continue;
+        }
+        images.push(trimmed.to_string());
+        if images.len() >= DOCKER_IMAGE_LIMIT {
+            break;
+        }
+    }
+    images
 }
 
 /// Walk up at most [`PACKAGE_JSON_WALK_LIMIT`] ancestors from `start` looking
@@ -3083,5 +3213,62 @@ mod tests {
         let paths = parse_vscode_recent_workspaces(&db_path);
         assert_eq!(paths.len(), 1, "remote entry must be skipped: {paths:?}");
         assert_eq!(paths[0].to_string_lossy().as_ref(), "/local/proj");
+    }
+
+    // -----------------------------------------------------------------------
+    // §7.8 docker image inline unit tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_docker_images_output_basic() {
+        let input = "nginx:latest\nredis:7\n<none>:<none>\n";
+        let result = parse_docker_images_output(input);
+        assert!(
+            result.contains(&"nginx:latest".to_string()),
+            "nginx:latest must be present: {result:?}"
+        );
+        assert!(
+            result.contains(&"redis:7".to_string()),
+            "redis:7 must be present: {result:?}"
+        );
+        assert!(
+            !result.contains(&"<none>:<none>".to_string()),
+            "<none>:<none> must be skipped: {result:?}"
+        );
+        assert_eq!(result.len(), 2, "expected exactly 2 images: {result:?}");
+    }
+
+    #[test]
+    fn parse_docker_images_skips_unnamed_repos() {
+        // Repo == "<none>" must be skipped even if the tag looks valid.
+        let input = "<none>:somecid\nnginx:latest\n";
+        let result = parse_docker_images_output(input);
+        assert_eq!(result.len(), 1, "expected only nginx:latest: {result:?}");
+        assert_eq!(result[0], "nginx:latest");
+    }
+
+    #[test]
+    fn parse_docker_images_handles_empty_output() {
+        let result = parse_docker_images_output("");
+        assert!(result.is_empty(), "empty input must produce empty vec: {result:?}");
+    }
+
+    #[test]
+    fn collect_docker_images_returns_empty_when_no_docker() {
+        // Temporarily override PATH to a directory without docker, then
+        // restore it after the call. We use catch_unwind to ensure restoration
+        // even if something panics.
+        use std::panic;
+
+        let original_path = std::env::var_os("PATH").unwrap_or_default();
+        std::env::set_var("PATH", "/dev/null");
+        let result = panic::catch_unwind(list_docker_images);
+        std::env::set_var("PATH", &original_path);
+
+        let images = result.expect("list_docker_images must not panic");
+        assert!(
+            images.is_empty(),
+            "expected empty Vec when docker is not on PATH: {images:?}"
+        );
     }
 }

@@ -30,6 +30,7 @@ Landing page: https://neftedollar.github.io/sh-autocomplete/
 - `ssh <Tab>` / `mosh <Tab>` host completion parsed from `~/.ssh/config` `Host` entries and `~/.ssh/known_hosts` (wildcards skipped, hashed entries skipped, `[host]:port` notation handled)
 - `code <Tab>` / `subl <Tab>` / `idea <Tab>` recent workspace completion from VS Code's SQLite store (`state.vscdb`); remote workspaces and missing-on-disk entries are filtered out; falls through to path completion for typed paths
 - `make <Tab>` / `just <Tab>` / `task <Tab>` target completion parsed from the cwd's nearest `Makefile`, `justfile`, or `Taskfile.yml` (walk-up bounded to 8 levels, stops at `.git` boundary; skips `.PHONY`, pattern rules, and variable assignments)
+- `docker run|pull|push|rmi <Tab>` image completion via `docker images` shellout (live only, no fallback; returns empty when docker is unavailable)
 - builtin docs for `git`, `docker`, `kubectl`, `npm`, `cargo`, `dotnet`, `python`, `pip`, `pytest`
 - explain output for feature contributions
 
