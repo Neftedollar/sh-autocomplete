@@ -35,7 +35,7 @@ fn ranking_regressions_cover_history_transitions_projects_and_runtime_hints() {
 
     let engine = Engine::new(&paths).expect("engine");
     engine
-        .reindex(Some(fake_bin.to_string_lossy().as_ref()), false)
+        .reindex(Some(fake_bin.to_string_lossy().as_ref()), false, false)
         .expect("reindex fake commands");
 
     engine

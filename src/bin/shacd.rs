@@ -14,6 +14,8 @@ use shac::engine::{self, Engine};
 use shac::indexer;
 use shac::protocol::RecordCommandRequest;
 
+const BG_REINDEX_INTERVAL: Duration = Duration::from_secs(6 * 3600);
+
 #[derive(Debug, Parser)]
 struct Args {
     #[arg(long)]
@@ -41,21 +43,49 @@ fn main() -> Result<()> {
     // Background indexer: opens its own DB connection (WAL-safe) and
     // incrementally indexes --help output for all PATH executables.
     // Waits 2s after daemon start to avoid competing with first completions,
-    // then loops every 6 hours.  Uses skip_existing=true so it never
-    // overwrites manually-indexed docs or reindexes commands already in DB.
+    // then loops every BG_REINDEX_INTERVAL.  Uses skip_existing=true so it
+    // never overwrites manually-indexed docs or reindexes commands already in DB.
+    // On transient errors, retries with exponential backoff (60s → 300s → cap).
+    //
+    // SHAC_BG_REINDEX_INTERVAL_SECS and SHAC_BG_SETTLE_SECS override the intervals
+    // at runtime — intended for integration tests only.
     {
         let db_path = paths.db_file.clone();
         let path_env = std::env::var("PATH").ok();
+        let reindex_interval = std::env::var("SHAC_BG_REINDEX_INTERVAL_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(Duration::from_secs)
+            .unwrap_or(BG_REINDEX_INTERVAL);
+        let settle_secs = std::env::var("SHAC_BG_SETTLE_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(2);
         thread::spawn(move || {
-            thread::sleep(Duration::from_secs(2));
+            thread::sleep(Duration::from_secs(settle_secs));
+            // Backoff schedule for consecutive failures: 60s, 300s, then cap at reindex_interval.
+            let backoff = [
+                Duration::from_secs(60).min(reindex_interval),
+                Duration::from_secs(300).min(reindex_interval),
+                reindex_interval,
+            ];
+            let mut fail_count: usize = 0;
             loop {
                 match AppDb::open(&db_path)
-                    .and_then(|db| indexer::reindex_path_commands(&db, path_env.as_deref(), true, true))
+                    .and_then(|db| indexer::reindex_path_commands(&db, path_env.as_deref(), false, true))
                 {
-                    Ok(n) => eprintln!("shac: background indexed {} commands", n),
-                    Err(e) => eprintln!("shac: background index error: {e}"),
+                    Ok(n) => {
+                        eprintln!("shac: background indexed {} commands", n);
+                        fail_count = 0;
+                        thread::sleep(reindex_interval);
+                    }
+                    Err(e) => {
+                        eprintln!("shac: background index error: {e}");
+                        let idx = fail_count.min(backoff.len() - 1);
+                        thread::sleep(backoff[idx]);
+                        fail_count = fail_count.saturating_add(1);
+                    }
                 }
-                thread::sleep(Duration::from_secs(6 * 3600));
             }
         });
     }
@@ -131,7 +161,13 @@ fn handle_client(engine: &Engine, mut stream: UnixStream) -> Result<()> {
                 .and_then(|payload| payload.get("full"))
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
-            let indexed = engine.reindex(path_env, full)?;
+            // Default skip_existing=true (safer/incremental); --full overrides it to false.
+            let skip_existing = request
+                .get("payload")
+                .and_then(|payload| payload.get("skip_existing"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            let indexed = engine.reindex(path_env, full, skip_existing)?;
             serde_json::to_vec(&serde_json::json!({ "indexed": indexed }))?
         }
         "invalidate-caches" => {
