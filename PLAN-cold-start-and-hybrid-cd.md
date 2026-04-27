@@ -674,3 +674,36 @@ Stubs in `Engine::dispatch_path_like` for non-Directory/Path arg types. Each is 
 7.1, 7.11, and 7.2 are independent and can run in parallel after the integration lands. 7.3 depends on 7.2 (both hydrate `command_docs`). 7.4–7.10 are independent siblings; do in priority order.
 
 7.12–7.15 are polish — slot in whenever convenient.
+
+---
+
+### ⏳ Pending — UX bugs surfaced from real usage
+
+**7.16 Cross-source candidate dedupe by `insert_text`**
+
+**Symptom (observed 2026-04-27):** typing `cd Ko<Tab>` from `~/` shows the same path twice in the menu —
+
+```
+shac 1/3
+> Korat/    Provided by current shell context
+  Korat/
+  Korat_old/
+```
+
+The first `Korat/` comes from the shell adapter's "current shell context" injection (zsh wraps shac's results with what zsh itself completed); the second `Korat/` comes from shac's path source. Both have identical `insert_text` but different `kind` / `source`, so the existing `seen: HashSet<String>` dedupe (keyed on `kind:insert_text`) doesn't fire across sources.
+
+**Fix options (pick one in implementation):**
+
+1. **Engine-side cross-source dedupe.** Change the dedupe key from `kind:insert_text` to just `insert_text` (or `normalized(insert_text)` to handle trailing-slash variations). Cheapest, but loses the ability to surface a path twice when it would be useful (e.g., as both a child and as a frecency jump — though we don't actually want that either).
+
+2. **Shell-adapter-side dedupe.** When the shell hook injects "current shell context" candidates ahead of shac's results, pass shac the active token + already-known shell candidates so shac can suppress its own duplicate emissions. More invasive, more correct.
+
+3. **Hybrid:** engine dedupes within its own sources by normalized `insert_text`; the shell adapter dedupes its own injected candidates against shac's TSV output before rendering the menu. Two cheap passes.
+
+**Recommendation:** start with option 1 (engine-side `insert_text`-only dedupe) — covers the most common case. If the shell-adapter injection still slips through (because shac never sees those candidates), add option 2 later.
+
+**Files:** `src/engine.rs` (`Engine::collect_candidates` — change `seen` key construction). Possibly `shell/zsh/shac.zsh` for adapter-side dedupe pass.
+
+**Tests:** add a regression test pinning `cd Ko<Tab>` from a directory containing `Korat/` returns at most one `Korat/` candidate. Also assert child + frecency-jump for the same path doesn't double-emit (rare but possible).
+
+**Priority:** medium — visually noisy but doesn't break completion. Probably bundle into a "UX bug bash" PR with any other duplicates we notice during dogfooding.
