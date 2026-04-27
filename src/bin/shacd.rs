@@ -79,13 +79,11 @@ fn main() -> Result<()> {
             let mut fail_count: usize = 0;
             loop {
                 match AppDb::open(&db_path)
-                    // full=false: only index the curated safe-default list
-                    // (git/docker/kubectl/...). full=true would shell out
-                    // `<cmd> --help` for every PATH binary, including GUI
-                    // apps (wish/tkcon/gitk/...) which open windows and
-                    // stress the system. The GUI denylist + script sniffing
-                    // in indexer.rs is defence in depth for explicit reindex.
-                    .and_then(|db| indexer::reindex_path_commands(&db, path_env.as_deref(), false, true))
+                    // bg indexer never shells out to `<cmd> --help`; only
+                    // records names + paths and seeds bundled static_docs.
+                    // Per-command --help extraction is opt-in via
+                    // `shac index add-command <name>` only.
+                    .and_then(|db| indexer::reindex_path_commands(&db, path_env.as_deref(), true))
                 {
                     Ok(n) => {
                         eprintln!("shac: background indexed {} commands", n);
@@ -169,18 +167,12 @@ fn handle_client(engine: &Engine, mut stream: UnixStream) -> Result<()> {
                 .get("payload")
                 .and_then(|payload| payload.get("path_env"))
                 .and_then(|value| value.as_str());
-            let full = request
-                .get("payload")
-                .and_then(|payload| payload.get("full"))
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            // Default skip_existing=true (safer/incremental); --full overrides it to false.
             let skip_existing = request
                 .get("payload")
                 .and_then(|payload| payload.get("skip_existing"))
                 .and_then(|v| v.as_bool())
                 .unwrap_or(true);
-            let indexed = engine.reindex(path_env, full, skip_existing)?;
+            let indexed = engine.reindex(path_env, skip_existing)?;
             serde_json::to_vec(&serde_json::json!({ "indexed": indexed }))?
         }
         "invalidate-caches" => {

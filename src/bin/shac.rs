@@ -50,12 +50,10 @@ enum Commands {
 
 #[derive(Debug, Args)]
 struct ReindexArgs {
-    /// Re-import everything from scratch, replacing existing indexed entries.
-    #[arg(long, conflicts_with = "skip_existing")]
-    full: bool,
-    /// Only add new entries; skip commands that are already indexed (default behaviour).
+    /// Re-process every PATH command, including those already indexed.
+    /// Default is to skip commands that already have docs.
     #[arg(long)]
-    skip_existing: bool,
+    all: bool,
 }
 
 #[derive(Debug, Args)]
@@ -275,18 +273,12 @@ fn main() -> Result<()> {
         Commands::Debug(args) => debug_action(&paths, args.action),
         Commands::Reindex(args) => {
             ensure_daemon(&paths)?;
-            // --full overrides --skip-existing; no flags = default (skip_existing=true, full=false)
-            let full = args.full;
-            // When --full is set, skip_existing is forced false. Otherwise default to true
-            // (incremental), which --skip-existing also explicitly requests.
-            let skip_existing = !full;
             let value = send_request(
                 &paths,
                 "reindex",
                 serde_json::json!({
                     "path_env": std::env::var("PATH").ok(),
-                    "full": full,
-                    "skip_existing": skip_existing,
+                    "skip_existing": !args.all,
                 }),
             )?;
             println!("{}", serde_json::to_string_pretty(&value)?);

@@ -26,10 +26,13 @@ const GUI_APP_DENYLIST: &[&str] = &[
     "osascript", "open", "Wish", "Wish.app",
 ];
 
+/// Index PATH binaries into the `commands` table by name + path + mtime.
+/// Also upserts bundled `static_docs` for the curated tool list (git, docker,
+/// kubectl, ...). Never shells out to `<cmd> --help` — that path is reserved
+/// for the explicit, single-command `shac index add-command <name>` flow.
 pub fn reindex_path_commands(
     db: &AppDb,
     path_env: Option<&str>,
-    full: bool,
     skip_existing: bool,
 ) -> Result<usize> {
     let mut seen = BTreeSet::new();
@@ -52,10 +55,6 @@ pub fn reindex_path_commands(
                 if seen.contains(&name) || !is_executable(&path) {
                     continue;
                 }
-                if is_gui_app(&name, &path) {
-                    seen.insert(name);
-                    continue;
-                }
                 let mtime = entry
                     .metadata()
                     .ok()
@@ -70,7 +69,7 @@ pub fn reindex_path_commands(
                     mtime,
                 )?;
                 if !skip_existing || !db.command_has_docs(&name) {
-                    maybe_upsert_docs(db, &name, full)?;
+                    upsert_static_docs(db, &name)?;
                 }
                 seen.insert(name);
             }
@@ -86,6 +85,10 @@ pub fn reindex_path_commands(
     Ok(seen.len())
 }
 
+/// Explicit per-command indexing: shells out `<cmd> --help` to extract
+/// flags/options. The only entry point that actually invokes a subprocess.
+/// Refuses GUI binaries (Tk/Aqua/AppleScript wrappers) to prevent window
+/// popups; falls back to bundled `static_docs` if shellout is unsafe.
 pub fn index_command(db: &AppDb, command: &str, path_env: Option<&str>) -> Result<usize> {
     let path = find_command_path(command, path_env);
     let mtime = path.as_deref().map(path_mtime).unwrap_or_default();
@@ -97,7 +100,10 @@ pub fn index_command(db: &AppDb, command: &str, path_env: Option<&str>) -> Resul
             .as_deref(),
         mtime,
     )?;
-    maybe_upsert_docs(db, command, true)?;
+    match path.as_deref() {
+        Some(p) if !is_gui_app(command, p) => upsert_docs_with_help_shellout(db, command)?,
+        _ => upsert_static_docs(db, command)?,
+    }
     db.upsert_index_target("command", command, false, false, 0)?;
     Ok(1)
 }
@@ -158,9 +164,25 @@ fn is_gui_app(name: &str, path: &Path) -> bool {
     false
 }
 
-fn maybe_upsert_docs(db: &AppDb, command: &str, explicit: bool) -> Result<()> {
+/// Upsert only bundled docs from `static_docs()`. No subprocess shellout;
+/// safe to call for any PATH binary. Returns silently when no static docs
+/// exist for the given command.
+fn upsert_static_docs(db: &AppDb, command: &str) -> Result<()> {
+    if let Some(docs) = static_docs(command) {
+        if !docs.is_empty() {
+            db.replace_docs_for_command(command, &docs)?;
+        }
+    }
+    Ok(())
+}
+
+/// Upsert docs by running `<cmd> --help`. Caller MUST verify that `command`
+/// is not a GUI app via `is_gui_app` first — this function will happily
+/// shell out to anything. Falls back to static_docs if help parse yields
+/// nothing (covers tools that print help to a man page or stderr).
+fn upsert_docs_with_help_shellout(db: &AppDb, command: &str) -> Result<()> {
     let docs = static_docs(command)
-        .or_else(|| parse_help_output(command, explicit))
+        .or_else(|| parse_help_output(command))
         .unwrap_or_default();
     if !docs.is_empty() {
         db.replace_docs_for_command(command, &docs)?;
@@ -168,14 +190,7 @@ fn maybe_upsert_docs(db: &AppDb, command: &str, explicit: bool) -> Result<()> {
     Ok(())
 }
 
-fn parse_help_output(command: &str, explicit: bool) -> Option<Vec<StoredDoc>> {
-    let safe_default = [
-        "git", "docker", "kubectl", "npm", "cargo", "dotnet", "python", "python3", "pip", "pytest",
-        "grep", "find", "ls",
-    ];
-    if !explicit && !safe_default.contains(&command) {
-        return None;
-    }
+fn parse_help_output(command: &str) -> Option<Vec<StoredDoc>> {
     let output = run_help_with_timeout(command, HELP_TIMEOUT)?;
     if !output.status.success() && output.stdout.is_empty() {
         return None;
@@ -315,7 +330,7 @@ fn index_path_file(
         Some(path.to_string_lossy().as_ref()),
         path_mtime(path),
     )?;
-    maybe_upsert_docs(db, name, false)?;
+    upsert_static_docs(db, name)?;
     Ok(1)
 }
 
@@ -492,7 +507,7 @@ mod tests {
         assert!(db.command_has_docs("mycmd"));
 
         // Pass empty path_env to avoid scanning real PATH.
-        reindex_path_commands(&db, Some(""), false, false).unwrap();
+        reindex_path_commands(&db, Some(""), false).unwrap();
         // mycmd docs were not touched (not in PATH scan).
         assert!(db.command_has_docs("mycmd"));
     }
@@ -512,7 +527,7 @@ mod tests {
         assert!(db.command_has_docs("git"));
 
         // Second reindex with skip_existing=true on empty path; the git entry should be intact.
-        reindex_path_commands(&db, Some(""), true, true).unwrap();
+        reindex_path_commands(&db, Some(""), true).unwrap();
         assert!(db.command_has_docs("git"));
     }
 
@@ -531,7 +546,7 @@ mod tests {
 
         let db = test_db();
         let path_env = dir.to_string_lossy().to_string();
-        let count = reindex_path_commands(&db, Some(&path_env), false, false).unwrap();
+        let count = reindex_path_commands(&db, Some(&path_env), false).unwrap();
         // Should have indexed at least the fake binary.
         assert!(count >= 1, "expected at least 1 indexed, got {count}");
 
@@ -565,7 +580,7 @@ mod tests {
 
         // Reindex with skip_existing=true; mybin should still have its doc (not erased).
         let path_env = dir.to_string_lossy().to_string();
-        reindex_path_commands(&db, Some(&path_env), true, true).unwrap();
+        reindex_path_commands(&db, Some(&path_env), true).unwrap();
         assert!(
             db.command_has_docs("mybin"),
             "pre-indexed doc should survive skip_existing reindex"
