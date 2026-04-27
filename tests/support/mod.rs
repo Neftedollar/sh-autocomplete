@@ -116,8 +116,22 @@ impl TestEnv {
     }
 
     pub fn spawn_daemon(&self) -> TestDaemon {
+        self.spawn_daemon_with_extra_env(&[] as &[(&str, &str)])
+    }
+
+    /// Spawn the daemon with additional environment variables layered on top of the
+    /// standard test environment.  Used by tests that need to override runtime
+    /// knobs such as SHAC_BG_REINDEX_INTERVAL_SECS.
+    pub fn spawn_daemon_with_extra_env<K, V>(&self, extra: &[(K, V)]) -> TestDaemon
+    where
+        K: AsRef<std::ffi::OsStr>,
+        V: AsRef<std::ffi::OsStr>,
+    {
         let mut command = Command::new(&self.shacd);
         self.apply_env(&mut command);
+        for (k, v) in extra {
+            command.env(k, v);
+        }
         let mut child = command
             .stdin(Stdio::null())
             .stdout(Stdio::null())
