@@ -609,7 +609,19 @@ impl Engine {
                 self.collect_path_candidates(active, cwd, true, candidates, seen)?;
             }
             ArgType::Resource => {
-                self.collect_kubectl_resource_candidates(active, candidates, seen)?;
+                // Route by command: kubectl uses Kubernetes api-resources;
+                // docker exec uses running container names; any other command
+                // mapped to Resource gets no completions here (other sources
+                // may still contribute via the Path fallback).
+                match command {
+                    "kubectl" => {
+                        self.collect_kubectl_resource_candidates(active, candidates, seen)?;
+                    }
+                    "docker" => {
+                        self.collect_docker_container_candidates(active, candidates, seen)?;
+                    }
+                    _ => {}
+                }
             }
             ArgType::Image => {
                 self.collect_docker_image_candidates(active, candidates, seen)?;
@@ -1164,6 +1176,42 @@ impl Engine {
                     kind: "docker_image".to_string(),
                     source: "docker_image".to_string(),
                     description: Some(format!("docker image · {tag}")),
+                },
+            );
+        }
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // docker container collector (docker exec)
+    // -----------------------------------------------------------------------
+
+    /// Emit `docker_container` candidates for `docker exec <Tab>`.
+    ///
+    /// Shells out to `docker ps --format {{.Names}}` with a [`DOCKER_TIMEOUT`]
+    /// deadline. Returns `Ok(())` with no candidates when docker is unavailable
+    /// or the daemon is not running — there is no static fallback because
+    /// container names are user-specific.
+    fn collect_docker_container_candidates(
+        &self,
+        active: &str,
+        candidates: &mut Vec<Candidate>,
+        seen: &mut HashSet<String>,
+    ) -> Result<()> {
+        let containers = list_docker_containers();
+        for name in containers {
+            if !active.is_empty() && !name.starts_with(active) {
+                continue;
+            }
+            push_candidate(
+                candidates,
+                seen,
+                Candidate {
+                    insert_text: name.clone(),
+                    display: name,
+                    kind: "docker_container".to_string(),
+                    source: "docker_container".to_string(),
+                    description: Some("docker container · running".to_string()),
                 },
             );
         }
@@ -1847,6 +1895,66 @@ fn parse_docker_images_output(output: &str) -> Vec<String> {
         }
     }
     images
+}
+
+/// Shell out to `docker ps --format {{.Names}}` with a [`DOCKER_TIMEOUT`]
+/// deadline and return running container names. Returns an empty `Vec` when
+/// docker is unavailable, the daemon is not running, or the command exits
+/// non-zero.
+fn list_docker_containers() -> Vec<String> {
+    let mut child = match Command::new("docker")
+        .args(["ps", "--format", "{{.Names}}"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .stdin(Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() {
+                    return Vec::new();
+                }
+                break;
+            }
+            Ok(None) => {
+                if started.elapsed() >= DOCKER_TIMEOUT {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Vec::new();
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Vec::new();
+            }
+        }
+    }
+
+    let mut buf = String::new();
+    if let Some(mut out) = child.stdout.take() {
+        out.read_to_string(&mut buf).ok();
+    }
+
+    parse_docker_containers_output(&buf)
+}
+
+/// Parse raw `docker ps` output (one container name per line) into a Vec,
+/// skipping empty lines.
+fn parse_docker_containers_output(output: &str) -> Vec<String> {
+    output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 /// Walk up at most [`PACKAGE_JSON_WALK_LIMIT`] ancestors from `start` looking
@@ -3646,5 +3754,106 @@ mod tests {
             images.is_empty(),
             "expected empty Vec when docker is not on PATH: {images:?}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // docker container collector (docker exec) — regression for P2 routing fix
+    // -----------------------------------------------------------------------
+
+    /// Parse `docker ps` output: one name per line, empty lines skipped.
+    #[test]
+    fn parse_docker_containers_output_basic() {
+        let input = "my-api\nredis-dev\n\npostgres\n";
+        let result = parse_docker_containers_output(input);
+        assert_eq!(result, vec!["my-api", "redis-dev", "postgres"]);
+    }
+
+    #[test]
+    fn parse_docker_containers_output_empty() {
+        let result = parse_docker_containers_output("");
+        assert!(result.is_empty(), "empty input must produce empty vec: {result:?}");
+    }
+
+    /// `collect_docker_container_candidates` returns empty when docker is absent.
+    #[test]
+    fn collect_docker_containers_returns_empty_when_no_docker() {
+        use std::panic;
+
+        let original_path = std::env::var_os("PATH").unwrap_or_default();
+        std::env::set_var("PATH", "/dev/null");
+        let result = panic::catch_unwind(list_docker_containers);
+        std::env::set_var("PATH", &original_path);
+
+        let containers = result.expect("list_docker_containers must not panic");
+        assert!(
+            containers.is_empty(),
+            "expected empty Vec when docker is not on PATH: {containers:?}"
+        );
+    }
+
+    /// Regression: `docker exec <Tab>` must NOT return kubernetes resources.
+    ///
+    /// Before the fix, `ArgType::Resource` always called
+    /// `collect_kubectl_resource_candidates`, so `docker exec <Tab>` was
+    /// populated from Kubernetes api-resources (pods, services, …).  The fix
+    /// routes by command: kubectl → k8s resources, docker → container names.
+    ///
+    /// With PATH=/dev/null neither kubectl nor docker is available, so both
+    /// collectors return empty — but the key assertion is that candidates
+    /// sourced from "k8s_resource" are NOT present for the docker command.
+    #[test]
+    fn docker_exec_tab_does_not_return_k8s_resources() {
+        // Save and override PATH so neither kubectl nor docker is on it.
+        let saved_path = std::env::var_os("PATH");
+        unsafe { std::env::set_var("PATH", "/dev/null") };
+
+        let result = std::panic::catch_unwind(|| {
+            let (engine, dir) = test_engine("docker-exec-no-k8s");
+
+            // Build a ParsedContext for `docker exec ` using the real parser so
+            // the field layout is always correct.
+            let parsed = crate::context::parse(
+                "docker exec ",
+                12,
+                dir.path.as_path(),
+            );
+            assert_eq!(parsed.command.as_deref(), Some("docker"),
+                "parsed command must be docker");
+
+            let mut dispatch_candidates: Vec<Candidate> = Vec::new();
+            let mut dispatch_seen: HashSet<String> = HashSet::new();
+            engine
+                .dispatch_path_like(
+                    &parsed,
+                    "docker",
+                    "",
+                    "/tmp",
+                    &mut dispatch_candidates,
+                    &mut dispatch_seen,
+                )
+                .expect("dispatch must not fail");
+
+            // No k8s_resource candidates must appear for `docker exec`.
+            let k8s_candidates: Vec<&Candidate> = dispatch_candidates
+                .iter()
+                .filter(|c| c.source == "k8s_resource" || c.kind == "k8s_resource")
+                .collect();
+            assert!(
+                k8s_candidates.is_empty(),
+                "docker exec must not return kubernetes resources, got: {k8s_candidates:?}"
+            );
+        });
+
+        // Restore PATH.
+        unsafe {
+            match saved_path {
+                Some(p) => std::env::set_var("PATH", p),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+
+        if let Err(e) = result {
+            std::panic::resume_unwind(e);
+        }
     }
 }
