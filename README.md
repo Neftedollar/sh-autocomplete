@@ -34,6 +34,9 @@ Landing page: https://neftedollar.github.io/sh-autocomplete/
 - `docker run|pull|push|rmi <Tab>` image completion via `docker images` shellout (live only, no fallback; returns empty when docker is unavailable)
 - builtin docs for `git`, `docker`, `kubectl`, `npm`, `cargo`, `dotnet`, `python`, `pip`, `pytest`
 - explain output for feature contributions
+- background auto-indexer: daemon re-indexes PATH command docs every 6 h; no manual action needed
+- hybrid cd: `cd <Tab>` surfaces frecent destinations (cyan `→` prefix) alongside cwd children
+- cold-start import on install: imports `~/.zsh_history`, zoxide jump list, and scans project roots on first `shac install`
 
 ## Build
 
@@ -106,6 +109,19 @@ shac recent-events --limit 20
 
 For development builds, replace `shac` with `./target/debug/shac` after `cargo build --bins`.
 
+## Background indexer
+
+After each daemon start `shacd` waits 2 seconds and begins a background pass that indexes docs for all PATH commands it has not seen before (`--skip-existing`). The pass repeats every 6 hours with exponential back-off on errors.
+
+No manual action is needed. To verify it ran:
+
+```bash
+shac stats          # command_docs row count increases after first pass
+shac doctor         # surfaces any indexer errors
+```
+
+Set `SHAC_BG_DISABLED=1` to suppress the background thread (useful in tests or on low-resource machines).
+
 ## zsh menu UI
 
 The owned `zsh` menu can be tuned from config:
@@ -156,6 +172,13 @@ unset SHAC_DISABLE
 ```
 
 ## Reindex and inspect
+
+```bash
+shac reindex                   # incremental: index new commands
+shac reindex --full            # re-index all commands, overwrite existing docs
+shac reindex --skip-existing   # add new commands only, skip already-indexed
+shac invalidate-caches         # drop daemon's in-memory dir cache
+```
 
 ```bash
 cargo run --bin shac -- daemon start
