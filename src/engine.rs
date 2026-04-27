@@ -656,6 +656,10 @@ impl Engine {
         }
 
         let cwd_path = PathBuf::from(cwd);
+        // Resolve cwd to its canonical form once so that comparisons below
+        // work even when the shell passes a symlinked path (e.g. /tmp on macOS
+        // is a symlink to /private/tmp, while the DB stores canonical paths).
+        let cwd_canonical = cwd_path.canonicalize().unwrap_or_else(|_| cwd_path.clone());
         let home = dirs::home_dir();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -664,12 +668,21 @@ impl Engine {
 
         for row in rows {
             let path = PathBuf::from(&row.path);
+            // Resolve this DB path canonically for comparison; fall back to the
+            // raw value if the path has vanished since it was recorded.
+            let path_canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
             // Skip paths equal to cwd.
-            if path == cwd_path {
+            if path_canonical == cwd_canonical {
                 continue;
             }
             // Skip direct children of cwd (already covered by collect_path_candidates).
-            if path.parent().map(|p| p == cwd_path).unwrap_or(false) {
+            // Compare canonical forms so that /tmp vs /private/tmp mismatches
+            // don't cause the same directory to appear twice (§7.16).
+            if path_canonical
+                .parent()
+                .map(|p| p == cwd_canonical)
+                .unwrap_or(false)
+            {
                 continue;
             }
             // Skip missing paths (cheap stat).
@@ -3855,5 +3868,103 @@ mod tests {
         if let Err(e) = result {
             std::panic::resume_unwind(e);
         }
+    }
+
+    // §7.16 cross-source deduplication by canonical path
+    // -----------------------------------------------------------------------
+
+    /// Reproduce the bug: a directory that is a direct child of cwd appears
+    /// twice in completion results when the paths_index stores its canonical
+    /// path while the shell passes the symlinked path as cwd.
+    ///
+    /// On macOS /tmp -> /private/tmp, so PathBuf::from("/tmp/X").parent() !=
+    /// PathBuf::from("/private/tmp/X").parent() and the old guard fails,
+    /// causing both a `path` candidate ("Korat/") and a `path_jump` candidate
+    /// ("→ /private/tmp/.../Korat") to be emitted for the same directory.
+    #[test]
+    fn no_duplicate_when_child_dir_in_paths_index_via_symlinked_cwd() {
+        use std::fs;
+
+        let (engine, _dir) = test_engine("dedupe-7-16");
+
+        // Create a real cwd directory under /tmp (the symlink path).
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let cwd_symlink = PathBuf::from(format!(
+            "/tmp/shac-dedupe-cwd-{}-{}",
+            std::process::id(),
+            ts
+        ));
+        fs::create_dir_all(&cwd_symlink).expect("create cwd via symlink path");
+
+        // Create the child directory.
+        let korat_symlink = cwd_symlink.join("Korat");
+        fs::create_dir_all(&korat_symlink).expect("create Korat/");
+
+        // Canonical path of the child (resolves /tmp -> /private/tmp on macOS).
+        let korat_canonical = korat_symlink
+            .canonicalize()
+            .expect("canonicalize Korat path");
+        let korat_canonical_str = korat_canonical.to_string_lossy().to_string();
+
+        // Seed paths_index with the *canonical* path (as the daemon would store it).
+        engine
+            .db
+            .upsert_path_index_with_rank(&korat_canonical_str, 5.0, 0, "test", false, None)
+            .expect("seed paths_index");
+
+        // Complete `cd Korat` with the *symlink* cwd path (as the shell would pass it).
+        let cwd_str = cwd_symlink.to_string_lossy().to_string();
+        let response = engine
+            .complete(make_request("cd Korat", &cwd_str))
+            .expect("complete");
+
+        // Resolve every candidate's insert_text to a canonical path so we can
+        // detect two cards for the same directory regardless of display form.
+        let korat_canonical_ref = &korat_canonical;
+        let items_for_korat: Vec<_> = response
+            .items
+            .iter()
+            .filter(|item| {
+                // Expand tilde and resolve the insert_text relative to cwd.
+                let raw = item.insert_text.trim_end_matches('/');
+                let expanded = if let Some(rest) = raw.strip_prefix("~/") {
+                    dirs::home_dir()
+                        .map(|h| h.join(rest))
+                        .unwrap_or_else(|| PathBuf::from(raw))
+                } else {
+                    PathBuf::from(raw)
+                };
+                let resolved = if expanded.is_absolute() {
+                    expanded
+                } else {
+                    PathBuf::from(&cwd_str).join(expanded)
+                };
+                resolved
+                    .canonicalize()
+                    .map(|c| c == *korat_canonical_ref)
+                    .unwrap_or(false)
+            })
+            .collect();
+
+        assert_eq!(
+            items_for_korat.len(),
+            1,
+            "expected exactly 1 candidate resolving to Korat canonical path, got {}: {:?}",
+            items_for_korat.len(),
+            response.items
+        );
+
+        // Prefer the local `path` source over `path_jump`.
+        assert_eq!(
+            items_for_korat[0].source,
+            "path_cache",
+            "surviving candidate should come from path_cache (local), got source={:?}",
+            items_for_korat[0].source
+        );
+
+        let _ = fs::remove_dir_all(&cwd_symlink);
     }
 }
