@@ -30,6 +30,7 @@ Landing page: https://neftedollar.github.io/sh-autocomplete/
 - `ssh <Tab>` / `mosh <Tab>` host completion parsed from `~/.ssh/config` `Host` entries and `~/.ssh/known_hosts` (wildcards skipped, hashed entries skipped, `[host]:port` notation handled)
 - `code <Tab>` / `subl <Tab>` / `idea <Tab>` recent workspace completion from VS Code's SQLite store (`state.vscdb`); remote workspaces and missing-on-disk entries are filtered out; falls through to path completion for typed paths
 - `make <Tab>` / `just <Tab>` / `task <Tab>` target completion parsed from the cwd's nearest `Makefile`, `justfile`, or `Taskfile.yml` (walk-up bounded to 8 levels, stops at `.git` boundary; skips `.PHONY`, pattern rules, and variable assignments)
+- `kubectl get|describe|delete <Tab>` resource-type completion: shells out to `kubectl api-resources` (500 ms timeout) for live cluster resources, always merged with a curated static fallback of ~30 core/apps/networking types (pods/po, services/svc, deployments/deploy, ...) so completion works without a cluster or without kubectl installed
 - builtin docs for `git`, `docker`, `kubectl`, `npm`, `cargo`, `dotnet`, `python`, `pip`, `pytest`
 - explain output for feature contributions
 
