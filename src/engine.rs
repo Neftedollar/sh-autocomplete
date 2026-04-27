@@ -300,8 +300,12 @@ impl Engine {
         Ok(())
     }
 
-    pub fn reindex(&self, path_env: Option<&str>) -> Result<usize> {
-        indexer::reindex_path_commands(&self.db, path_env)
+    pub fn reindex(&self, path_env: Option<&str>, full: bool, skip_existing: bool) -> Result<usize> {
+        indexer::reindex_path_commands(&self.db, path_env, full, skip_existing)
+    }
+
+    pub fn invalidate_caches(&self) {
+        self.db.invalidate_caches();
     }
 
     pub fn stats(&self) -> Result<StatsResponse> {

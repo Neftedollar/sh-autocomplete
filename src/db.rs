@@ -842,6 +842,15 @@ impl AppDb {
         Ok(())
     }
 
+    /// Drop all memoized in-process caches: the SQLite `dir_cache` rows that
+    /// store directory-listing snapshots keyed by mtime.  After this call the
+    /// next completion request re-reads every directory from disk.  Safe to
+    /// call at any time; no daemon restart required.
+    pub fn invalidate_caches(&self) {
+        // Ignore errors — if the table does not exist yet (empty DB) that is fine.
+        let _ = self.conn.execute("DELETE FROM dir_cache", []);
+    }
+
     /// Bump frecency for a path (rank += 1.0, clamped to 100.0). On insert, rank=1.0.
     pub fn upsert_path_index(
         &self,
@@ -2109,6 +2118,24 @@ mod tests {
         let row = top.iter().find(|p| p.path == "/tmp/foo").unwrap();
         assert_eq!(row.visit_count, 3);
         assert!(row.rank >= 3.0);
+    }
+
+    #[test]
+    fn invalidate_caches_clears_dir_cache() {
+        let db = test_db();
+        db.upsert_dir_cache("/tmp/testdir", 12345, "file1\nfile2")
+            .unwrap();
+        // Confirm the entry is there.
+        let cached = db.get_dir_cache("/tmp/testdir").unwrap();
+        assert!(cached.is_some(), "expected dir_cache entry before invalidation");
+        // Invalidate.
+        db.invalidate_caches();
+        // Entry should be gone.
+        let cached_after = db.get_dir_cache("/tmp/testdir").unwrap();
+        assert!(
+            cached_after.is_none(),
+            "expected dir_cache entry to be removed after invalidate_caches"
+        );
     }
 
     #[test]

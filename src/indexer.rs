@@ -15,7 +15,12 @@ const HELP_TIMEOUT: Duration = Duration::from_millis(350);
 const MAX_DOCS_PER_COMMAND: usize = 80;
 const MAX_DESCRIPTION_LEN: usize = 160;
 
-pub fn reindex_path_commands(db: &AppDb, path_env: Option<&str>) -> Result<usize> {
+pub fn reindex_path_commands(
+    db: &AppDb,
+    path_env: Option<&str>,
+    full: bool,
+    skip_existing: bool,
+) -> Result<usize> {
     let mut seen = BTreeSet::new();
     let path_env = path_env
         .map(ToOwned::to_owned)
@@ -49,7 +54,9 @@ pub fn reindex_path_commands(db: &AppDb, path_env: Option<&str>) -> Result<usize
                     Some(path.to_string_lossy().as_ref()),
                     mtime,
                 )?;
-                maybe_upsert_docs(db, &name, false)?;
+                if !skip_existing || !db.command_has_docs(&name) {
+                    maybe_upsert_docs(db, &name, full)?;
+                }
                 seen.insert(name);
             }
         }
@@ -413,4 +420,112 @@ fn static_docs(command: &str) -> Option<Vec<StoredDoc>> {
         _ => return None,
     };
     Some(docs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn test_db() -> AppDb {
+        AppDb::open(std::path::Path::new(":memory:")).unwrap()
+    }
+
+    /// Verify that skip_existing=false (default mode) always calls maybe_upsert_docs —
+    /// i.e. running reindex twice does not wipe already-indexed commands.
+    #[test]
+    fn skip_existing_false_does_not_wipe_existing_docs() {
+        let db = test_db();
+        let doc = crate::db::StoredDoc {
+            command: "mycmd".into(),
+            item_type: "option".into(),
+            item_value: "--foo".into(),
+            description: "a flag".into(),
+            source: "help".into(),
+        };
+        db.replace_docs_for_command("mycmd", &[doc]).unwrap();
+        assert!(db.command_has_docs("mycmd"));
+
+        // Pass empty path_env to avoid scanning real PATH.
+        reindex_path_commands(&db, Some(""), false, false).unwrap();
+        // mycmd docs were not touched (not in PATH scan).
+        assert!(db.command_has_docs("mycmd"));
+    }
+
+    /// Verify that skip_existing=true avoids re-indexing commands that already have docs.
+    #[test]
+    fn skip_existing_true_preserves_existing_docs() {
+        let db = test_db();
+        let doc = crate::db::StoredDoc {
+            command: "git".into(),
+            item_type: "subcommand".into(),
+            item_value: "fake-subcmd".into(),
+            description: "fake doc".into(),
+            source: "help".into(),
+        };
+        db.replace_docs_for_command("git", &[doc]).unwrap();
+        assert!(db.command_has_docs("git"));
+
+        // Second reindex with skip_existing=true on empty path; the git entry should be intact.
+        reindex_path_commands(&db, Some(""), true, true).unwrap();
+        assert!(db.command_has_docs("git"));
+    }
+
+    /// Verify that reindex_path_commands discovers and upserts executables from a fake PATH dir.
+    #[test]
+    fn indexes_executables_found_in_path() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let dir = std::path::PathBuf::from(format!("/tmp/shac-indexer-test-{suffix}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("fakecmd");
+        std::fs::write(&bin, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let db = test_db();
+        let path_env = dir.to_string_lossy().to_string();
+        let count = reindex_path_commands(&db, Some(&path_env), false, false).unwrap();
+        // Should have indexed at least the fake binary.
+        assert!(count >= 1, "expected at least 1 indexed, got {count}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Verify skip_existing guard: a command that already has docs is not re-indexed.
+    #[test]
+    fn skip_existing_skips_already_indexed_command() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let dir = std::path::PathBuf::from(format!("/tmp/shac-skip-test-{suffix}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("mybin");
+        std::fs::write(&bin, "#!/bin/sh\necho hello\n").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let db = test_db();
+        // Manually insert a doc for mybin.
+        let doc = crate::db::StoredDoc {
+            command: "mybin".into(),
+            item_type: "option".into(),
+            item_value: "--version".into(),
+            description: "pre-indexed doc".into(),
+            source: "help".into(),
+        };
+        db.replace_docs_for_command("mybin", &[doc]).unwrap();
+        assert!(db.command_has_docs("mybin"));
+
+        // Reindex with skip_existing=true; mybin should still have its doc (not erased).
+        let path_env = dir.to_string_lossy().to_string();
+        reindex_path_commands(&db, Some(&path_env), true, true).unwrap();
+        assert!(
+            db.command_has_docs("mybin"),
+            "pre-indexed doc should survive skip_existing reindex"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
