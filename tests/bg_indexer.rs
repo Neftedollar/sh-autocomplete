@@ -123,9 +123,11 @@ fn bg_indexer_populates_commands_table() {
     let stub_path_env = env.path_with_prefix(&stub_dir);
 
     // Spawn daemon with fast BG intervals so the indexer fires within ~1 second.
+    // SHAC_BG_DISABLED=0 opts back in (the default is disabled in test harness).
     // SHAC_BG_SETTLE_SECS=0 removes the 2s startup delay.
     // SHAC_BG_REINDEX_INTERVAL_SECS=1 makes the loop repeat every second.
     let _daemon = env.spawn_daemon_with_extra_env(&[
+        ("SHAC_BG_DISABLED", "0"),
         ("PATH", stub_path_env.as_str()),
         ("SHAC_BG_SETTLE_SECS", "0"),
         ("SHAC_BG_REINDEX_INTERVAL_SECS", "1"),

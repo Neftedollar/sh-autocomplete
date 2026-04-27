@@ -49,7 +49,14 @@ fn main() -> Result<()> {
     //
     // SHAC_BG_REINDEX_INTERVAL_SECS and SHAC_BG_SETTLE_SECS override the intervals
     // at runtime — intended for integration tests only.
+    // Set SHAC_BG_DISABLED=1 to skip spawning the thread entirely (used by tests).
+    if std::env::var("SHAC_BG_DISABLED")
+        .ok()
+        .filter(|v| !v.is_empty() && v != "0")
+        .is_some()
     {
+        eprintln!("shacd: bg indexer disabled via SHAC_BG_DISABLED");
+    } else {
         let db_path = paths.db_file.clone();
         let path_env = std::env::var("PATH").ok();
         let reindex_interval = std::env::var("SHAC_BG_REINDEX_INTERVAL_SECS")
