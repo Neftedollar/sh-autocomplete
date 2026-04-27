@@ -21,7 +21,10 @@ pub struct ParsedContext {
 }
 
 pub fn parse(line: &str, cursor: usize, cwd: &Path) -> ParsedContext {
-    let safe_cursor = cursor.min(line.len());
+    // Round down to the nearest UTF-8 char boundary so multibyte chars (e.g.
+    // Cyrillic, CJK) don't cause a panic when the cursor lands mid-codepoint.
+    let max = cursor.min(line.len());
+    let safe_cursor = (0..=max).rev().find(|&i| line.is_char_boundary(i)).unwrap_or(0);
     let before = line[..safe_cursor].to_string();
     let mut tokens = shell_split(&before);
     let ends_with_space = before.ends_with(char::is_whitespace);

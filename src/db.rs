@@ -416,6 +416,10 @@ impl AppDb {
     }
 
     pub fn search_docs(&self, query: &str, limit: usize) -> Result<Vec<StoredDoc>> {
+        // FTS5 treats special chars (. * ^ " etc.) as syntax; wrap in double
+        // quotes and escape internal quotes so arbitrary prefixes don't error.
+        let escaped = query.replace('"', "\"\"");
+        let fts_query = format!("\"{escaped}\"*");
         let mut stmt = self.conn.prepare(
             "SELECT d.command, d.item_type, d.item_value, d.description, d.source
              FROM command_docs_fts f
@@ -423,7 +427,7 @@ impl AppDb {
              WHERE command_docs_fts MATCH ?1
              LIMIT ?2",
         )?;
-        let rows = stmt.query_map(params![query, limit as i64], |row| {
+        let rows = stmt.query_map(params![fts_query, limit as i64], |row| {
             Ok(StoredDoc {
                 command: row.get(0)?,
                 item_type: row.get(1)?,
