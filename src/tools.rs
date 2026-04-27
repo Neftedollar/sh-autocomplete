@@ -93,17 +93,29 @@ static KNOWN_CLIS: &[&str] = &[
 
 /// Scan `$PATH` and known ecosystem directories for installed CLIs.
 ///
+/// Thin public wrapper: reads `HOME` and `PATH` from the process environment
+/// once and forwards to [`detect_tools_with_env`].
+pub fn detect_tools() -> ToolDetection {
+    let home = home_dir();
+    let path_var = env::var("PATH").unwrap_or_default();
+    detect_tools_with_env(home.as_deref(), Some(&path_var))
+}
+
+/// Core implementation of the tool scan, parameterized on `home` and
+/// `path_env` so tests can supply explicit values without touching process
+/// state.
+///
 /// The scan is capped to [`KNOWN_CLIS`] — we do not stat every binary on the
 /// machine. Goal: gate priors/profiles seeding, not produce a full PATH index.
-pub fn detect_tools() -> ToolDetection {
+pub fn detect_tools_with_env(home: Option<&Path>, path_env: Option<&str>) -> ToolDetection {
     let mut installed: HashSet<String> = HashSet::new();
 
     // -----------------------------------------------------------------------
     // 1. PATH scan — for each known CLI, check if it exists and is executable
     //    in any PATH directory. Stop at first hit per name.
     // -----------------------------------------------------------------------
-    let path_var = env::var("PATH").unwrap_or_default();
-    let path_dirs: Vec<&str> = path_var.split(':').collect();
+    let path_str = path_env.unwrap_or("");
+    let path_dirs: Vec<&str> = path_str.split(':').collect();
 
     for &cli in KNOWN_CLIS {
         if is_on_path(cli, &path_dirs) {
@@ -115,10 +127,9 @@ pub fn detect_tools() -> ToolDetection {
     // 2. Ecosystem indicators — directories/apps that imply a tool even when
     //    the binary might live in a non-standard location not on current PATH.
     // -----------------------------------------------------------------------
-    let home = home_dir();
 
     // ~/.cargo/bin/ exists → rust toolchain likely present
-    if let Some(ref h) = home {
+    if let Some(h) = home {
         if h.join(".cargo/bin").is_dir() {
             for name in ["cargo", "rustc", "rustup"] {
                 installed.insert(name.to_string());
@@ -127,21 +138,21 @@ pub fn detect_tools() -> ToolDetection {
     }
 
     // ~/.dotnet/ exists → dotnet SDK
-    if let Some(ref h) = home {
+    if let Some(h) = home {
         if h.join(".dotnet").is_dir() {
             installed.insert("dotnet".to_string());
         }
     }
 
     // ~/.nvm/ exists → nvm (Node version manager, may not be on PATH yet)
-    if let Some(ref h) = home {
+    if let Some(h) = home {
         if h.join(".nvm").is_dir() {
             installed.insert("nvm".to_string());
         }
     }
 
     // ~/.rbenv/ or /usr/local/Cellar/rbenv/ → ruby, gem
-    let rbenv_home = home.as_ref().map(|h| h.join(".rbenv")).unwrap_or_default();
+    let rbenv_home = home.map(|h| h.join(".rbenv")).unwrap_or_default();
     let rbenv_cellar = Path::new("/usr/local/Cellar/rbenv");
     if rbenv_home.is_dir() || rbenv_cellar.is_dir() {
         installed.insert("ruby".to_string());
@@ -255,39 +266,36 @@ mod tests {
 
     #[test]
     fn detect_tools_finds_real_path_binary() {
-        // `sh` is available on every POSIX machine, so it must be detected.
-        let detection = detect_tools();
+        // `sh` is available on every POSIX machine. Use an explicit PATH so
+        // this test never touches the process environment (parallel-safe).
+        let detection = detect_tools_with_env(None, Some("/usr/bin:/bin"));
         assert!(
             detection.has("sh"),
-            "detect_tools() should find 'sh' on PATH; installed set: {:?}",
+            "detect_tools_with_env() should find 'sh' on /usr/bin:/bin; installed set: {:?}",
             detection.installed
         );
     }
 
     #[test]
     fn detect_tools_does_not_find_xyzzy() {
-        let detection = detect_tools();
+        // Use an explicit PATH that has no xyzzy (parallel-safe).
+        let detection = detect_tools_with_env(None, Some("/usr/bin:/bin"));
         assert!(
             !detection.has("xyzzy_does_not_exist"),
-            "detect_tools() falsely detected 'xyzzy_does_not_exist'"
+            "detect_tools_with_env() falsely detected 'xyzzy_does_not_exist'"
         );
     }
 
     #[test]
     fn detect_tools_admits_cargo_when_cargo_dir_exists() {
         // Create a temporary HOME with a ~/.cargo/bin/ directory to simulate
-        // the Rust toolchain indicator, then restore HOME afterwards.
+        // the Rust toolchain indicator. Pass it explicitly — no env mutation.
         let tmp = make_temp_dir("cargo-home");
         let cargo_bin = tmp.join(".cargo").join("bin");
         fs::create_dir_all(&cargo_bin).expect("create .cargo/bin");
 
-        let old_home = env::var("HOME").unwrap_or_default();
-        // SAFETY: single-threaded portion of test; restored before exit.
-        unsafe { env::set_var("HOME", &tmp) };
+        let detection = detect_tools_with_env(Some(&tmp), Some("/usr/bin:/bin"));
 
-        let detection = detect_tools();
-
-        unsafe { env::set_var("HOME", &old_home) };
         // Best-effort cleanup
         let _ = fs::remove_dir_all(&tmp);
 
