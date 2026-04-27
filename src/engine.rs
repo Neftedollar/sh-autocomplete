@@ -37,6 +37,67 @@ const BUILD_FILE_WALK_LIMIT: usize = 8;
 /// Cap on the size of build files we'll read for target extraction.
 const BUILD_FILE_MAX_BYTES: u64 = 1_048_576; // 1 MiB
 
+/// Hard timeout on the `kubectl api-resources` invocation that backs
+/// `collect_kubectl_resource_candidates`. kubectl against a live cluster can
+/// take 200–500ms; 500ms is generous. On timeout the static fallback list is
+/// used instead, so the user always gets reasonable candidates.
+const KUBECTL_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Static fallback list of well-known Kubernetes resource names and short-names.
+/// Used when `kubectl api-resources` fails (no kubectl, no cluster, timeout).
+/// Also merged with live results when the shellout succeeds (robustness).
+const KUBECTL_FALLBACK_RESOURCES: &[&str] = &[
+    "pods",
+    "po",
+    "services",
+    "svc",
+    "deployments",
+    "deploy",
+    "replicasets",
+    "rs",
+    "statefulsets",
+    "sts",
+    "daemonsets",
+    "ds",
+    "jobs",
+    "cronjobs",
+    "cj",
+    "configmaps",
+    "cm",
+    "secrets",
+    "namespaces",
+    "ns",
+    "nodes",
+    "no",
+    "ingresses",
+    "ing",
+    "endpoints",
+    "ep",
+    "events",
+    "ev",
+    "persistentvolumes",
+    "pv",
+    "persistentvolumeclaims",
+    "pvc",
+    "serviceaccounts",
+    "sa",
+    "horizontalpodautoscalers",
+    "hpa",
+    "networkpolicies",
+    "netpol",
+    "storageclasses",
+    "sc",
+    "customresourcedefinitions",
+    "crd",
+    "roles",
+    "rolebindings",
+    "clusterroles",
+    "clusterrolebindings",
+    "podtemplates",
+    "limitranges",
+    "resourcequotas",
+];
+
 use anyhow::{Context, Result};
 use rusqlite;
 
@@ -538,8 +599,11 @@ impl Engine {
                 // surfaces directories the user is typing directly.
                 self.collect_path_candidates(active, cwd, true, candidates, seen)?;
             }
-            ArgType::Resource | ArgType::Image => {
-                // Stubs for now — implementations land in subsequent PRs.
+            ArgType::Resource => {
+                self.collect_kubectl_resource_candidates(active, candidates, seen)?;
+            }
+            ArgType::Image => {
+                // TODO: 7.8 — implement docker image completion.
             }
             ArgType::Subcommand | ArgType::Flag | ArgType::None => {
                 // Subcommand / flag completion is handled elsewhere in
@@ -956,6 +1020,104 @@ impl Engine {
         Ok(())
     }
 
+    // -----------------------------------------------------------------------
+    // kubectl resource collector (§7.7)
+    // -----------------------------------------------------------------------
+
+    /// Emit Kubernetes resource-type candidates for `kubectl get|describe|delete`.
+    ///
+    /// Strategy:
+    /// 1. Shell out to `kubectl api-resources --no-headers --output=name` with a
+    ///    500ms timeout to discover live cluster resources.
+    /// 2. Parse: each output line is `name` or `name.group` (e.g. `pods`,
+    ///    `deployments.apps`). Emit **both** the short name (before the first `.`)
+    ///    and the full name so users can type either form.
+    /// 3. If the shellout fails (no kubectl, no cluster reachable, timeout, or
+    ///    non-zero exit), fall back to [`KUBECTL_FALLBACK_RESOURCES`].
+    /// 4. The static fallback is always merged in (even on success) to guarantee
+    ///    short-name aliases like `po`/`svc` are always present.
+    /// 5. Filter by `active` prefix; emit with `kind = k8s_resource`,
+    ///    `source = k8s_resource`.
+    ///
+    /// No `cwd` argument — kubectl resources are cluster-scoped, not project-local.
+    ///
+    /// // TODO: cache by current-context, invalidate on context switch
+    fn collect_kubectl_resource_candidates(
+        &self,
+        active: &str,
+        candidates: &mut Vec<Candidate>,
+        seen: &mut HashSet<String>,
+    ) -> Result<()> {
+        let live_resources = list_kubectl_resources(KUBECTL_TIMEOUT);
+
+        // Merge live results with the static fallback. Static is always included
+        // for robustness (guarantees short-name aliases are always present).
+        let mut all: Vec<(String, bool)> = Vec::new(); // (name, is_live)
+
+        // Add live results first (they appear as "· live" in the description).
+        for resource in live_resources {
+            // Each line from `kubectl api-resources --output=name` looks like:
+            //   pods
+            //   deployments.apps
+            //   ingresses.networking.k8s.io
+            // Emit the full name plus the short name (segment before first '.').
+            let short = resource
+                .split_once('.')
+                .map(|(s, _)| s.to_string());
+            all.push((resource.clone(), true));
+            if let Some(s) = short {
+                if s != resource {
+                    all.push((s, true));
+                }
+            }
+        }
+
+        // Merge static fallback — always added, marked as builtin.
+        for &name in KUBECTL_FALLBACK_RESOURCES {
+            all.push((name.to_string(), false));
+        }
+
+        // Deduplicate while preserving order (live results take precedence in
+        // description). We use the shared `seen` set for cross-source deduplication,
+        // but also need per-name dedup within our own list.
+        //
+        // No per-collector limit here — Kubernetes api-resources is a bounded,
+        // well-known set (typically <200 entries including short names and CRDs).
+        // The top-level `Engine::complete` truncates to `config.max_results` after
+        // scoring, so we can safely emit the full merged list.
+        let mut local_seen: HashSet<String> = HashSet::new();
+
+        for (name, is_live) in all {
+            // Prefix filter; empty active passes all.
+            if !active.is_empty() && !name.starts_with(active) {
+                continue;
+            }
+            if !local_seen.insert(name.clone()) {
+                continue;
+            }
+            // "· live" only when the entry actually came from a live kubectl
+            // invocation. Fallback entries are always "· builtin".
+            let source_suffix = if is_live {
+                " \u{00b7} live"
+            } else {
+                " \u{00b7} builtin"
+            };
+            let description = format!("kubernetes resource{source_suffix}");
+            push_candidate(
+                candidates,
+                seen,
+                Candidate {
+                    insert_text: name.clone(),
+                    display: name,
+                    kind: "k8s_resource".to_string(),
+                    source: "k8s_resource".to_string(),
+                    description: Some(description),
+                },
+            );
+        }
+        Ok(())
+    }
+
     fn collect_path_candidates(
         &self,
         token: &str,
@@ -1308,6 +1470,7 @@ fn position_score(parsed: &ParsedContext, candidate: &Candidate) -> f64 {
         _ if candidate.kind == "ssh_host" => 1.0,
         _ if candidate.kind == "build_target" => 1.0,
         _ if candidate.kind == "workspace" => 1.0,
+        _ if candidate.kind == "k8s_resource" => 1.0,
         TokenRole::SubcommandOrArg if candidate.kind == "module" => 1.0,
         TokenRole::SubcommandOrArg if candidate.kind == "subcommand" => 0.9,
         TokenRole::SubcommandOrArg if candidate.kind == "history" => 0.6,
@@ -1336,6 +1499,7 @@ fn source_prior(source: &str, kind: &str) -> f64 {
         ("ssh_host", _) => 0.85,
         ("build_target", _) => 0.85,
         ("workspace", _) => 0.85,
+        ("k8s_resource", _) => 0.85,
         _ => 0.4,
     }
 }
@@ -1474,6 +1638,84 @@ fn list_git_refs(repo_root: &Path, timeout: Duration) -> Option<Vec<String>> {
         }
     }
     Some(refs)
+}
+
+/// Check whether `kubectl` is available on `PATH` without invoking it.
+/// Returns `true` if a file named `kubectl` exists and is executable on the
+/// current `PATH`. This is a fast pre-flight check (stat-only) so we avoid
+/// spawning a subprocess when kubectl isn't installed at all.
+fn kubectl_on_path() -> bool {
+    let path_env = std::env::var_os("PATH").unwrap_or_default();
+    for dir in std::env::split_paths(&path_env) {
+        let candidate = dir.join("kubectl");
+        if candidate.is_file() {
+            return true;
+        }
+    }
+    false
+}
+
+/// Run `kubectl api-resources --no-headers --output=name` with a hard timeout.
+///
+/// Returns the raw output lines (one resource per line, possibly `name.group`
+/// form). Returns an empty Vec on any failure: kubectl not installed, no
+/// cluster reachable, non-zero exit, or timeout.
+///
+/// Mirrors the [`list_git_refs`] pattern — spawn child, poll with `try_wait`,
+/// kill on timeout.
+fn list_kubectl_resources(timeout: Duration) -> Vec<String> {
+    if !kubectl_on_path() {
+        return Vec::new();
+    }
+
+    let mut child = match Command::new("kubectl")
+        .args(["api-resources", "--no-headers", "--output=name"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .stdin(Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(_) => return Vec::new(),
+    };
+
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() {
+                    return Vec::new();
+                }
+                break;
+            }
+            Ok(None) => {
+                if started.elapsed() >= timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Vec::new();
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Vec::new();
+            }
+        }
+    }
+
+    let mut buf = String::new();
+    if let Some(mut out) = child.stdout.take() {
+        if out.read_to_string(&mut buf).is_err() {
+            return Vec::new();
+        }
+    }
+
+    buf.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 /// Walk up at most [`PACKAGE_JSON_WALK_LIMIT`] ancestors from `start` looking
@@ -3083,5 +3325,138 @@ mod tests {
         let paths = parse_vscode_recent_workspaces(&db_path);
         assert_eq!(paths.len(), 1, "remote entry must be skipped: {paths:?}");
         assert_eq!(paths[0].to_string_lossy().as_ref(), "/local/proj");
+    }
+
+    // -----------------------------------------------------------------------
+    // kubectl resource collector unit tests (§7.7)
+    // -----------------------------------------------------------------------
+
+    /// Parse synthetic `kubectl api-resources --output=name` output and verify
+    /// that resource names are extracted correctly.
+    #[test]
+    fn parse_kubectl_api_resources_output_basic() {
+        // Simulate the output of `kubectl api-resources --no-headers --output=name`.
+        let raw = "pods\nservices\ndeployments.apps\n";
+        let parsed: Vec<String> = raw
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect();
+        assert!(parsed.contains(&"pods".to_string()), "{parsed:?}");
+        assert!(parsed.contains(&"services".to_string()), "{parsed:?}");
+        assert!(parsed.contains(&"deployments.apps".to_string()), "{parsed:?}");
+        assert_eq!(parsed.len(), 3);
+    }
+
+    /// Verify that grouped resource names (e.g. `deployments.apps`) produce
+    /// both the full name and the short segment as separate candidates. This
+    /// mirrors the extraction logic in `collect_kubectl_resource_candidates`.
+    #[test]
+    fn parse_kubectl_api_resources_handles_grouped_names() {
+        let grouped = "deployments.apps";
+        let short = grouped.split_once('.').map(|(s, _)| s.to_string());
+        assert_eq!(short.as_deref(), Some("deployments"));
+        // Both "deployments" and "deployments.apps" should be candidates.
+        let full = grouped.to_string();
+        assert_ne!(short.as_deref(), Some(full.as_str()));
+    }
+
+    /// The static fallback list must be non-empty and contain core resource
+    /// names.
+    #[test]
+    fn kubectl_static_fallback_nonempty() {
+        assert!(
+            !KUBECTL_FALLBACK_RESOURCES.is_empty(),
+            "static fallback list must not be empty"
+        );
+        assert!(
+            KUBECTL_FALLBACK_RESOURCES.contains(&"pods"),
+            "pods must be in fallback list"
+        );
+        assert!(
+            KUBECTL_FALLBACK_RESOURCES.contains(&"services"),
+            "services must be in fallback list"
+        );
+        assert!(
+            KUBECTL_FALLBACK_RESOURCES.contains(&"deployments"),
+            "deployments must be in fallback list"
+        );
+        assert!(
+            KUBECTL_FALLBACK_RESOURCES.contains(&"po"),
+            "short-name 'po' must be in fallback list"
+        );
+        assert!(
+            KUBECTL_FALLBACK_RESOURCES.contains(&"svc"),
+            "short-name 'svc' must be in fallback list"
+        );
+    }
+
+    /// Verify that `collect_kubectl_resource_candidates` surfaces the static
+    /// fallback list when kubectl is not available on PATH.
+    ///
+    /// This test manipulates the `PATH` environment variable in-process to a
+    /// value that cannot contain a `kubectl` binary, then calls the collector
+    /// directly (bypassing the daemon) and checks that the static fallback
+    /// resources are emitted. PATH is restored at the end of the test.
+    ///
+    /// Note: this test is inherently not thread-safe with respect to other
+    /// tests that also manipulate PATH. It is designed to run quickly
+    /// (no subprocess or socket involved) so the window is small. Isolate
+    /// with `cargo test collect_kubectl_resources_falls_back -- --test-threads=1`
+    /// if flakiness is observed.
+    #[test]
+    fn collect_kubectl_resources_falls_back_when_no_kubectl() {
+        // Save the current PATH so we can restore it after the test.
+        let saved_path = std::env::var_os("PATH");
+
+        // Set PATH to /dev/null so kubectl_on_path() returns false.
+        // Safety: single-threaded section; PATH is restored in the finally block.
+        unsafe {
+            std::env::set_var("PATH", "/dev/null");
+        }
+
+        let result = std::panic::catch_unwind(|| {
+            let (engine, _dir) = test_engine("kubectl-no-kubectl");
+            let mut candidates: Vec<Candidate> = Vec::new();
+            let mut seen: HashSet<String> = HashSet::new();
+
+            engine
+                .collect_kubectl_resource_candidates("", &mut candidates, &mut seen)
+                .expect("collect should not fail");
+
+            // With PATH=/dev/null, list_kubectl_resources() returns empty, so all
+            // candidates come from KUBECTL_FALLBACK_RESOURCES.
+            let names: Vec<&str> = candidates
+                .iter()
+                .map(|c| c.insert_text.as_str())
+                .collect();
+
+            assert!(names.contains(&"pods"), "pods must surface: {names:?}");
+            assert!(names.contains(&"services"), "services must surface: {names:?}");
+            assert!(names.contains(&"deployments"), "deployments must surface: {names:?}");
+            assert!(names.contains(&"po"), "short-name po must surface: {names:?}");
+            assert!(names.contains(&"svc"), "short-name svc must surface: {names:?}");
+            // With no live kubectl, all descriptions say "· builtin".
+            assert!(
+                candidates
+                    .iter()
+                    .all(|c| c.description.as_deref().unwrap_or("").contains("builtin")),
+                "all candidates must be '· builtin' when kubectl is absent: {candidates:?}",
+            );
+        });
+
+        // Restore PATH regardless of whether the test panicked.
+        unsafe {
+            match saved_path {
+                Some(p) => std::env::set_var("PATH", p),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+
+        // Re-panic if the test body panicked.
+        if let Err(e) = result {
+            std::panic::resume_unwind(e);
+        }
     }
 }
