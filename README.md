@@ -24,6 +24,14 @@ Landing page: https://neftedollar.github.io/sh-autocomplete/
 - project-aware heuristic reranking
 - optional local ML reranking from a JSON model file
 - on-demand path completion with cached hot directories
+- branch-aware completion for `git checkout|switch|branch|merge|rebase` via `git for-each-ref` (200 ms timeout, no cache yet)
+- bundled command priors (~60 grammar pairs for git, docker, kubectl, npm, ...) seeded on first install for cold-start (filtered to installed CLIs only)
+- live `npm run` / `pnpm run` / `yarn run` script completion parsed from the cwd's nearest `package.json` (walk-up bounded to 8 levels, stops at `.git` boundary)
+- `ssh <Tab>` / `mosh <Tab>` host completion parsed from `~/.ssh/config` `Host` entries and `~/.ssh/known_hosts` (wildcards skipped, hashed entries skipped, `[host]:port` notation handled)
+- `code <Tab>` / `subl <Tab>` / `idea <Tab>` recent workspace completion from VS Code's SQLite store (`state.vscdb`); remote workspaces and missing-on-disk entries are filtered out; falls through to path completion for typed paths
+- `make <Tab>` / `just <Tab>` / `task <Tab>` target completion parsed from the cwd's nearest `Makefile`, `justfile`, or `Taskfile.yml` (walk-up bounded to 8 levels, stops at `.git` boundary; skips `.PHONY`, pattern rules, and variable assignments)
+- `kubectl get|describe|delete <Tab>` resource-type completion: shells out to `kubectl api-resources` (500 ms timeout) for live cluster resources, always merged with a curated static fallback of ~30 core/apps/networking types (pods/po, services/svc, deployments/deploy, ...) so completion works without a cluster or without kubectl installed
+- `docker run|pull|push|rmi <Tab>` image completion via `docker images` shellout (live only, no fallback; returns empty when docker is unavailable)
 - builtin docs for `git`, `docker`, `kubectl`, `npm`, `cargo`, `dotnet`, `python`, `pip`, `pytest`
 - explain output for feature contributions
 
@@ -61,6 +69,25 @@ shac reindex
 shac doctor
 ```
 
+`shac install --shell zsh --edit-rc` runs a quick first-run pass: it
+splices the shac block into your `~/.zshrc`, prompts (Y/n) before
+importing your `~/.zsh_history`, imports your `zoxide` jump list if
+present, and scans the standard project roots (`~/dev`,
+`~/Documents/dev`, `~/code`, `~/src`, `~/projects`) for git repos.
+Pass `--yes` to skip the history-import prompt, `--no-import` to skip
+the import phase entirely. Output looks like:
+
+```
+✓ Hooking shac into zsh                          ~/.zshrc  [0.0s]
+✓ Importing zsh history                          12,847 entries, 3 dup, 1 redacted  [1.8s]
+✓ Importing zoxide                               156 destinations  [0.1s]
+✓ Scanning project roots for git repos           23 found  [0.6s]
+
+Try: cd <Tab>
+  Run `shac doctor` if Tab feels off.
+  Run `shac stats` to see what was learned.
+```
+
 Open a new shell or run:
 
 ```zsh
@@ -93,6 +120,8 @@ shac config set ui.zsh.max_items 8
 ```
 
 Defaults are optimized for daily use: compact descriptions are shown, internal `kind/source` metadata is hidden. Use `ui.zsh.menu_detail debug` when diagnosing ranking or candidate source issues.
+
+Hybrid `cd` candidates surfaced from `paths_index` (`kind=path_jump`) render with a cyan-tinted leading `→` arrow so they're visually distinguishable from local cwd children. Set `SHAC_NO_COLOR=1` to disable the tint.
 
 ## Install and uninstall
 
@@ -171,6 +200,12 @@ shac debug completion --shell zsh --line "python3 -" --cursor 9
 shac stats
 shac recent-events --limit 20
 ```
+
+`shac doctor` surfaces three cold-start telemetry checks alongside the usual config / daemon / shell-adapter checks:
+
+- `cold_start_paths`: row count in `paths_index` (zsh-history replay + zoxide + project scan combined). Zero means hybrid `cd` will fall back to local cwd children.
+- `cold_start_history`: imported zsh history events plus `import_coverage_pct` (imported / total history rows).
+- `time_to_first_accept`: seconds between `shac install` and the first accepted completion. Recorded once and never overwritten.
 
 If completion breaks, first try:
 

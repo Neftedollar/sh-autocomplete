@@ -41,6 +41,17 @@ pub struct TransitionEntry {
 }
 
 #[derive(Debug, Clone)]
+pub struct PathFrecency {
+    pub path: String,
+    pub rank: f64,
+    pub last_visit: i64,
+    pub visit_count: i64,
+    pub source: String,
+    pub is_git_repo: bool,
+    pub project_marker: Option<String>,
+}
+
+#[derive(Debug, Clone)]
 pub struct IndexTarget {
     pub id: i64,
     pub target_type: String,
@@ -187,6 +198,20 @@ impl AppDb {
                 entries TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS paths_index (
+                path TEXT PRIMARY KEY,
+                rank REAL NOT NULL DEFAULT 0.0,
+                last_visit INTEGER NOT NULL DEFAULT 0,
+                visit_count INTEGER NOT NULL DEFAULT 0,
+                source TEXT NOT NULL,
+                is_git_repo INTEGER NOT NULL DEFAULT 0,
+                project_marker TEXT,
+                created_ts INTEGER NOT NULL,
+                updated_ts INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_paths_index_rank ON paths_index(rank DESC);
+            CREATE INDEX IF NOT EXISTS idx_paths_index_last_visit ON paths_index(last_visit DESC);
+
             CREATE TABLE IF NOT EXISTS index_targets (
                 id INTEGER PRIMARY KEY,
                 target_type TEXT NOT NULL,
@@ -264,6 +289,8 @@ impl AppDb {
             "tty_present",
             "INTEGER NOT NULL DEFAULT 0",
         )?;
+        self.ensure_column("history_events", "import_hash", "TEXT")?;
+        self.ensure_column("history_events", "imported_at", "INTEGER")?;
 
         self.ensure_column(
             "completion_requests",
@@ -307,6 +334,11 @@ impl AppDb {
         )?;
         self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_completion_requests_trust ON completion_requests(trust, provenance)",
+            [],
+        )?;
+        self.conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_history_import_hash \
+             ON history_events(import_hash) WHERE import_hash IS NOT NULL",
             [],
         )?;
 
@@ -354,6 +386,16 @@ impl AppDb {
             ])?;
         }
         Ok(())
+    }
+
+    pub fn command_has_docs(&self, command: &str) -> bool {
+        self.conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM command_docs WHERE command = ?1)",
+                [command],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap_or(false)
     }
 
     pub fn docs_for_command(&self, command: &str) -> Result<Vec<StoredDoc>> {
@@ -516,6 +558,11 @@ impl AppDb {
             let _ = self.mark_completion_accepted(&request.command, &request.cwd, &classified);
         }
 
+        // Hybrid-cd: extract `cd <path>` events into paths_index for global frecency.
+        if let Some(target) = extract_cd_target(&request.command) {
+            let _ = self.upsert_path_index(&target, "cwd_event", false, None);
+        }
+
         Ok(classified)
     }
 
@@ -611,6 +658,7 @@ impl AppDb {
                 ],
             )?;
             if self.conn.changes() > 0 {
+                let _ = self.set_meta_value_if_unset("first_accept_ts", &unix_ts().to_string());
                 return Ok(true);
             }
         }
@@ -676,11 +724,17 @@ impl AppDb {
                         request_id
                     ],
                 )?;
+                let _ = self.set_meta_value_if_unset("first_accept_ts", &unix_ts().to_string());
                 return Ok(true);
             }
         }
 
         Ok(false)
+    }
+
+    fn set_meta_value_if_unset(&self, key: &str, value: &str) -> Result<()> {
+        if self.meta_value(key)?.is_none() { self.set_meta_value(key, value)?; }
+        Ok(())
     }
 
     pub fn latest_command(&self) -> Result<Option<String>> {
@@ -788,6 +842,146 @@ impl AppDb {
         Ok(())
     }
 
+    /// Bump frecency for a path (rank += 1.0, clamped to 100.0). On insert, rank=1.0.
+    pub fn upsert_path_index(
+        &self,
+        path: &str,
+        source: &str,
+        is_git_repo: bool,
+        project_marker: Option<&str>,
+    ) -> Result<()> {
+        let now = unix_ts();
+        let git_flag = if is_git_repo { 1 } else { 0 };
+        self.conn.execute(
+            "INSERT INTO paths_index(path, rank, last_visit, visit_count, source, is_git_repo, project_marker, created_ts, updated_ts)
+             VALUES (?1, 1.0, ?2, 1, ?3, ?4, ?5, ?2, ?2)
+             ON CONFLICT(path) DO UPDATE SET
+                 rank = MIN(rank + 1.0, 100.0),
+                 last_visit = excluded.last_visit,
+                 visit_count = visit_count + 1,
+                 updated_ts = excluded.updated_ts,
+                 is_git_repo = MAX(is_git_repo, excluded.is_git_repo),
+                 project_marker = COALESCE(excluded.project_marker, project_marker)",
+            params![path, now, source, git_flag, project_marker],
+        )?;
+        Ok(())
+    }
+
+    /// Insert/update a path with explicit rank/last_visit (for zoxide / project scan importers).
+    /// On conflict: only update rank/last_visit if the new rank is higher.
+    pub fn upsert_path_index_with_rank(
+        &self,
+        path: &str,
+        rank: f64,
+        last_visit: i64,
+        source: &str,
+        is_git_repo: bool,
+        project_marker: Option<&str>,
+    ) -> Result<()> {
+        let now = unix_ts();
+        let git_flag = if is_git_repo { 1 } else { 0 };
+        self.conn.execute(
+            "INSERT INTO paths_index(path, rank, last_visit, visit_count, source, is_git_repo, project_marker, created_ts, updated_ts)
+             VALUES (?1, ?2, ?3, 0, ?4, ?5, ?6, ?7, ?7)
+             ON CONFLICT(path) DO UPDATE SET
+                 rank = MAX(rank, excluded.rank),
+                 last_visit = MAX(last_visit, excluded.last_visit),
+                 updated_ts = excluded.updated_ts,
+                 is_git_repo = MAX(is_git_repo, excluded.is_git_repo),
+                 project_marker = COALESCE(excluded.project_marker, project_marker)",
+            params![path, rank, last_visit, source, git_flag, project_marker, now],
+        )?;
+        Ok(())
+    }
+
+    /// Top frecent paths, ranked by `rank * decay(now - last_visit)`.
+    /// `prefix_filter`: optional case-insensitive substring match on `path`.
+    pub fn top_paths(&self, prefix_filter: Option<&str>, limit: usize) -> Result<Vec<PathFrecency>> {
+        // Decay matches engine.rs::recency_score: 1 / (1 + age_hours).
+        // Computed in Rust after pulling rows; we order in SQL by rank, then re-sort.
+        // We over-fetch by 4x to give room for decay-based reordering, capped.
+        let fetch = (limit * 4).max(limit + 16);
+        let now = unix_ts();
+        let mut rows: Vec<PathFrecency> = if let Some(filter) = prefix_filter {
+            let pattern = format!("%{}%", filter.to_lowercase());
+            let mut stmt = self.conn.prepare(
+                "SELECT path, rank, last_visit, visit_count, source, is_git_repo, project_marker
+                 FROM paths_index
+                 WHERE LOWER(path) LIKE ?1
+                 ORDER BY rank DESC
+                 LIMIT ?2",
+            )?;
+            let mapped = stmt
+                .query_map(params![pattern, fetch as i64], |row| {
+                    Ok(PathFrecency {
+                        path: row.get(0)?,
+                        rank: row.get(1)?,
+                        last_visit: row.get(2)?,
+                        visit_count: row.get(3)?,
+                        source: row.get(4)?,
+                        is_git_repo: row.get::<_, i64>(5)? != 0,
+                        project_marker: row.get(6)?,
+                    })
+                })?
+                .filter_map(Result::ok)
+                .collect::<Vec<_>>();
+            mapped
+        } else {
+            let mut stmt = self.conn.prepare(
+                "SELECT path, rank, last_visit, visit_count, source, is_git_repo, project_marker
+                 FROM paths_index
+                 ORDER BY rank DESC
+                 LIMIT ?1",
+            )?;
+            let mapped = stmt
+                .query_map(params![fetch as i64], |row| {
+                    Ok(PathFrecency {
+                        path: row.get(0)?,
+                        rank: row.get(1)?,
+                        last_visit: row.get(2)?,
+                        visit_count: row.get(3)?,
+                        source: row.get(4)?,
+                        is_git_repo: row.get::<_, i64>(5)? != 0,
+                        project_marker: row.get(6)?,
+                    })
+                })?
+                .filter_map(Result::ok)
+                .collect::<Vec<_>>();
+            mapped
+        };
+
+        rows.sort_by(|a, b| {
+            let sa = path_frecency_decayed(a.rank, a.last_visit, now);
+            let sb = path_frecency_decayed(b.rank, b.last_visit, now);
+            sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        rows.truncate(limit);
+        Ok(rows)
+    }
+
+    /// Maximum rank across paths_index (for normalization).
+    pub fn paths_index_max_rank(&self) -> Result<f64> {
+        let value: Option<f64> = self
+            .conn
+            .query_row("SELECT MAX(rank) FROM paths_index", [], |row| row.get(0))
+            .optional()?
+            .flatten();
+        Ok(value.unwrap_or(0.0))
+    }
+
+    /// Look up the rank for a single path; 0.0 if missing.
+    pub fn path_rank(&self, path: &str) -> Result<f64> {
+        let value: Option<f64> = self
+            .conn
+            .query_row(
+                "SELECT rank FROM paths_index WHERE path = ?1",
+                params![path],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(value.unwrap_or(0.0))
+    }
+
     pub fn upsert_index_target(
         &self,
         target_type: &str,
@@ -839,6 +1033,20 @@ impl AppDb {
     }
 
     pub fn stats(&self) -> Result<StatsResponse> {
+        let history_total = count(&self.conn, "history_events")?;
+        let imported_history = self.count_imported_history()?;
+        let imported_zoxide = self.count_paths_index_by_source("zoxide_import")?;
+        let scanned_projects = self.count_paths_index_by_source("project_scan")?;
+        let paths_index_rows = self.count_paths_index()?;
+        let install_ts: Option<i64> = self.meta_value("install_ts")?.and_then(|v| v.parse().ok());
+        let first_accept_ts: Option<i64> = self.meta_value("first_accept_ts")?.and_then(|v| v.parse().ok());
+        let time_to_first_accept_seconds = match (install_ts, first_accept_ts) {
+            (Some(install), Some(accept)) => Some(accept - install),
+            _ => None,
+        };
+        let import_coverage_pct = if history_total > 0 {
+            (imported_history as f64) / (history_total as f64) * 100.0
+        } else { 0.0 };
         Ok(StatsResponse {
             commands: count(&self.conn, "commands")?,
             docs: count(&self.conn, "command_docs")?,
@@ -896,6 +1104,12 @@ impl AppDb {
                 "history_events",
                 "provenance = 'pasted' AND provenance_confidence = 'heuristic'",
             )?,
+            imported_history_events: imported_history,
+            imported_zoxide_paths: imported_zoxide,
+            scanned_project_paths: scanned_projects,
+            paths_index_rows,
+            time_to_first_accept_seconds,
+            import_coverage_pct,
         })
     }
 
@@ -974,6 +1188,100 @@ impl AppDb {
             },
         )?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_imported_history(
+        &self,
+        ts: i64, cwd: &str, command: &str, shell: Option<&str>,
+        import_hash: &str, trust: &str, provenance: &str,
+    ) -> Result<bool> {
+        let imported_at = unix_ts();
+        let changed = self.conn.execute(
+            "INSERT OR IGNORE INTO history_events(
+                ts, cwd, command, shell, trust, provenance,
+                provenance_source, provenance_confidence, origin, tty_present,
+                import_hash, imported_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, ?10, ?11)",
+            params![ts, cwd, command, shell, trust, provenance,
+                PROVENANCE_SOURCE_UNKNOWN, PROVENANCE_CONFIDENCE_UNKNOWN,
+                "import", import_hash, imported_at],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Batch-insert imported history rows in a single multi-VALUES statement
+    /// using `INSERT OR IGNORE`. Returns the number of rows actually inserted
+    /// (changes() reflects rows the unique partial index accepted). Empty
+    /// batches are a no-op and return 0.
+    ///
+    /// Each row is a tuple `(ts, cwd, command, shell, import_hash, trust,
+    /// provenance)`. `imported_at` is filled with `unix_ts()` per call.
+    /// `provenance_source`, `provenance_confidence`, `origin`, and
+    /// `tty_present` use the same constants as `insert_imported_history`.
+    #[allow(clippy::type_complexity)]
+    pub fn insert_imported_history_batch(
+        &self,
+        rows: &[(i64, String, String, Option<String>, String, String, String)],
+    ) -> Result<usize> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        let imported_at = unix_ts();
+        let mut sql = String::from(
+            "INSERT OR IGNORE INTO history_events(\
+                ts, cwd, command, shell, trust, provenance,\
+                provenance_source, provenance_confidence, origin, tty_present,\
+                import_hash, imported_at\
+             ) VALUES ",
+        );
+        // 12 columns per row; build placeholders.
+        let placeholders_per_row = "(?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)";
+        for i in 0..rows.len() {
+            if i > 0 { sql.push(','); }
+            sql.push_str(placeholders_per_row);
+        }
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::with_capacity(rows.len() * 11);
+        for (ts, cwd, command, shell, import_hash, trust, provenance) in rows {
+            params.push(Box::new(*ts));
+            params.push(Box::new(cwd.clone()));
+            params.push(Box::new(command.clone()));
+            params.push(Box::new(shell.clone()));
+            params.push(Box::new(trust.clone()));
+            params.push(Box::new(provenance.clone()));
+            params.push(Box::new(PROVENANCE_SOURCE_UNKNOWN));
+            params.push(Box::new(PROVENANCE_CONFIDENCE_UNKNOWN));
+            params.push(Box::new("import"));
+            params.push(Box::new(import_hash.clone()));
+            params.push(Box::new(imported_at));
+        }
+        let refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|b| b.as_ref()).collect();
+        let changed = self.conn.execute(&sql, rusqlite::params_from_iter(refs.iter()))?;
+        Ok(changed)
+    }
+
+    pub fn begin_txn(&self) -> Result<()> { self.conn.execute_batch("BEGIN")?; Ok(()) }
+    pub fn commit_txn(&self) -> Result<()> { self.conn.execute_batch("COMMIT")?; Ok(()) }
+    pub fn rollback_txn(&self) -> Result<()> { self.conn.execute_batch("ROLLBACK")?; Ok(()) }
+
+    pub fn meta_get(&self, key: &str) -> Result<Option<String>> { self.meta_value(key) }
+    pub fn meta_set(&self, key: &str, value: &str) -> Result<()> { self.set_meta_value(key, value) }
+    pub fn meta_set_if_unset(&self, key: &str, value: &str) -> Result<()> {
+        if self.meta_value(key)?.is_none() { self.set_meta_value(key, value)?; }
+        Ok(())
+    }
+
+    pub fn count_paths_index(&self) -> Result<i64> { count(&self.conn, "paths_index") }
+    pub fn count_paths_index_by_source(&self, source: &str) -> Result<i64> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*) FROM paths_index WHERE source = ?1",
+            params![source], |row| row.get(0))?)
+    }
+    pub fn count_imported_history(&self) -> Result<i64> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*) FROM history_events WHERE import_hash IS NOT NULL",
+            [], |row| row.get(0))?)
     }
 
     pub fn reset_personalization(&self) -> Result<()> {
@@ -1146,6 +1454,54 @@ fn unix_ts() -> i64 {
         .as_secs() as i64
 }
 
+fn path_frecency_decayed(rank: f64, last_visit: i64, now: i64) -> f64 {
+    let age_secs = (now - last_visit).max(0) as f64;
+    let decay = 1.0 / (1.0 + age_secs / 3600.0);
+    rank * decay
+}
+
+/// Resolve a `cd` target to an absolute path string.
+/// Returns None for relative paths and shell substitutions (skip).
+fn resolve_cd_target(target: &str) -> Option<String> {
+    let target = target.trim();
+    if target.is_empty() || target.contains('$') || target.contains('`') {
+        return None;
+    }
+    if let Some(rest) = target.strip_prefix("~/") {
+        let home = dirs::home_dir()?;
+        return Some(home.join(rest).to_string_lossy().to_string());
+    }
+    if target == "~" {
+        let home = dirs::home_dir()?;
+        return Some(home.to_string_lossy().to_string());
+    }
+    if target.starts_with('/') {
+        return Some(target.to_string());
+    }
+    None
+}
+
+/// If `command` is a `cd <path>`, return the resolved absolute target.
+fn extract_cd_target(command: &str) -> Option<String> {
+    let trimmed = command.trim();
+    let rest = trimmed.strip_prefix("cd ")?;
+    // Strip surrounding quotes if any (single, double).
+    let arg = rest.trim();
+    let unquoted = if (arg.starts_with('"') && arg.ends_with('"') && arg.len() >= 2)
+        || (arg.starts_with('\'') && arg.ends_with('\'') && arg.len() >= 2)
+    {
+        &arg[1..arg.len() - 1]
+    } else {
+        arg
+    };
+    // Take only the first token (don't try to interpret flags).
+    let first = unquoted.split_whitespace().next().unwrap_or(unquoted);
+    if first.is_empty() {
+        return None;
+    }
+    resolve_cd_target(first)
+}
+
 fn sanitize_trust(value: Option<&str>) -> Option<String> {
     match value?.trim() {
         TRUST_INTERACTIVE | TRUST_SCRIPT_LIKE | TRUST_UNKNOWN | TRUST_LEGACY => {
@@ -1306,6 +1662,10 @@ fn detect_project_root(cwd: &str) -> Option<String> {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    fn test_db() -> AppDb {
+        AppDb::open(std::path::Path::new(":memory:")).unwrap()
+    }
 
     #[test]
     fn script_like_classifier_catches_shell_wrappers() {
@@ -1641,5 +2001,133 @@ mod tests {
         assert!(samples.iter().all(|sample| sample.kind == "command"));
 
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn command_has_docs_returns_false_when_empty() {
+        let db = test_db();
+        assert!(!db.command_has_docs("nonexistent_cmd"));
+    }
+
+    #[test]
+    fn command_has_docs_returns_true_after_replace() {
+        let db = test_db();
+        let doc = StoredDoc {
+            command: "mycmd".into(),
+            item_type: "subcommand".into(),
+            item_value: "run".into(),
+            description: "Run something".into(),
+            source: "help".into(),
+        };
+        db.replace_docs_for_command("mycmd", &[doc]).unwrap();
+        assert!(db.command_has_docs("mycmd"));
+    }
+
+    #[test]
+    fn command_has_docs_does_not_bleed_across_commands() {
+        let db = test_db();
+        let doc = StoredDoc {
+            command: "mycmd".into(),
+            item_type: "subcommand".into(),
+            item_value: "run".into(),
+            description: "Run something".into(),
+            source: "help".into(),
+        };
+        db.replace_docs_for_command("mycmd", &[doc]).unwrap();
+        assert!(!db.command_has_docs("othercmd"));
+    }
+
+    #[test]
+    fn paths_index_upsert_and_top_paths() {
+        let db = test_db();
+        let now = unix_ts();
+        db.upsert_path_index_with_rank("/tmp/aaa", 3.0, now, "test", false, None)
+            .unwrap();
+        db.upsert_path_index_with_rank("/tmp/bbb", 5.0, now, "test", false, None)
+            .unwrap();
+        db.upsert_path_index_with_rank("/tmp/ccc", 1.0, now, "test", false, None)
+            .unwrap();
+
+        let top = db.top_paths(None, 5).unwrap();
+        assert_eq!(top.len(), 3);
+        assert_eq!(top[0].path, "/tmp/bbb");
+        assert_eq!(top[1].path, "/tmp/aaa");
+        assert_eq!(top[2].path, "/tmp/ccc");
+    }
+
+    #[test]
+    fn top_paths_filters_by_prefix() {
+        let db = test_db();
+        let now = unix_ts();
+        db.upsert_path_index_with_rank("/tmp/alpha", 2.0, now, "test", false, None)
+            .unwrap();
+        db.upsert_path_index_with_rank("/tmp/beta", 3.0, now, "test", false, None)
+            .unwrap();
+
+        let filtered = db.top_paths(Some("alp"), 10).unwrap();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].path, "/tmp/alpha");
+    }
+
+    #[test]
+    fn cd_history_event_populates_paths_index() {
+        let db = test_db();
+        db.record_history(&RecordCommandRequest {
+            command: "cd /tmp/foo".to_string(),
+            cwd: "/tmp".to_string(),
+            shell: Some("zsh".to_string()),
+            trust: Some(TRUST_INTERACTIVE.to_string()),
+            provenance: Some(PROVENANCE_TYPED_MANUAL.to_string()),
+            provenance_source: None,
+            provenance_confidence: None,
+            origin: Some("zsh_precmd".to_string()),
+            tty_present: Some(true),
+            exit_status: None,
+            accepted_request_id: None,
+            accepted_item_key: None,
+            accepted_rank: None,
+        })
+        .expect("record cd history");
+
+        let top = db.top_paths(None, 10).unwrap();
+        assert!(
+            top.iter().any(|p| p.path == "/tmp/foo"),
+            "expected /tmp/foo in paths_index, got: {top:?}"
+        );
+    }
+
+    #[test]
+    fn upsert_path_index_increments_rank() {
+        let db = test_db();
+        db.upsert_path_index("/tmp/foo", "cwd_event", false, None)
+            .unwrap();
+        db.upsert_path_index("/tmp/foo", "cwd_event", false, None)
+            .unwrap();
+        db.upsert_path_index("/tmp/foo", "cwd_event", false, None)
+            .unwrap();
+        let top = db.top_paths(None, 10).unwrap();
+        let row = top.iter().find(|p| p.path == "/tmp/foo").unwrap();
+        assert_eq!(row.visit_count, 3);
+        assert!(row.rank >= 3.0);
+    }
+
+    #[test]
+    fn extract_cd_target_resolves_absolute_and_skips_relative() {
+        assert_eq!(
+            extract_cd_target("cd /tmp/foo"),
+            Some("/tmp/foo".to_string())
+        );
+        assert_eq!(
+            extract_cd_target("cd  /tmp/foo "),
+            Some("/tmp/foo".to_string())
+        );
+        assert_eq!(
+            extract_cd_target("cd \"/tmp/foo\""),
+            Some("/tmp/foo".to_string())
+        );
+        assert_eq!(extract_cd_target("cd ./relative"), None);
+        assert_eq!(extract_cd_target("cd $VAR"), None);
+        assert_eq!(extract_cd_target("git cd /tmp"), None);
+        assert_eq!(extract_cd_target("cd"), None);
     }
 }

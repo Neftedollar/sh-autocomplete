@@ -130,6 +130,18 @@ pub struct StatsResponse {
     pub pasted_history_events: i64,
     pub exact_pasted_history_events: i64,
     pub heuristic_pasted_history_events: i64,
+    #[serde(default)]
+    pub imported_history_events: i64,
+    #[serde(default)]
+    pub imported_zoxide_paths: i64,
+    #[serde(default)]
+    pub scanned_project_paths: i64,
+    #[serde(default)]
+    pub paths_index_rows: i64,
+    #[serde(default)]
+    pub time_to_first_accept_seconds: Option<i64>,
+    #[serde(default)]
+    pub import_coverage_pct: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
