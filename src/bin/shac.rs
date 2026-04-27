@@ -31,7 +31,8 @@ enum Commands {
     Index(IndexArgs),
     Doctor(DoctorArgs),
     Debug(DebugArgs),
-    Reindex,
+    Reindex(ReindexArgs),
+    InvalidateCaches,
     Explain(CompletionArgs),
     Complete(CompletionArgs),
     RecordCommand(RecordArgs),
@@ -45,6 +46,16 @@ enum Commands {
     TrainModel(TrainModelArgs),
     Import(ImportArgs),
     ScanProjects(ScanProjectsArgs),
+}
+
+#[derive(Debug, Args)]
+struct ReindexArgs {
+    /// Re-import everything from scratch, replacing existing indexed entries.
+    #[arg(long, conflicts_with = "skip_existing")]
+    full: bool,
+    /// Only add new entries; skip commands that are already indexed (default behaviour).
+    #[arg(long)]
+    skip_existing: bool,
 }
 
 #[derive(Debug, Args)]
@@ -262,14 +273,25 @@ fn main() -> Result<()> {
         Commands::Index(args) => index_action(&paths, args.action),
         Commands::Doctor(args) => doctor(&paths, args),
         Commands::Debug(args) => debug_action(&paths, args.action),
-        Commands::Reindex => {
+        Commands::Reindex(args) => {
             ensure_daemon(&paths)?;
+            // --full overrides --skip-existing; no flags = default (skip-existing=false, full=false)
+            let full = args.full;
             let value = send_request(
                 &paths,
                 "reindex",
-                serde_json::json!({ "path_env": std::env::var("PATH").ok() }),
+                serde_json::json!({
+                    "path_env": std::env::var("PATH").ok(),
+                    "full": full,
+                }),
             )?;
             println!("{}", serde_json::to_string_pretty(&value)?);
+            Ok(())
+        }
+        Commands::InvalidateCaches => {
+            ensure_daemon(&paths)?;
+            send_request(&paths, "invalidate-caches", serde_json::json!({}))?;
+            println!("caches invalidated");
             Ok(())
         }
         Commands::Explain(args) => explain(&paths, args),
