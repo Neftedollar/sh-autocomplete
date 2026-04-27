@@ -3,11 +3,15 @@ use std::io::ErrorKind;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
+use std::thread;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
 use shac::config::AppPaths;
+use shac::db::AppDb;
 use shac::engine::{self, Engine};
+use shac::indexer;
 use shac::protocol::RecordCommandRequest;
 
 #[derive(Debug, Parser)]
@@ -33,6 +37,28 @@ fn main() -> Result<()> {
         eprintln!("shac: personalized model activated");
     }
     let engine = Engine::new(&paths)?;
+
+    // Background indexer: opens its own DB connection (WAL-safe) and
+    // incrementally indexes --help output for all PATH executables.
+    // Waits 2s after daemon start to avoid competing with first completions,
+    // then loops every 6 hours.  Uses skip_existing=true so it never
+    // overwrites manually-indexed docs or reindexes commands already in DB.
+    {
+        let db_path = paths.db_file.clone();
+        let path_env = std::env::var("PATH").ok();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_secs(2));
+            loop {
+                match AppDb::open(&db_path)
+                    .and_then(|db| indexer::reindex_path_commands(&db, path_env.as_deref(), true, true))
+                {
+                    Ok(n) => eprintln!("shac: background indexed {} commands", n),
+                    Err(e) => eprintln!("shac: background index error: {e}"),
+                }
+                thread::sleep(Duration::from_secs(6 * 3600));
+            }
+        });
+    }
 
     for stream in listener.incoming() {
         match stream {
@@ -100,8 +126,17 @@ fn handle_client(engine: &Engine, mut stream: UnixStream) -> Result<()> {
                 .get("payload")
                 .and_then(|payload| payload.get("path_env"))
                 .and_then(|value| value.as_str());
-            let indexed = engine.reindex(path_env)?;
+            let full = request
+                .get("payload")
+                .and_then(|payload| payload.get("full"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let indexed = engine.reindex(path_env, full)?;
             serde_json::to_vec(&serde_json::json!({ "indexed": indexed }))?
+        }
+        "invalidate-caches" => {
+            engine.invalidate_caches();
+            br#"{"ok":true}"#.to_vec()
         }
         "stats" => serde_json::to_vec(&engine.stats()?)?,
         _ => serde_json::to_vec(
