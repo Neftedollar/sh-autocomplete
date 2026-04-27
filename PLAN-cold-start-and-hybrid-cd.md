@@ -632,8 +632,8 @@ Stubs in `Engine::dispatch_path_like` for non-Directory/Path arg types. Each is 
 |---|---|---|
 | **Task 1**: `AppDb::command_has_docs(&str) -> bool` + 2 unit tests | `docs/superpowers/plans/2026-04-26-background-indexation.md` §"Task 1" | ✅ **DONE** — landed on integration via base PR (`6409d7e`). Method exists at `src/db.rs`; tests pass. |
 | **Task 2**: `reindex_path_commands` gains `full: bool` + `skip_existing: bool` args, guard `if !skip_existing \|\| !db.command_has_docs(&name) { maybe_upsert_docs(db, &name, full)? }` (`src/indexer.rs:54-58`) + 2 unit tests | `docs/superpowers/plans/2026-04-26-background-indexation.md` §"Task 2" | 🟡 **STASHED** — `stash@{6}` "WIP feat/background-indexation engine+indexer changes before BASE PR". Near-complete, both tests included, applies cleanly onto `integration/cold-start-and-hybrid-cd` (no conflict with hybrid-cd's engine.rs edits — they live in `dispatch_path_like` / `collect_global_path_candidates`, far from `reindex_path_commands`). |
-| **Task 3**: spawn background thread in `src/bin/shacd.rs` after `Engine::new()`; thread opens own `AppDb`, sleeps 2s, calls `reindex_path_commands(.., true, true)`, loops every 6h | `docs/superpowers/plans/2026-04-26-background-indexation.md` §"Task 3" | ❌ **NOT DONE** |
-| **Task 4**: verify full flow + clippy + manual `shac complete --line "shac "` end-to-end | `docs/superpowers/plans/2026-04-26-background-indexation.md` §"Task 4" | ❌ **NOT DONE** |
+| **Task 3**: spawn background thread in `src/bin/shacd.rs` after `Engine::new()`; thread opens own `AppDb`, sleeps 2s, calls `reindex_path_commands(.., true, true)`, loops every 6h | `docs/superpowers/plans/2026-04-26-background-indexation.md` §"Task 3" | ✅ **DONE** — landed via PR #14 |
+| **Task 4**: verify full flow + clippy + manual `shac complete --line "shac "` end-to-end | `docs/superpowers/plans/2026-04-26-background-indexation.md` §"Task 4" | ✅ **DONE** — landed via PR #14 |
 
 **Sequence to graduate:**
 
@@ -644,8 +644,8 @@ Stubs in `Engine::dispatch_path_like` for non-Directory/Path arg types. Each is 
 
 **Adjacent extensions worth bundling here (pulled from this Section 7):**
 
-- **7.5b** Add `shacd` action `invalidate-caches` so CLI imports nudge the daemon to refresh in-memory caches without restart. (PLAN §4 deferred for v1; natural fit with the background-indexer work since both touch `shacd`'s long-lived state.)
-- **7.5c** Per-CLI knob: `shac reindex [--full] [--skip-existing]` so the user can manually trigger either mode.
+- **7.5b** ✅ **DONE** — landed via PR #14. Add `shacd` action `invalidate-caches` so CLI imports nudge the daemon to refresh in-memory caches without restart. (PLAN §4 deferred for v1; natural fit with the background-indexer work since both touch `shacd`'s long-lived state.)
+- **7.5c** ✅ **DONE** — landed via PR #14. Per-CLI knob: `shac reindex [--full] [--skip-existing]` so the user can manually trigger either mode.
 
 **Conflict surface with integration:** none. Cold-start (`integration/cold-start-and-hybrid-cd`) solves *first-run* import; background indexer solves *cheap repeat* indexing. Orthogonal.
 
@@ -677,9 +677,9 @@ Stubs in `Engine::dispatch_path_like` for non-Directory/Path arg types. Each is 
 
 ---
 
-### ⏳ Pending — UX bugs surfaced from real usage
+### ✅ Done — UX bugs surfaced from real usage
 
-**7.16 Cross-source candidate dedupe by `insert_text`**
+**7.16 Cross-source candidate dedupe by `insert_text`** — ✅ **DONE** — landed via PR #15
 
 **Symptom (observed 2026-04-27):** typing `cd Ko<Tab>` from `~/` shows the same path twice in the menu —
 
