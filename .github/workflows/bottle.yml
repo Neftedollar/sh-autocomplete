@@ -1,0 +1,125 @@
+name: Homebrew Bottles
+
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  bottle:
+    name: Build bottle (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15   # arm64_sequoia (Apple Silicon)
+          - os: macos-13   # ventura       (Intel)
+
+    steps:
+      - uses: Homebrew/actions/setup-homebrew@master
+
+      - name: Install shac from tap for bottling
+        run: |
+          brew tap Neftedollar/shac https://github.com/Neftedollar/homebrew-shac
+          brew install --build-bottle Neftedollar/shac/shac
+
+      - name: Create bottle
+        run: |
+          brew bottle \
+            --json \
+            --root-url "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}" \
+            Neftedollar/shac/shac
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bottle-${{ matrix.os }}
+          path: |
+            *.bottle.tar.gz
+            *.bottle.json
+
+  publish:
+    name: Publish bottles & update tap
+    needs: bottle
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+          path: bottles/
+
+      - name: Upload bottles to GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Wait for release.yml to create the release first
+          for i in $(seq 1 12); do
+            gh release view "${{ github.ref_name }}" \
+              --repo "${{ github.repository }}" &>/dev/null && break
+            echo "Waiting for release... ($i/12)"
+            sleep 10
+          done
+          gh release upload "${{ github.ref_name }}" \
+            --repo "${{ github.repository }}" \
+            --clobber \
+            bottles/*.bottle.tar.gz
+
+      - name: Extract bottle hashes from JSON
+        id: hashes
+        run: |
+          # Each JSON contains one platform entry; merge into a single block
+          BOTTLE_LINES=""
+          for f in bottles/*.bottle.json; do
+            PLATFORM=$(jq -r '.[].bottle.tags | keys[0]' "$f")
+            SHA=$(jq -r '.[].bottle.tags | .[keys[0]].sha256' "$f")
+            BOTTLE_LINES="${BOTTLE_LINES}    sha256 cellar: :any_skip_relocation, ${PLATFORM}: \"${SHA}\"\n"
+          done
+          echo "lines<<EOF" >> $GITHUB_OUTPUT
+          printf "%b" "$BOTTLE_LINES" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Update homebrew-shac tap formula
+        env:
+          TAP_TOKEN: ${{ secrets.TAP_TOKEN }}
+        run: |
+          ROOT_URL="https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}"
+
+          git clone "https://x-access-token:${TAP_TOKEN}@github.com/Neftedollar/homebrew-shac.git" tap
+          cd tap
+
+          python3 - <<PYEOF
+          import re, os
+
+          root_url = os.environ["ROOT_URL"]
+          lines    = """${{ steps.hashes.outputs.lines }}"""
+
+          bottle_block = (
+              "  bottle do\n"
+              f'    root_url "{root_url}"\n'
+              + lines
+              + "  end\n"
+          )
+
+          with open("Formula/shac.rb") as f:
+              src = f.read()
+
+          # Remove any existing bottle block
+          src = re.sub(r"\n  bottle do\b.*?\n  end\n", "\n", src, flags=re.DOTALL)
+
+          # Insert after the license line
+          src = src.replace(
+              '  license "MIT"\n',
+              '  license "MIT"\n\n' + bottle_block,
+          )
+
+          with open("Formula/shac.rb", "w") as f:
+              f.write(src)
+          PYEOF
+
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git add Formula/shac.rb
+          git commit -m "chore: add bottles for ${{ github.ref_name }}"
+          git push
