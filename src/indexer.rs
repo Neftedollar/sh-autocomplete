@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 use std::env;
 use std::fs;
+use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -14,6 +15,16 @@ use crate::db::{AppDb, StoredDoc};
 const HELP_TIMEOUT: Duration = Duration::from_millis(350);
 const MAX_DOCS_PER_COMMAND: usize = 80;
 const MAX_DESCRIPTION_LEN: usize = 160;
+
+/// Commands known to open GUI windows (Tk/Aqua/X11) instead of writing help
+/// to stdout. Spawning these from the indexer pops up windows and stresses
+/// the system, especially on macOS where the bg indexer can spawn many at
+/// once. Skip them entirely — extracting docs requires a TTY anyway.
+const GUI_APP_DENYLIST: &[&str] = &[
+    "wish", "tkcon", "tclsh", "tkdiff", "gitk", "git-gui", "git-citool",
+    "idle", "idle3", "idle3.10", "idle3.11", "idle3.12", "idle3.13",
+    "osascript", "open", "Wish", "Wish.app",
+];
 
 pub fn reindex_path_commands(
     db: &AppDb,
@@ -39,6 +50,10 @@ pub fn reindex_path_commands(
                     None => continue,
                 };
                 if seen.contains(&name) || !is_executable(&path) {
+                    continue;
+                }
+                if is_gui_app(&name, &path) {
+                    seen.insert(name);
                     continue;
                 }
                 let mtime = entry
@@ -111,6 +126,36 @@ fn is_executable(path: &Path) -> bool {
     fs::metadata(path)
         .map(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
         .unwrap_or(false)
+}
+
+/// Returns true if the binary is a known GUI app or a shell script whose
+/// shebang/exec line points at a GUI interpreter (wish, osascript, etc.).
+/// Such commands open native windows when invoked with `--help`, so we
+/// must skip them in the indexer to avoid window spam and system load.
+fn is_gui_app(name: &str, path: &Path) -> bool {
+    if GUI_APP_DENYLIST.contains(&name) {
+        return true;
+    }
+    // Skip anything that lives inside a macOS .app bundle.
+    if path
+        .components()
+        .any(|c| c.as_os_str().to_string_lossy().ends_with(".app"))
+    {
+        return true;
+    }
+    // Read first 256 bytes and check for known GUI exec patterns.
+    if let Ok(mut f) = fs::File::open(path) {
+        let mut head = [0u8; 256];
+        if let Ok(n) = f.read(&mut head) {
+            let prefix = String::from_utf8_lossy(&head[..n]);
+            for needle in &["exec wish", "exec tclsh", "exec expect", "osascript", "/Wish.app"] {
+                if prefix.contains(needle) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 fn maybe_upsert_docs(db: &AppDb, command: &str, explicit: bool) -> Result<()> {

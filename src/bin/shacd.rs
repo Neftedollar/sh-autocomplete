@@ -79,7 +79,13 @@ fn main() -> Result<()> {
             let mut fail_count: usize = 0;
             loop {
                 match AppDb::open(&db_path)
-                    .and_then(|db| indexer::reindex_path_commands(&db, path_env.as_deref(), true, true))
+                    // full=false: only index the curated safe-default list
+                    // (git/docker/kubectl/...). full=true would shell out
+                    // `<cmd> --help` for every PATH binary, including GUI
+                    // apps (wish/tkcon/gitk/...) which open windows and
+                    // stress the system. The GUI denylist + script sniffing
+                    // in indexer.rs is defence in depth for explicit reindex.
+                    .and_then(|db| indexer::reindex_path_commands(&db, path_env.as_deref(), false, true))
                 {
                     Ok(n) => {
                         eprintln!("shac: background indexed {} commands", n);
