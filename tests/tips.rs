@@ -66,3 +66,71 @@ fn tips_state_table_is_created() {
         .expect("query");
     assert_eq!(exists, 1, "tips_state table should exist");
 }
+
+use rusqlite::Connection;
+use shac::tips::storage;
+
+fn test_db() -> Connection {
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(
+        "CREATE TABLE tips_state (
+            tip_id          TEXT PRIMARY KEY,
+            shows_count     INTEGER NOT NULL DEFAULT 0,
+            last_shown_at   INTEGER,
+            muted           INTEGER NOT NULL DEFAULT 0,
+            muted_at        INTEGER,
+            first_shown_at  INTEGER
+        );",
+    ).unwrap();
+    conn
+}
+
+#[test]
+fn record_show_inserts_and_increments() {
+    let conn = test_db();
+    storage::record_show(&conn, "git_branches", 1000).unwrap();
+    storage::record_show(&conn, "git_branches", 2000).unwrap();
+    let state = storage::load_all(&conn).unwrap();
+    let entry = state.get("git_branches").expect("entry exists");
+    assert_eq!(entry.shows_count, 2);
+    assert_eq!(entry.last_shown_at, Some(2000));
+    assert_eq!(entry.first_shown_at, Some(1000));
+    assert!(!entry.muted);
+}
+
+#[test]
+fn mute_and_unmute() {
+    let conn = test_db();
+    storage::record_show(&conn, "git_branches", 1000).unwrap();
+    storage::mute(&conn, "git_branches", 5000).unwrap();
+    let state = storage::load_all(&conn).unwrap();
+    assert!(state.get("git_branches").unwrap().muted);
+
+    storage::unmute(&conn, "git_branches").unwrap();
+    let state = storage::load_all(&conn).unwrap();
+    let e = state.get("git_branches").unwrap();
+    assert!(!e.muted);
+    assert_eq!(e.shows_count, 0, "unmute resets shows_count for a second chance");
+}
+
+#[test]
+fn reset_clears_counts_but_preserves_mutes() {
+    let conn = test_db();
+    storage::record_show(&conn, "a", 1).unwrap();
+    storage::record_show(&conn, "b", 1).unwrap();
+    storage::mute(&conn, "b", 2).unwrap();
+    storage::reset(&conn, false).unwrap();
+    let state = storage::load_all(&conn).unwrap();
+    assert_eq!(state.get("a").unwrap().shows_count, 0);
+    assert!(state.get("b").unwrap().muted, "soft reset preserves mute");
+}
+
+#[test]
+fn reset_hard_clears_everything() {
+    let conn = test_db();
+    storage::record_show(&conn, "a", 1).unwrap();
+    storage::mute(&conn, "a", 2).unwrap();
+    storage::reset(&conn, true).unwrap();
+    let state = storage::load_all(&conn).unwrap();
+    assert!(state.is_empty(), "hard reset deletes all rows");
+}

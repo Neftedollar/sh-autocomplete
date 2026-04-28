@@ -67,3 +67,86 @@ mod triggers {
     pub fn menu_detail_verbose(_: &Context) -> bool { false }
     pub fn tips_off(_: &Context) -> bool { false }
 }
+
+pub mod storage {
+    use std::collections::HashMap;
+    use anyhow::{Context, Result};
+    use rusqlite::{params, Connection};
+
+    #[derive(Debug, Clone, Default)]
+    pub struct TipState {
+        pub shows_count: u32,
+        pub last_shown_at: Option<i64>,
+        pub first_shown_at: Option<i64>,
+        pub muted: bool,
+        pub muted_at: Option<i64>,
+    }
+
+    pub type StateMap = HashMap<String, TipState>;
+
+    pub fn load_all(conn: &Connection) -> Result<StateMap> {
+        let mut stmt = conn.prepare(
+            "SELECT tip_id, shows_count, last_shown_at, first_shown_at, muted, muted_at FROM tips_state",
+        ).context("prepare load_all")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                TipState {
+                    shows_count: r.get::<_, i64>(1)? as u32,
+                    last_shown_at: r.get(2)?,
+                    first_shown_at: r.get(3)?,
+                    muted: r.get::<_, i64>(4)? != 0,
+                    muted_at: r.get(5)?,
+                },
+            ))
+        }).context("query tips_state")?;
+        let mut out = HashMap::new();
+        for row in rows {
+            let (id, state) = row.context("read row")?;
+            out.insert(id, state);
+        }
+        Ok(out)
+    }
+
+    pub fn record_show(conn: &Connection, tip_id: &str, now: i64) -> Result<()> {
+        conn.execute(
+            "INSERT INTO tips_state(tip_id, shows_count, last_shown_at, first_shown_at)
+             VALUES (?1, 1, ?2, ?2)
+             ON CONFLICT(tip_id) DO UPDATE SET
+                 shows_count = shows_count + 1,
+                 last_shown_at = excluded.last_shown_at",
+            params![tip_id, now],
+        ).context("upsert record_show")?;
+        Ok(())
+    }
+
+    pub fn mute(conn: &Connection, tip_id: &str, now: i64) -> Result<()> {
+        conn.execute(
+            "INSERT INTO tips_state(tip_id, shows_count, muted, muted_at)
+             VALUES (?1, 0, 1, ?2)
+             ON CONFLICT(tip_id) DO UPDATE SET muted = 1, muted_at = excluded.muted_at",
+            params![tip_id, now],
+        ).context("mute")?;
+        Ok(())
+    }
+
+    pub fn unmute(conn: &Connection, tip_id: &str) -> Result<()> {
+        conn.execute(
+            "UPDATE tips_state SET muted = 0, muted_at = NULL, shows_count = 0 WHERE tip_id = ?1",
+            params![tip_id],
+        ).context("unmute")?;
+        Ok(())
+    }
+
+    pub fn reset(conn: &Connection, hard: bool) -> Result<()> {
+        if hard {
+            conn.execute("DELETE FROM tips_state", []).context("reset --hard")?;
+        } else {
+            conn.execute(
+                "UPDATE tips_state SET shows_count = 0, last_shown_at = NULL, first_shown_at = NULL",
+                [],
+            ).context("reset")?;
+        }
+        Ok(())
+    }
+}
