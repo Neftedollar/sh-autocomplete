@@ -1,4 +1,4 @@
-use shac::i18n::{resolve_locale, LocaleSource};
+use shac::i18n::{resolve_locale, Catalog, LocaleSource, Translator};
 
 #[test]
 fn shac_locale_env_wins() {
@@ -64,4 +64,44 @@ fn lang_c_normalizes_to_en() {
 fn lang_posix_normalizes_to_en() {
     assert_eq!(resolve_locale(Some("POSIX".to_string()), None, None, None).lang, "en");
     assert_eq!(resolve_locale(Some("posix".to_string()), None, None, None).lang, "en");
+}
+
+#[test]
+fn english_lookup_returns_key_text() {
+    let translator = Translator::new_for_test("en", &Catalog::bundled_en());
+    assert!(translator.lookup("greeter.first_run").contains("shac is ready"));
+}
+
+#[test]
+fn missing_key_returns_key_string_for_visibility() {
+    let translator = Translator::new_for_test("en", &Catalog::bundled_en());
+    assert_eq!(translator.lookup("tips.does_not_exist"), "tips.does_not_exist");
+}
+
+#[test]
+fn russian_partial_translation_falls_back_to_english_per_key() {
+    let mut catalog = Catalog::bundled_en();
+    catalog.merge_locale("ru", r#"
+        [tips]
+        git_branches = "ветки этого репо подтягиваются автоматически"
+    "#).expect("parse ru toml");
+
+    let translator = Translator::new_for_test("ru", &catalog);
+    assert!(translator.lookup("tips.git_branches").starts_with("ветки"));
+    assert!(translator.lookup("tips.ssh_hosts").contains("hosts from"));
+}
+
+#[test]
+fn interpolation_replaces_placeholders() {
+    let translator = Translator::new_for_test("en", &Catalog::bundled_en());
+    let out = translator.lookup_with("tips.unknown_command", &[("bin", "kubectl")]);
+    assert!(out.contains("kubectl"));
+    assert!(!out.contains("{bin}"));
+}
+
+#[test]
+fn interpolation_leaves_literal_when_placeholder_missing() {
+    let translator = Translator::new_for_test("en", &Catalog::bundled_en());
+    let out = translator.lookup_with("tips.unknown_command", &[]);
+    assert!(out.contains("{bin}"), "missing placeholder leaves literal {{bin}}");
 }
