@@ -1,6 +1,8 @@
 //! Discoverability hints — catalog, selection, persistence, runtime.
 
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::time::Instant;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TipCategory {
@@ -247,9 +249,6 @@ pub mod storage {
     }
 }
 
-use std::collections::{HashMap, HashSet};
-use std::time::Instant;
-
 #[derive(Debug, Default, Clone)]
 pub struct SessionState {
     pub shown_this_session: HashSet<String>,
@@ -278,6 +277,9 @@ pub fn select<'a>(input: &'a SelectInput<'a>) -> Option<&'static Tip> {
         true
     }).collect();
 
+    // Sort ascending: smallest category rank, then zero-acceptance first, then
+    // least-recently-shown first. unwrap_or(0) means never-shown ties with
+    // epoch-0 — never-shown wins because the priority is "rotate fairly".
     candidates.sort_by_key(|t| {
         let category_rank = t.category as u8;
         let zero_acc_priority = match t.source_hint {
@@ -298,12 +300,12 @@ pub struct Runtime {
 
 impl Runtime {
     pub fn session_for(&self, tty: &str) -> SessionState {
-        let map = self.sessions.lock().expect("tips runtime mutex");
+        let map = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
         map.get(tty).cloned().unwrap_or_default()
     }
 
     pub fn record_show(&self, tty: &str, tip_id: &str) {
-        let mut map = self.sessions.lock().expect("tips runtime mutex");
+        let mut map = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
         let entry = map.entry(tty.to_string()).or_default();
         entry.shown_this_session.insert(tip_id.to_string());
         entry.last_tab_at = Some(Instant::now());
