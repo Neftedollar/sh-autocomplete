@@ -2,6 +2,7 @@ pub mod config;
 pub mod context;
 pub mod db;
 pub mod engine;
+pub mod i18n;
 pub mod import;
 pub mod indexer;
 pub mod ml;
