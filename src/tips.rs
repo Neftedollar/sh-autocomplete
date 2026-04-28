@@ -34,7 +34,7 @@ pub struct Tip {
 }
 
 pub fn catalog() -> &'static [Tip] {
-    &CATALOG
+    CATALOG
 }
 
 const CATALOG: &[Tip] = &[

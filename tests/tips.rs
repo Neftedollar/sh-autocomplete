@@ -161,20 +161,15 @@ fn reset_hard_clears_everything() {
 }
 
 use shac::tips::{triggers_for_test, Context};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-fn ctx<'a>(
-    line: &'a str,
-    cwd: &'a PathBuf,
-    home: &'a PathBuf,
-    sources: &'a [String],
-) -> Context<'a> {
+fn ctx<'a>(line: &'a str, cwd: &'a Path, home: &'a Path, sources: &'a [String]) -> Context<'a> {
     Context {
         line,
         cursor: line.len(),
-        cwd: cwd.as_path(),
+        cwd,
         tty: "test-tty",
-        home: home.as_path(),
+        home,
         response_sources: sources,
         has_path_jump: sources.iter().any(|s| s == "path_jump"),
         n_candidates: sources.len(),

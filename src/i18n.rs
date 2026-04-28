@@ -258,10 +258,7 @@ fn non_empty(s: Option<String>) -> Option<String> {
 // ship language-level translations, but revisit when script-aware locales land.
 fn normalize(raw: &str) -> String {
     let lowercase = raw.to_ascii_lowercase();
-    let cut = lowercase
-        .split(|c: char| c == '_' || c == '.' || c == '-')
-        .next()
-        .unwrap_or("");
+    let cut = lowercase.split(['_', '.', '-']).next().unwrap_or("");
     if cut.is_empty() {
         return "en".into();
     }
