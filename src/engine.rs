@@ -150,7 +150,7 @@ pub struct Engine {
     paths: AppPaths,
     ml_model: Option<MlModel>,
     tips_runtime: crate::tips::Runtime,
-    translator_cache: std::sync::OnceLock<crate::i18n::Translator>,
+    catalog_cache: std::sync::OnceLock<crate::i18n::Catalog>,
 }
 
 impl Engine {
@@ -171,7 +171,7 @@ impl Engine {
             paths: paths.clone(),
             ml_model,
             tips_runtime: crate::tips::Runtime::default(),
-            translator_cache: std::sync::OnceLock::new(),
+            catalog_cache: std::sync::OnceLock::new(),
         })
     }
 
@@ -219,8 +219,7 @@ impl Engine {
 
         items.sort_by(|left, right| cmp_score(right.item.score, left.item.score));
         items.truncate(self.config.max_results);
-        let response_sources: Vec<String> =
-            items.iter().map(|i| i.item.source.clone()).collect();
+        let response_sources: Vec<String> = items.iter().map(|i| i.item.source.clone()).collect();
         let tip = self.maybe_pick_tip(&req, &response_sources, items.len());
         let request_id = self.db.record_completion_request(
             &req.shell,
@@ -373,17 +372,33 @@ pub fn maybe_auto_train(paths: &AppPaths) -> Result<bool> {
 }
 
 impl Engine {
-    fn translator(&self) -> &crate::i18n::Translator {
-        self.translator_cache.get_or_init(|| {
+    fn translator_for(&self, request: &CompletionRequest) -> crate::i18n::Translator {
+        let catalog = self.catalog_cache.get_or_init(|| {
+            // The catalog is locale-agnostic enough for v0.5.0: only en is bundled.
+            // Future work: rebuild when user override mtime changes.
             let resolved = crate::i18n::resolve_locale(
                 std::env::var("SHAC_LOCALE").ok(),
                 Some(self.config.ui.locale.clone()),
                 std::env::var("LC_MESSAGES").ok(),
                 std::env::var("LANG").ok(),
             );
-            let catalog = crate::i18n::Catalog::build(&self.paths.config_dir, &resolved.lang);
-            crate::i18n::Translator::new(resolved.lang, catalog)
-        })
+            crate::i18n::Catalog::build(&self.paths.config_dir, &resolved.lang)
+        });
+        let resolved = crate::i18n::resolve_locale(
+            request.env.get("SHAC_LOCALE").cloned(),
+            Some(self.config.ui.locale.clone()),
+            request
+                .env
+                .get("LC_MESSAGES")
+                .cloned()
+                .or_else(|| std::env::var("LC_MESSAGES").ok()),
+            request
+                .env
+                .get("LANG")
+                .cloned()
+                .or_else(|| std::env::var("LANG").ok()),
+        );
+        crate::i18n::Translator::new(resolved.lang, catalog.clone())
     }
 
     fn maybe_pick_tip(
@@ -410,7 +425,7 @@ impl Engine {
 
         // First-run greeter wins over normal selection.
         if self.config.ui.first_run_greeter && self.db.try_claim_first_run().unwrap_or(false) {
-            let text = self.translator().lookup("greeter.first_run");
+            let text = self.translator_for(request).lookup("greeter.first_run");
             return Some(CompletionTip {
                 id: "__greeter__".into(),
                 text,
@@ -465,7 +480,13 @@ impl Engine {
         let _ = self.db.record_tip_show(picked.id, now);
         self.tips_runtime.record_show(tty, picked.id);
 
-        let text = self.translator().lookup(picked.text_key);
+        let translator = self.translator_for(request);
+        let text = if picked.id == "unknown_command" {
+            let bin = unknown_bin.unwrap_or("");
+            translator.lookup_with(picked.text_key, &[("bin", bin)])
+        } else {
+            translator.lookup(picked.text_key)
+        };
         Some(CompletionTip {
             id: picked.id.into(),
             text,
@@ -703,12 +724,7 @@ impl Engine {
                 self.collect_git_branch_candidates(active, cwd, candidates, seen)?;
             }
             ArgType::Script => {
-                self.collect_npm_script_candidates(
-                    active,
-                    Path::new(cwd),
-                    candidates,
-                    seen,
-                )?;
+                self.collect_npm_script_candidates(active, Path::new(cwd), candidates, seen)?;
             }
             ArgType::Host => {
                 self.collect_ssh_host_candidates(active, candidates, seen)?;
@@ -1210,9 +1226,7 @@ impl Engine {
             //   deployments.apps
             //   ingresses.networking.k8s.io
             // Emit the full name plus the short name (segment before first '.').
-            let short = resource
-                .split_once('.')
-                .map(|(s, _)| s.to_string());
+            let short = resource.split_once('.').map(|(s, _)| s.to_string());
             all.push((resource.clone(), true));
             if let Some(s) = short {
                 if s != resource {
@@ -2191,8 +2205,22 @@ fn vscode_storage_paths() -> Vec<PathBuf> {
     // macOS: ~/Library/Application Support/Code/...
     // Linux: ~/.config/Code/...
     let candidates: &[&[&str]] = &[
-        &["Library", "Application Support", "Code", "User", "globalStorage", "state.vscdb"],
-        &["Library", "Application Support", "Code", "User", "globalStorage", "storage.json"],
+        &[
+            "Library",
+            "Application Support",
+            "Code",
+            "User",
+            "globalStorage",
+            "state.vscdb",
+        ],
+        &[
+            "Library",
+            "Application Support",
+            "Code",
+            "User",
+            "globalStorage",
+            "storage.json",
+        ],
         &[".config", "Code", "User", "globalStorage", "state.vscdb"],
         &[".config", "Code", "User", "globalStorage", "storage.json"],
     ];
@@ -2863,9 +2891,7 @@ fn parse_justfile_targets(path: &Path) -> Vec<String> {
             continue;
         }
         // Extract the name: everything up to the first `(`, ` `, or `:`.
-        let name_end = trimmed
-            .find(['(', ' ', ':'])
-            .unwrap_or(trimmed.len());
+        let name_end = trimmed.find(['(', ' ', ':']).unwrap_or(trimmed.len());
         let name = &trimmed[..name_end];
         if name.is_empty() {
             continue;
@@ -2948,12 +2974,29 @@ fn parse_taskfile_targets(path: &Path) -> Vec<String> {
                 // They appear at deeper indent anyway, but guard here too.
                 let is_yaml_key = matches!(
                     name,
-                    "cmds" | "desc" | "summary" | "deps" | "env"
-                        | "vars" | "silent" | "run" | "method"
-                        | "sources" | "generates" | "status"
-                        | "preconditions" | "ignore_error" | "dir"
-                        | "dotenv" | "label" | "internal" | "platforms"
-                        | "prompt" | "requires" | "aliases" | "set"
+                    "cmds"
+                        | "desc"
+                        | "summary"
+                        | "deps"
+                        | "env"
+                        | "vars"
+                        | "silent"
+                        | "run"
+                        | "method"
+                        | "sources"
+                        | "generates"
+                        | "status"
+                        | "preconditions"
+                        | "ignore_error"
+                        | "dir"
+                        | "dotenv"
+                        | "label"
+                        | "internal"
+                        | "platforms"
+                        | "prompt"
+                        | "requires"
+                        | "aliases"
+                        | "set"
                         | "shopt"
                 );
                 if !is_yaml_key && !name.is_empty() && !name.starts_with('-') {
@@ -3018,8 +3061,10 @@ mod tests {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_nanos();
-            let path = std::env::temp_dir()
-                .join(format!("shac-engine-{label}-{}-{nanos}", std::process::id()));
+            let path = std::env::temp_dir().join(format!(
+                "shac-engine-{label}-{}-{nanos}",
+                std::process::id()
+            ));
             std::fs::create_dir_all(&path).expect("create test dir");
             Self { path }
         }
@@ -3167,12 +3212,8 @@ mod tests {
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-        let path = std::env::temp_dir().join(format!(
-            "{prefix}-{}-{}-{}",
-            std::process::id(),
-            nanos,
-            n
-        ));
+        let path =
+            std::env::temp_dir().join(format!("{prefix}-{}-{}-{}", std::process::id(), nanos, n));
         std::fs::create_dir_all(&path).expect("create unique tmp");
         path
     }
@@ -3236,10 +3277,7 @@ mod tests {
         std::fs::create_dir_all(inner.join(".git")).expect("mkdir .git");
         std::fs::write(inner.join("package.json"), "{}").expect("seed pkg");
         let found = find_package_json_root(&leaf).expect("found");
-        assert_eq!(
-            found.canonicalize().unwrap(),
-            inner.canonicalize().unwrap()
-        );
+        assert_eq!(found.canonicalize().unwrap(), inner.canonicalize().unwrap());
     }
 
     #[test]
@@ -3643,10 +3681,8 @@ mod tests {
     fn write_test_vscdb(dir: &std::path::Path, payload: &str) -> std::path::PathBuf {
         let db_path = dir.join("state.vscdb");
         let conn = rusqlite::Connection::open(&db_path).expect("open test vscdb");
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS ItemTable (key TEXT UNIQUE, value TEXT);",
-        )
-        .expect("create table");
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS ItemTable (key TEXT UNIQUE, value TEXT);")
+            .expect("create table");
         conn.execute(
             "INSERT INTO ItemTable (key, value) VALUES ('history.recentlyOpenedPathsList', ?1)",
             rusqlite::params![payload],
@@ -3658,13 +3694,23 @@ mod tests {
     #[test]
     fn parse_vscode_recent_workspaces_basic() {
         let scratch = unique_tmp("shac-vsc-basic");
-        let payload = r#"{"entries":[{"folderUri":"file:///foo/alpha"},{"folderUri":"file:///foo/beta"}]}"#;
+        let payload =
+            r#"{"entries":[{"folderUri":"file:///foo/alpha"},{"folderUri":"file:///foo/beta"}]}"#;
         let db_path = write_test_vscdb(&scratch, payload);
         let paths = parse_vscode_recent_workspaces(&db_path);
         assert_eq!(paths.len(), 2, "expected 2 paths: {paths:?}");
-        let strs: Vec<String> = paths.iter().map(|p| p.to_string_lossy().to_string()).collect();
-        assert!(strs.iter().any(|s| s == "/foo/alpha"), "alpha missing: {strs:?}");
-        assert!(strs.iter().any(|s| s == "/foo/beta"), "beta missing: {strs:?}");
+        let strs: Vec<String> = paths
+            .iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect();
+        assert!(
+            strs.iter().any(|s| s == "/foo/alpha"),
+            "alpha missing: {strs:?}"
+        );
+        assert!(
+            strs.iter().any(|s| s == "/foo/beta"),
+            "beta missing: {strs:?}"
+        );
     }
 
     #[test]
@@ -3712,7 +3758,10 @@ mod tests {
             .collect();
         assert!(parsed.contains(&"pods".to_string()), "{parsed:?}");
         assert!(parsed.contains(&"services".to_string()), "{parsed:?}");
-        assert!(parsed.contains(&"deployments.apps".to_string()), "{parsed:?}");
+        assert!(
+            parsed.contains(&"deployments.apps".to_string()),
+            "{parsed:?}"
+        );
         assert_eq!(parsed.len(), 3);
     }
 
@@ -3794,21 +3843,32 @@ mod tests {
 
             // With PATH=/dev/null, list_kubectl_resources() returns empty, so all
             // candidates come from KUBECTL_FALLBACK_RESOURCES.
-            let names: Vec<&str> = candidates
-                .iter()
-                .map(|c| c.insert_text.as_str())
-                .collect();
+            let names: Vec<&str> = candidates.iter().map(|c| c.insert_text.as_str()).collect();
 
             assert!(names.contains(&"pods"), "pods must surface: {names:?}");
-            assert!(names.contains(&"services"), "services must surface: {names:?}");
-            assert!(names.contains(&"deployments"), "deployments must surface: {names:?}");
-            assert!(names.contains(&"po"), "short-name po must surface: {names:?}");
-            assert!(names.contains(&"svc"), "short-name svc must surface: {names:?}");
+            assert!(
+                names.contains(&"services"),
+                "services must surface: {names:?}"
+            );
+            assert!(
+                names.contains(&"deployments"),
+                "deployments must surface: {names:?}"
+            );
+            assert!(
+                names.contains(&"po"),
+                "short-name po must surface: {names:?}"
+            );
+            assert!(
+                names.contains(&"svc"),
+                "short-name svc must surface: {names:?}"
+            );
             // With no live kubectl, all descriptions say "· builtin".
             assert!(
-                candidates
-                    .iter()
-                    .all(|c| c.description.as_deref().unwrap_or("").contains("builtin")),
+                candidates.iter().all(|c| c
+                    .description
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains("builtin")),
                 "all candidates must be '· builtin' when kubectl is absent: {candidates:?}",
             );
         });
@@ -3862,7 +3922,10 @@ mod tests {
     #[test]
     fn parse_docker_images_handles_empty_output() {
         let result = parse_docker_images_output("");
-        assert!(result.is_empty(), "empty input must produce empty vec: {result:?}");
+        assert!(
+            result.is_empty(),
+            "empty input must produce empty vec: {result:?}"
+        );
     }
 
     #[test]
@@ -3899,7 +3962,10 @@ mod tests {
     #[test]
     fn parse_docker_containers_output_empty() {
         let result = parse_docker_containers_output("");
-        assert!(result.is_empty(), "empty input must produce empty vec: {result:?}");
+        assert!(
+            result.is_empty(),
+            "empty input must produce empty vec: {result:?}"
+        );
     }
 
     /// `collect_docker_container_candidates` returns empty when docker is absent.
@@ -3940,13 +4006,12 @@ mod tests {
 
             // Build a ParsedContext for `docker exec ` using the real parser so
             // the field layout is always correct.
-            let parsed = crate::context::parse(
-                "docker exec ",
-                12,
-                dir.path.as_path(),
+            let parsed = crate::context::parse("docker exec ", 12, dir.path.as_path());
+            assert_eq!(
+                parsed.command.as_deref(),
+                Some("docker"),
+                "parsed command must be docker"
             );
-            assert_eq!(parsed.command.as_deref(), Some("docker"),
-                "parsed command must be docker");
 
             let mut dispatch_candidates: Vec<Candidate> = Vec::new();
             let mut dispatch_seen: HashSet<String> = HashSet::new();
@@ -4074,8 +4139,7 @@ mod tests {
 
         // Prefer the local `path` source over `path_jump`.
         assert_eq!(
-            items_for_korat[0].source,
-            "path_cache",
+            items_for_korat[0].source, "path_cache",
             "surviving candidate should come from path_cache (local), got source={:?}",
             items_for_korat[0].source
         );

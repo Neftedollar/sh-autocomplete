@@ -143,7 +143,10 @@ fn parse_history_line(line: &str, extended_re: &Regex) -> Option<(i64, String)> 
             .get(1)
             .and_then(|m| m.as_str().parse().ok())
             .unwrap_or(0);
-        let cmd = caps.get(2).map(|m| m.as_str().to_string()).unwrap_or_default();
+        let cmd = caps
+            .get(2)
+            .map(|m| m.as_str().to_string())
+            .unwrap_or_default();
         Some((ts, cmd))
     } else if !line.is_empty() {
         Some((0, line.to_string()))
@@ -260,11 +263,7 @@ fn read_history_lines(path: &Path) -> Result<Vec<String>> {
 }
 
 /// Import zsh-history file into `history_events` and `paths_index`.
-pub fn import_zsh_history(
-    db: &AppDb,
-    path: &Path,
-    redactor: &Redactor,
-) -> Result<ImportSummary> {
+pub fn import_zsh_history(db: &AppDb, path: &Path, redactor: &Redactor) -> Result<ImportSummary> {
     let started = Instant::now();
     let mut summary = ImportSummary::empty("zsh_history");
 
@@ -327,11 +326,8 @@ pub fn import_zsh_history(
             let hash_hex = import_hash(ts, cmd, line_no);
             let mut hash_bytes = [0u8; 32];
             for (i, chunk) in hash_hex.as_bytes().chunks(2).enumerate().take(32) {
-                hash_bytes[i] = u8::from_str_radix(
-                    std::str::from_utf8(chunk).unwrap_or("00"),
-                    16,
-                )
-                .unwrap_or(0);
+                hash_bytes[i] =
+                    u8::from_str_radix(std::str::from_utf8(chunk).unwrap_or("00"), 16).unwrap_or(0);
             }
             if !seen_hashes.insert(hash_bytes) {
                 summary.skipped_dup += 1;
@@ -531,11 +527,7 @@ fn detect_project_marker(dir: &Path) -> Option<String> {
 }
 
 /// Walk `roots` looking for `.git`-bearing directories up to `max_depth`.
-pub fn scan_projects(
-    db: &AppDb,
-    roots: &[PathBuf],
-    max_depth: usize,
-) -> Result<ImportSummary> {
+pub fn scan_projects(db: &AppDb, roots: &[PathBuf], max_depth: usize) -> Result<ImportSummary> {
     let started = Instant::now();
     let mut summary = ImportSummary::empty("project_scan");
 
@@ -642,9 +634,7 @@ pub fn run_full_import(db: &AppDb, opts: ImportOpts) -> Result<Vec<ImportSummary
                 let approved = if opts.yes {
                     true
                 } else {
-                    let entry_count = read_history_lines(&path)
-                        .map(|v| v.len())
-                        .unwrap_or(0);
+                    let entry_count = read_history_lines(&path).map(|v| v.len()).unwrap_or(0);
                     prompt_yes_default(&format!(
                         "Import {} zsh history entries? [Y/n] ",
                         entry_count
@@ -820,8 +810,7 @@ mod tests {
         let rows = db.top_paths(None, 50).unwrap();
         for sub in ["alpha", "beta", "gamma"] {
             assert!(
-                rows.iter()
-                    .any(|r| r.path.ends_with(sub) && r.is_git_repo),
+                rows.iter().any(|r| r.path.ends_with(sub) && r.is_git_repo),
                 "missing repo for {sub}"
             );
         }
@@ -910,8 +899,7 @@ mod tests {
         let history = write_history_file(dir.path(), contents);
         let red = Redactor::new();
 
-        let summary = import_zsh_history(&db, &history, &red)
-            .expect("import must succeed");
+        let summary = import_zsh_history(&db, &history, &red).expect("import must succeed");
 
         assert_eq!(
             summary.inserted, 5,

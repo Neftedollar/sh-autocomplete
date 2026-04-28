@@ -152,10 +152,7 @@ fn shac_import_all_runs_both() {
     fs::write(&history_path, HISTORY_FIXTURE).expect("write history");
 
     let zo_path = env.home.join(".local/share/zoxide/db.zo");
-    write_zoxide_v3_db(
-        &zo_path,
-        &[("/tmp/aaa", 4.0, 100), ("/tmp/bbb", 2.0, 200)],
-    );
+    write_zoxide_v3_db(&zo_path, &[("/tmp/aaa", 4.0, 100), ("/tmp/bbb", 2.0, 200)]);
 
     let _ = run_ok(&env, ["import", "all", "--yes"]);
 

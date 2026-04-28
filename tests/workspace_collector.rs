@@ -21,10 +21,8 @@ fn write_vscdb(env: &support::TestEnv, entries_json: &str) {
     let db_path = dir.join("state.vscdb");
 
     let conn = rusqlite::Connection::open(&db_path).expect("open test vscdb");
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS ItemTable (key TEXT UNIQUE, value TEXT);",
-    )
-    .expect("create table");
+    conn.execute_batch("CREATE TABLE IF NOT EXISTS ItemTable (key TEXT UNIQUE, value TEXT);")
+        .expect("create table");
     conn.execute(
         "INSERT OR REPLACE INTO ItemTable (key, value) VALUES ('history.recentlyOpenedPathsList', ?1)",
         rusqlite::params![entries_json],
@@ -255,10 +253,8 @@ fn code_completion_handles_malformed_json() {
 
     // Write a vscdb with broken JSON payload — must not panic.
     let conn = rusqlite::Connection::open(dir.join("state.vscdb")).expect("open db");
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS ItemTable (key TEXT UNIQUE, value TEXT);",
-    )
-    .expect("create table");
+    conn.execute_batch("CREATE TABLE IF NOT EXISTS ItemTable (key TEXT UNIQUE, value TEXT);")
+        .expect("create table");
     conn.execute(
         "INSERT INTO ItemTable (key, value) VALUES ('history.recentlyOpenedPathsList', ?1)",
         rusqlite::params!["{ this is not valid json "],
@@ -282,10 +278,7 @@ fn subl_uses_workspace_completion() {
     let proj = env.home.join("projects/sublproj");
     fs::create_dir_all(&proj).expect("mkdir");
 
-    let json = history_json(&[&format!(
-        r#"{{"folderUri":"file://{}"}}"#,
-        proj.display()
-    )]);
+    let json = history_json(&[&format!(r#"{{"folderUri":"file://{}"}}"#, proj.display())]);
     write_vscdb(&env, &json);
 
     let _daemon = env.spawn_daemon();

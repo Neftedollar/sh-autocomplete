@@ -28,8 +28,14 @@ fn catalog_has_expected_ids() {
 fn catalog_categories_match_spec() {
     let by_id: std::collections::HashMap<&str, TipCategory> =
         catalog().iter().map(|t| (t.id, t.category)).collect();
-    assert_eq!(by_id.get("git_branches").copied(), Some(TipCategory::Capability));
-    assert_eq!(by_id.get("transitions").copied(), Some(TipCategory::Explanation));
+    assert_eq!(
+        by_id.get("git_branches").copied(),
+        Some(TipCategory::Capability)
+    );
+    assert_eq!(
+        by_id.get("transitions").copied(),
+        Some(TipCategory::Explanation)
+    );
     assert_eq!(by_id.get("tips_off").copied(), Some(TipCategory::Config));
 }
 
@@ -81,7 +87,8 @@ fn test_db() -> Connection {
             muted_at        INTEGER,
             first_shown_at  INTEGER
         );",
-    ).unwrap();
+    )
+    .unwrap();
     conn
 }
 
@@ -110,7 +117,10 @@ fn mute_and_unmute() {
     let state = storage::load_all(&conn).unwrap();
     let e = state.get("git_branches").unwrap();
     assert!(!e.muted);
-    assert_eq!(e.shows_count, 0, "unmute resets shows_count for a second chance");
+    assert_eq!(
+        e.shows_count, 0,
+        "unmute resets shows_count for a second chance"
+    );
 }
 
 #[test]
@@ -132,7 +142,11 @@ fn first_shown_at_set_when_mute_precedes_record_show() {
     storage::record_show(&conn, "x", 500).unwrap();
     let state = storage::load_all(&conn).unwrap();
     let entry = state.get("x").expect("entry");
-    assert_eq!(entry.first_shown_at, Some(500), "first_shown_at must be set on first show even if a row already existed");
+    assert_eq!(
+        entry.first_shown_at,
+        Some(500),
+        "first_shown_at must be set on first show even if a row already existed"
+    );
     assert_eq!(entry.shows_count, 1);
 }
 
@@ -146,10 +160,15 @@ fn reset_hard_clears_everything() {
     assert!(state.is_empty(), "hard reset deletes all rows");
 }
 
+use shac::tips::{triggers_for_test, Context};
 use std::path::PathBuf;
-use shac::tips::{Context, triggers_for_test};
 
-fn ctx<'a>(line: &'a str, cwd: &'a PathBuf, home: &'a PathBuf, sources: &'a [String]) -> Context<'a> {
+fn ctx<'a>(
+    line: &'a str,
+    cwd: &'a PathBuf,
+    home: &'a PathBuf,
+    sources: &'a [String],
+) -> Context<'a> {
     Context {
         line,
         cursor: line.len(),
@@ -195,7 +214,11 @@ fn ssh_hosts_requires_ssh_config() {
     assert!(!triggers_for_test::ssh_hosts(&c));
 
     std::fs::create_dir_all(home.join(".ssh")).unwrap();
-    std::fs::write(home.join(".ssh").join("config"), "Host foo\n  HostName 1.2.3.4\n").unwrap();
+    std::fs::write(
+        home.join(".ssh").join("config"),
+        "Host foo\n  HostName 1.2.3.4\n",
+    )
+    .unwrap();
     let c = ctx("ssh ", &cwd, &home, &sources);
     assert!(triggers_for_test::ssh_hosts(&c));
 }
@@ -245,7 +268,10 @@ fn docker_trigger_matches_run_exec_rmi() {
     }
     for nope in ["docker ps ", "docker logs "] {
         let c = ctx(nope, &cwd, &home, &sources);
-        assert!(!triggers_for_test::docker_images(&c), "{nope} should not trigger");
+        assert!(
+            !triggers_for_test::docker_images(&c),
+            "{nope} should not trigger"
+        );
     }
 }
 
@@ -256,8 +282,12 @@ fn transitions_trigger_uses_response_sources() {
     let cwd = tmp.path().to_path_buf();
     let with = vec!["transitions".to_string()];
     let without = vec!["history".to_string()];
-    assert!(triggers_for_test::transitions(&ctx("foo", &cwd, &home, &with)));
-    assert!(!triggers_for_test::transitions(&ctx("foo", &cwd, &home, &without)));
+    assert!(triggers_for_test::transitions(&ctx(
+        "foo", &cwd, &home, &with
+    )));
+    assert!(!triggers_for_test::transitions(&ctx(
+        "foo", &cwd, &home, &without
+    )));
     let _ = tmp;
 }
 
@@ -277,12 +307,16 @@ fn unknown_command_uses_unknown_bin_field() {
     assert!(!triggers_for_test::unknown_command(&c));
 }
 
-use shac::tips::{select, SelectInput, SessionState};
 use shac::tips::storage::TipState;
+use shac::tips::{select, SelectInput, SessionState};
 use std::collections::{HashMap, HashSet};
 
-fn empty_state() -> HashMap<String, TipState> { HashMap::new() }
-fn empty_session() -> SessionState { SessionState::default() }
+fn empty_state() -> HashMap<String, TipState> {
+    HashMap::new()
+}
+fn empty_session() -> SessionState {
+    SessionState::default()
+}
 
 #[test]
 fn select_returns_none_when_no_trigger_matches() {
@@ -311,7 +345,13 @@ fn select_skips_muted() {
     let context = ctx("git checkout main", &cwd, &home, &sources);
 
     let mut state = empty_state();
-    state.insert("git_branches".into(), TipState { muted: true, ..Default::default() });
+    state.insert(
+        "git_branches".into(),
+        TipState {
+            muted: true,
+            ..Default::default()
+        },
+    );
     let input = SelectInput {
         context: &context,
         state: &state,
@@ -363,7 +403,10 @@ fn select_caps_per_session_max() {
         zero_acceptance_sources: &HashSet::new(),
         tips_per_session_max: 3,
     };
-    assert!(select(&input).is_none(), "session at max should suppress further tips");
+    assert!(
+        select(&input).is_none(),
+        "session at max should suppress further tips"
+    );
 }
 
 #[test]
@@ -428,15 +471,24 @@ fn complete_in_git_repo_emits_tip_line() {
     let out = support::run_ok(
         &env,
         [
-            "complete", "--shell", "zsh",
-            "--line", "git checkout main",
-            "--cursor", "20",
-            "--cwd", cwd.to_string_lossy().as_ref(),
-            "--format", "shell-tsv-v2",
+            "complete",
+            "--shell",
+            "zsh",
+            "--line",
+            "git checkout main",
+            "--cursor",
+            "20",
+            "--cwd",
+            cwd.to_string_lossy().as_ref(),
+            "--format",
+            "shell-tsv-v2",
         ],
     );
     // First call may emit greeter; either greeter or git_branches counts.
-    assert!(out.contains("__shac_tip"), "expected __shac_tip line, got:\n{out}");
+    assert!(
+        out.contains("__shac_tip"),
+        "expected __shac_tip line, got:\n{out}"
+    );
 }
 
 #[test]
@@ -456,7 +508,10 @@ fn tips_reset_hard_clears_state() {
     support::run_ok(&env, ["tips", "mute", "git_branches"]);
     support::run_ok(&env, ["tips", "reset", "--hard"]);
     let out = support::run_ok(&env, ["tips", "list", "--all"]);
-    assert!(!out.contains("muted"), "expected no muted after hard reset, got:\n{out}");
+    assert!(
+        !out.contains("muted"),
+        "expected no muted after hard reset, got:\n{out}"
+    );
 }
 
 #[test]
@@ -469,14 +524,23 @@ fn shac_no_tips_env_suppresses_tip_line() {
     let mut cmd = env.shac_cmd();
     cmd.env("SHAC_NO_TIPS", "1");
     cmd.args([
-        "complete", "--shell", "zsh",
-        "--line", "git checkout main",
-        "--cursor", "20",
-        "--cwd", cwd.to_string_lossy().as_ref(),
-        "--format", "shell-tsv-v2",
+        "complete",
+        "--shell",
+        "zsh",
+        "--line",
+        "git checkout main",
+        "--cursor",
+        "20",
+        "--cwd",
+        cwd.to_string_lossy().as_ref(),
+        "--format",
+        "shell-tsv-v2",
     ]);
     let out = cmd.output().expect("run");
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(!stdout.contains("__shac_tip"), "SHAC_NO_TIPS should suppress: {stdout}");
+    assert!(
+        !stdout.contains("__shac_tip"),
+        "SHAC_NO_TIPS should suppress: {stdout}"
+    );
 }

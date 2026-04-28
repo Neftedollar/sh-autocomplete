@@ -37,8 +37,7 @@ fn write_fake_kubectl(bin_dir: &Path, exit_code: i32) {
     let script = format!("#!/bin/sh\nexit {exit_code}\n");
     let path = bin_dir.join("kubectl");
     fs::write(&path, script).expect("write fake kubectl");
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
-        .expect("chmod fake kubectl");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("chmod fake kubectl");
 }
 
 // ---------------------------------------------------------------------------

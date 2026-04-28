@@ -17,7 +17,14 @@ fn install_seeds_priors_and_completions_surface_them() {
     // populate `command_docs`.
     let install_out = support::run_ok(
         &env,
-        ["install", "--shell", "zsh", "--edit-rc", "--yes", "--no-import"],
+        [
+            "install",
+            "--shell",
+            "zsh",
+            "--edit-rc",
+            "--yes",
+            "--no-import",
+        ],
     );
     assert!(
         install_out.contains("Loaded command priors"),

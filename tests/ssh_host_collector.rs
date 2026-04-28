@@ -151,10 +151,7 @@ fn ssh_completion_dedupes_across_sources() {
         "Host bastion\n\
          \tHostName 10.0.0.1\n",
     );
-    write_known_hosts(
-        &env,
-        "bastion ssh-rsa AAAA...\n",
-    );
+    write_known_hosts(&env, "bastion ssh-rsa AAAA...\n");
 
     let _daemon = env.spawn_daemon();
 
@@ -298,10 +295,7 @@ fn mosh_uses_same_collector() {
 fn ssh_completion_brackets_stripped_from_known_hosts() {
     // [host]:port notation must produce bare hostname.
     let env = support::TestEnv::new("ssh-brackets-strip");
-    write_known_hosts(
-        &env,
-        "[jump-host]:2222 ssh-ed25519 CCCC...\n",
-    );
+    write_known_hosts(&env, "[jump-host]:2222 ssh-ed25519 CCCC...\n");
 
     let _daemon = env.spawn_daemon();
 
@@ -317,7 +311,9 @@ fn ssh_completion_brackets_stripped_from_known_hosts() {
         "brackets must not appear in candidates: {hosts:?}"
     );
     assert!(
-        !hosts.iter().any(|h| h.contains(':') && !h.contains("::") /* IPv6 */),
+        !hosts
+            .iter()
+            .any(|h| h.contains(':') && !h.contains("::") /* IPv6 */),
         "port suffix must not appear: {hosts:?}"
     );
 }

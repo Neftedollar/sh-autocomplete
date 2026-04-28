@@ -53,8 +53,7 @@ fn write_fake_docker(bin_dir: &Path, images_output: Option<&str>, exit_code: i32
     };
     let path = bin_dir.join("docker");
     fs::write(&path, &script).expect("write fake docker");
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
-        .expect("chmod fake docker");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("chmod fake docker");
 }
 
 /// Wrap `s` in POSIX single quotes, escaping embedded `'` as `'\''`.
@@ -81,10 +80,7 @@ impl Drop for TestDaemon {
 /// must contain the fake binary.
 fn spawn_daemon_with_path(env: &support::TestEnv, extra_path: &Path) -> TestDaemon {
     let path_str = env.path_with_prefix(extra_path);
-    let socket = env
-        .state_home
-        .join("shac")
-        .join("shacd.sock");
+    let socket = env.state_home.join("shac").join("shacd.sock");
 
     let mut command = Command::new(&env.shacd);
     env.apply_env(&mut command);

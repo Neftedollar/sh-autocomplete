@@ -219,18 +219,33 @@ pub fn resolve_locale(
     lang_env: Option<String>,
 ) -> ResolvedLocale {
     if let Some(value) = non_empty(shac_locale_env) {
-        return ResolvedLocale { lang: normalize(&value), source: LocaleSource::Env };
+        return ResolvedLocale {
+            lang: normalize(&value),
+            source: LocaleSource::Env,
+        };
     }
     if let Some(value) = non_empty(ui_locale_config) {
-        return ResolvedLocale { lang: normalize(&value), source: LocaleSource::Config };
+        return ResolvedLocale {
+            lang: normalize(&value),
+            source: LocaleSource::Config,
+        };
     }
     if let Some(value) = non_empty(lc_messages_env) {
-        return ResolvedLocale { lang: normalize(&value), source: LocaleSource::AutoLcMessages };
+        return ResolvedLocale {
+            lang: normalize(&value),
+            source: LocaleSource::AutoLcMessages,
+        };
     }
     if let Some(value) = non_empty(lang_env) {
-        return ResolvedLocale { lang: normalize(&value), source: LocaleSource::AutoLang };
+        return ResolvedLocale {
+            lang: normalize(&value),
+            source: LocaleSource::AutoLang,
+        };
     }
-    ResolvedLocale { lang: "en".into(), source: LocaleSource::Default }
+    ResolvedLocale {
+        lang: "en".into(),
+        source: LocaleSource::Default,
+    }
 }
 
 fn non_empty(s: Option<String>) -> Option<String> {

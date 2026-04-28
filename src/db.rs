@@ -355,6 +355,10 @@ impl AppDb {
         Ok(())
     }
 
+    pub fn connection(&self) -> &Connection {
+        &self.conn
+    }
+
     pub fn upsert_command(
         &self,
         name: &str,
@@ -746,7 +750,9 @@ impl AppDb {
     }
 
     fn set_meta_value_if_unset(&self, key: &str, value: &str) -> Result<()> {
-        if self.meta_value(key)?.is_none() { self.set_meta_value(key, value)?; }
+        if self.meta_value(key)?.is_none() {
+            self.set_meta_value(key, value)?;
+        }
         Ok(())
     }
 
@@ -918,7 +924,11 @@ impl AppDb {
 
     /// Top frecent paths, ranked by `rank * decay(now - last_visit)`.
     /// `prefix_filter`: optional case-insensitive substring match on `path`.
-    pub fn top_paths(&self, prefix_filter: Option<&str>, limit: usize) -> Result<Vec<PathFrecency>> {
+    pub fn top_paths(
+        &self,
+        prefix_filter: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<PathFrecency>> {
         // Decay matches engine.rs::recency_score: 1 / (1 + age_hours).
         // Computed in Rust after pulling rows; we order in SQL by rank, then re-sort.
         // We over-fetch by 4x to give room for decay-based reordering, capped.
@@ -1061,14 +1071,18 @@ impl AppDb {
         let scanned_projects = self.count_paths_index_by_source("project_scan")?;
         let paths_index_rows = self.count_paths_index()?;
         let install_ts: Option<i64> = self.meta_value("install_ts")?.and_then(|v| v.parse().ok());
-        let first_accept_ts: Option<i64> = self.meta_value("first_accept_ts")?.and_then(|v| v.parse().ok());
+        let first_accept_ts: Option<i64> = self
+            .meta_value("first_accept_ts")?
+            .and_then(|v| v.parse().ok());
         let time_to_first_accept_seconds = match (install_ts, first_accept_ts) {
             (Some(install), Some(accept)) => Some(accept - install),
             _ => None,
         };
         let import_coverage_pct = if history_total > 0 {
             (imported_history as f64) / (history_total as f64) * 100.0
-        } else { 0.0 };
+        } else {
+            0.0
+        };
         Ok(StatsResponse {
             commands: count(&self.conn, "commands")?,
             docs: count(&self.conn, "command_docs")?,
@@ -1212,12 +1226,16 @@ impl AppDb {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
-
     #[allow(clippy::too_many_arguments)]
     pub fn insert_imported_history(
         &self,
-        ts: i64, cwd: &str, command: &str, shell: Option<&str>,
-        import_hash: &str, trust: &str, provenance: &str,
+        ts: i64,
+        cwd: &str,
+        command: &str,
+        shell: Option<&str>,
+        import_hash: &str,
+        trust: &str,
+        provenance: &str,
     ) -> Result<bool> {
         let imported_at = unix_ts();
         let changed = self.conn.execute(
@@ -1226,9 +1244,19 @@ impl AppDb {
                 provenance_source, provenance_confidence, origin, tty_present,
                 import_hash, imported_at
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, ?10, ?11)",
-            params![ts, cwd, command, shell, trust, provenance,
-                PROVENANCE_SOURCE_UNKNOWN, PROVENANCE_CONFIDENCE_UNKNOWN,
-                "import", import_hash, imported_at],
+            params![
+                ts,
+                cwd,
+                command,
+                shell,
+                trust,
+                provenance,
+                PROVENANCE_SOURCE_UNKNOWN,
+                PROVENANCE_CONFIDENCE_UNKNOWN,
+                "import",
+                import_hash,
+                imported_at
+            ],
         )?;
         Ok(changed > 0)
     }
@@ -1261,7 +1289,9 @@ impl AppDb {
         // 12 columns per row; build placeholders.
         let placeholders_per_row = "(?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)";
         for i in 0..rows.len() {
-            if i > 0 { sql.push(','); }
+            if i > 0 {
+                sql.push(',');
+            }
             sql.push_str(placeholders_per_row);
         }
         let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::with_capacity(rows.len() * 11);
@@ -1279,31 +1309,54 @@ impl AppDb {
             params.push(Box::new(imported_at));
         }
         let refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|b| b.as_ref()).collect();
-        let changed = self.conn.execute(&sql, rusqlite::params_from_iter(refs.iter()))?;
+        let changed = self
+            .conn
+            .execute(&sql, rusqlite::params_from_iter(refs.iter()))?;
         Ok(changed)
     }
 
-    pub fn begin_txn(&self) -> Result<()> { self.conn.execute_batch("BEGIN")?; Ok(()) }
-    pub fn commit_txn(&self) -> Result<()> { self.conn.execute_batch("COMMIT")?; Ok(()) }
-    pub fn rollback_txn(&self) -> Result<()> { self.conn.execute_batch("ROLLBACK")?; Ok(()) }
-
-    pub fn meta_get(&self, key: &str) -> Result<Option<String>> { self.meta_value(key) }
-    pub fn meta_set(&self, key: &str, value: &str) -> Result<()> { self.set_meta_value(key, value) }
-    pub fn meta_set_if_unset(&self, key: &str, value: &str) -> Result<()> {
-        if self.meta_value(key)?.is_none() { self.set_meta_value(key, value)?; }
+    pub fn begin_txn(&self) -> Result<()> {
+        self.conn.execute_batch("BEGIN")?;
+        Ok(())
+    }
+    pub fn commit_txn(&self) -> Result<()> {
+        self.conn.execute_batch("COMMIT")?;
+        Ok(())
+    }
+    pub fn rollback_txn(&self) -> Result<()> {
+        self.conn.execute_batch("ROLLBACK")?;
         Ok(())
     }
 
-    pub fn count_paths_index(&self) -> Result<i64> { count(&self.conn, "paths_index") }
+    pub fn meta_get(&self, key: &str) -> Result<Option<String>> {
+        self.meta_value(key)
+    }
+    pub fn meta_set(&self, key: &str, value: &str) -> Result<()> {
+        self.set_meta_value(key, value)
+    }
+    pub fn meta_set_if_unset(&self, key: &str, value: &str) -> Result<()> {
+        if self.meta_value(key)?.is_none() {
+            self.set_meta_value(key, value)?;
+        }
+        Ok(())
+    }
+
+    pub fn count_paths_index(&self) -> Result<i64> {
+        count(&self.conn, "paths_index")
+    }
     pub fn count_paths_index_by_source(&self, source: &str) -> Result<i64> {
         Ok(self.conn.query_row(
             "SELECT COUNT(*) FROM paths_index WHERE source = ?1",
-            params![source], |row| row.get(0))?)
+            params![source],
+            |row| row.get(0),
+        )?)
     }
     pub fn count_imported_history(&self) -> Result<i64> {
         Ok(self.conn.query_row(
             "SELECT COUNT(*) FROM history_events WHERE import_hash IS NOT NULL",
-            [], |row| row.get(0))?)
+            [],
+            |row| row.get(0),
+        )?)
     }
 
     pub fn load_tips_state(
@@ -2180,7 +2233,10 @@ mod tests {
             .unwrap();
         // Confirm the entry is there.
         let cached = db.get_dir_cache("/tmp/testdir").unwrap();
-        assert!(cached.is_some(), "expected dir_cache entry before invalidation");
+        assert!(
+            cached.is_some(),
+            "expected dir_cache entry before invalidation"
+        );
         // Invalidate.
         db.invalidate_caches();
         // Entry should be gone.

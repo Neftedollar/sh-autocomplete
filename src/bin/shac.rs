@@ -490,11 +490,12 @@ fn run_locale(paths: &AppPaths, args: LocaleArgs) -> Result<()> {
 }
 
 fn run_tips(paths: &AppPaths, args: TipsArgs) -> Result<()> {
-    let conn = rusqlite::Connection::open(&paths.db_file)
+    let db = shac::db::AppDb::open(&paths.db_file)
         .with_context(|| format!("open db at {:?}", paths.db_file))?;
+    let conn = db.connection();
     match args.action {
         TipsAction::List { all, muted } => {
-            let state = shac::tips::storage::load_all(&conn)?;
+            let state = shac::tips::storage::load_all(conn)?;
             let catalog = shac::tips::catalog();
             for tip in catalog {
                 let s = state.get(tip.id);
@@ -516,17 +517,17 @@ fn run_tips(paths: &AppPaths, args: TipsArgs) -> Result<()> {
         }
         TipsAction::Mute { id } => {
             let now = unix_now_secs();
-            shac::tips::storage::mute(&conn, &id, now)?;
+            shac::tips::storage::mute(conn, &id, now)?;
             println!("muted: {id}");
             Ok(())
         }
         TipsAction::Unmute { id } => {
-            shac::tips::storage::unmute(&conn, &id)?;
+            shac::tips::storage::unmute(conn, &id)?;
             println!("unmuted: {id}");
             Ok(())
         }
         TipsAction::Reset { hard } => {
-            shac::tips::storage::reset(&conn, hard)?;
+            shac::tips::storage::reset(conn, hard)?;
             println!(
                 "{}",
                 if hard {
@@ -623,9 +624,15 @@ fn learning_status_check(paths: &AppPaths, config: &AppConfig) -> serde_json::Va
         .map(|s| s.accepted_clean_completions)
         .unwrap_or(0);
     let (ok, detail) = if config.features.ml_rerank {
-        (true, format!("personalized model active ({accepted} accepted completions)"))
+        (
+            true,
+            format!("personalized model active ({accepted} accepted completions)"),
+        )
     } else if accepted == 0 {
-        (false, "no accepted completions yet — press Tab a few times to start learning".to_string())
+        (
+            false,
+            "no accepted completions yet — press Tab a few times to start learning".to_string(),
+        )
     } else {
         let remaining = (50 - accepted).max(0);
         (false, format!("{accepted}/50 accepted completions — {remaining} more to activate personalized model"))
@@ -678,7 +685,10 @@ fn cold_start_checks(paths: &AppPaths) -> Vec<serde_json::Value> {
     let (ttfa_ok, ttfa_detail) = match stats.time_to_first_accept_seconds {
         Some(secs) if secs >= 0 => (true, format!("{secs}s")),
         Some(_) => (true, "negative — clock skew?".to_string()),
-        None => (false, "not yet — press Tab to accept a completion".to_string()),
+        None => (
+            false,
+            "not yet — press Tab to accept a completion".to_string(),
+        ),
     };
     checks.push(doctor_check("time_to_first_accept", ttfa_ok, ttfa_detail));
 
@@ -1019,7 +1029,11 @@ fn shell_kind_to_import(shell: ShellKind) -> shac::import::ShellKind {
 /// plain colorless render and skip ANSI escape sequences.
 fn print_first_run_summary(summaries: &[shac::import::ImportSummary]) {
     let tty = std::io::stdout().is_terminal();
-    let check = if tty { "\x1b[32m\u{2713}\x1b[0m" } else { "\u{2713}" };
+    let check = if tty {
+        "\x1b[32m\u{2713}\x1b[0m"
+    } else {
+        "\u{2713}"
+    };
     let dim_open = if tty { "\x1b[2m" } else { "" };
     let dim_close = if tty { "\x1b[0m" } else { "" };
 
@@ -1044,7 +1058,11 @@ fn print_first_run_summary(summaries: &[shac::import::ImportSummary]) {
 /// number of prior rows actually written (filtered to those CLIs).
 fn print_priors_seeded_line(n_detected: usize, seeded: usize) {
     let tty = std::io::stdout().is_terminal();
-    let check = if tty { "\x1b[32m\u{2713}\x1b[0m" } else { "\u{2713}" };
+    let check = if tty {
+        "\x1b[32m\u{2713}\x1b[0m"
+    } else {
+        "\u{2713}"
+    };
     let dim_open = if tty { "\x1b[2m" } else { "" };
     let dim_close = if tty { "\x1b[0m" } else { "" };
     let label = "Loaded command priors";
@@ -1167,11 +1185,18 @@ where
 /// subcommands (one summary at a time, no first-run framing).
 fn print_import_summary(summaries: &[shac::import::ImportSummary]) {
     let tty = std::io::stdout().is_terminal();
-    let check = if tty { "\x1b[32m\u{2713}\x1b[0m" } else { "\u{2713}" };
+    let check = if tty {
+        "\x1b[32m\u{2713}\x1b[0m"
+    } else {
+        "\u{2713}"
+    };
     for s in summaries {
         println!(
             "{check} {}: {} inserted, {} dup, {} redacted ({}ms)",
-            s.source, s.inserted, s.skipped_dup, s.skipped_redacted,
+            s.source,
+            s.inserted,
+            s.skipped_dup,
+            s.skipped_redacted,
             s.elapsed.as_millis()
         );
     }
@@ -1181,7 +1206,8 @@ fn import_action(paths: &AppPaths, args: ImportArgs) -> Result<()> {
     let db = shac::db::AppDb::open(&paths.db_file)?;
     match args.action {
         ImportAction::ZshHistory { path, dry_run } => {
-            let resolved = path.map(PathBuf::from)
+            let resolved = path
+                .map(PathBuf::from)
                 .or_else(shac::import::default_zsh_history_path)
                 .ok_or_else(|| anyhow::anyhow!("could not resolve zsh history path"))?;
             if dry_run {
@@ -1193,7 +1219,8 @@ fn import_action(paths: &AppPaths, args: ImportArgs) -> Result<()> {
             print_import_summary(std::slice::from_ref(&summary));
         }
         ImportAction::Zoxide { path, dry_run } => {
-            let resolved = path.map(PathBuf::from)
+            let resolved = path
+                .map(PathBuf::from)
                 .or_else(shac::import::default_zoxide_path)
                 .ok_or_else(|| anyhow::anyhow!("could not resolve zoxide path"))?;
             if dry_run {
@@ -1272,12 +1299,12 @@ fn uninstall_rc_block(shell: ShellKind) -> Result<()> {
 fn managed_rc_block(shell: ShellKind, shell_file: &Path) -> String {
     let path = shell_escape(&shell_file.to_string_lossy());
     match shell {
-        ShellKind::Fish => format!(
-            "{SHAC_RC_BEGIN}\nif test -f {path}\n  source {path}\nend\n{SHAC_RC_END}\n"
-        ),
-        _ => format!(
-            "{SHAC_RC_BEGIN}\nif [ -f {path} ]; then\n  source {path}\nfi\n{SHAC_RC_END}\n"
-        ),
+        ShellKind::Fish => {
+            format!("{SHAC_RC_BEGIN}\nif test -f {path}\n  source {path}\nend\n{SHAC_RC_END}\n")
+        }
+        _ => {
+            format!("{SHAC_RC_BEGIN}\nif [ -f {path} ]; then\n  source {path}\nfi\n{SHAC_RC_END}\n")
+        }
     }
 }
 
@@ -1490,7 +1517,13 @@ fn print_completion_response(response: serde_json::Value, format: &str) -> Resul
 
 fn completion_request(args: &CompletionArgs) -> CompletionRequest {
     let mut env = std::collections::HashMap::new();
-    for key in ["SHAC_NO_TIPS", "SHAC_LOCALE", "SHAC_TIPS_DEBUG"] {
+    for key in [
+        "SHAC_NO_TIPS",
+        "SHAC_LOCALE",
+        "SHAC_TIPS_DEBUG",
+        "LC_MESSAGES",
+        "LANG",
+    ] {
         if let Ok(value) = std::env::var(key) {
             env.insert(key.to_string(), value);
         }
@@ -1933,8 +1966,10 @@ mod first_run_ux_tests {
     fn first_run_line_handles_zoxide_and_project_scan() {
         let zox = ImportSummary {
             source: "zoxide",
-            seen: 156, inserted: 156,
-            skipped_dup: 0, skipped_redacted: 0,
+            seen: 156,
+            inserted: 156,
+            skipped_dup: 0,
+            skipped_redacted: 0,
             elapsed: Duration::from_millis(100),
         };
         let (label, detail) = first_run_line(&zox);
@@ -1943,8 +1978,10 @@ mod first_run_ux_tests {
 
         let scan = ImportSummary {
             source: "project_scan",
-            seen: 23, inserted: 23,
-            skipped_dup: 0, skipped_redacted: 0,
+            seen: 23,
+            inserted: 23,
+            skipped_dup: 0,
+            skipped_redacted: 0,
             elapsed: Duration::from_millis(600),
         };
         let (label, detail) = first_run_line(&scan);

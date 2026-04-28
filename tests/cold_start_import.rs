@@ -27,15 +27,13 @@ fn install_imports_history_and_zoxide() {
 
     // Stage ~/.zsh_history
     let history_path = env.home.join(".zsh_history");
-    let history_contents = ": 1700000000:0;ls -al\n: 1700000010:0;cd /tmp\n: 1700000020:0;echo hi\n";
+    let history_contents =
+        ": 1700000000:0;ls -al\n: 1700000010:0;cd /tmp\n: 1700000020:0;echo hi\n";
     fs::write(&history_path, history_contents).expect("write history");
 
     // Stage zoxide DB
     let zo_path = env.home.join(".local/share/zoxide/db.zo");
-    write_zoxide_v3_db(
-        &zo_path,
-        &[("/tmp/aaa", 4.0, 100), ("/tmp/bbb", 2.0, 200)],
-    );
+    write_zoxide_v3_db(&zo_path, &[("/tmp/aaa", 4.0, 100), ("/tmp/bbb", 2.0, 200)]);
 
     let started = Instant::now();
     let mut command = env.shac_cmd();
@@ -76,22 +74,12 @@ fn install_no_import_flag_skips_imports() {
 
     // Stage history + zoxide just like the positive case.
     let history_path = env.home.join(".zsh_history");
-    fs::write(
-        &history_path,
-        ": 1700000000:0;ls\n: 1700000001:0;cd /tmp\n",
-    )
-    .expect("write history");
+    fs::write(&history_path, ": 1700000000:0;ls\n: 1700000001:0;cd /tmp\n").expect("write history");
     let zo_path = env.home.join(".local/share/zoxide/db.zo");
     write_zoxide_v3_db(&zo_path, &[("/tmp/xxx", 3.0, 50)]);
 
     let mut command = env.shac_cmd();
-    command.args([
-        "install",
-        "--shell",
-        "zsh",
-        "--edit-rc",
-        "--no-import",
-    ]);
+    command.args(["install", "--shell", "zsh", "--edit-rc", "--no-import"]);
     let output = command.output().expect("run install");
     assert!(
         output.status.success(),

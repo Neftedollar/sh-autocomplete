@@ -57,7 +57,9 @@ pub fn run(input: &SuggestInput<'_>) -> Result<SuggestOutput> {
                 text: translator.lookup(tip.text_key),
             });
         }
-        return Ok(SuggestOutput { groups: vec![group] });
+        return Ok(SuggestOutput {
+            groups: vec![group],
+        });
     }
 
     // Probe lines: each capability has a synthetic command-line that activates its trigger.

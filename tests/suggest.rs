@@ -7,14 +7,7 @@ fn suggest_in_git_repo_lists_git_branches() {
     let cwd = env.root.join("repo");
     std::fs::create_dir_all(cwd.join(".git")).unwrap();
 
-    let out = support::run_ok(
-        &env,
-        [
-            "suggest",
-            "--cwd",
-            cwd.to_string_lossy().as_ref(),
-        ],
-    );
+    let out = support::run_ok(&env, ["suggest", "--cwd", cwd.to_string_lossy().as_ref()]);
     assert!(
         out.contains("git_branches") || out.contains("branches of this repo"),
         "expected git_branches mention, got:\n{out}"
@@ -53,8 +46,7 @@ fn suggest_json_returns_structured_output() {
         &env,
         ["suggest", "--cwd", cwd.to_string_lossy().as_ref(), "--json"],
     );
-    let parsed: serde_json::Value =
-        serde_json::from_str(out.trim()).expect("parse json");
+    let parsed: serde_json::Value = serde_json::from_str(out.trim()).expect("parse json");
     assert!(
         parsed.get("groups").is_some(),
         "expected groups field, got:\n{out}"
