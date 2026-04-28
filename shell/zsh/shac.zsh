@@ -475,6 +475,19 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
     fi
   }
 
+  function _shac_render_tip_only() {
+    [[ -z "$_shac_pending_tip_text" ]] && return 0
+    [[ -n "${SHAC_NO_TIPS:-}" ]] && return 0
+    local bullet="💡"
+    if [[ -n "${SHAC_NO_COLOR:-}" ]]; then
+      bullet="tip:"
+    fi
+    POSTDISPLAY=$'\n  '"${bullet} ${_shac_pending_tip_text}"
+    if zle; then
+      zle -R
+    fi
+  }
+
   function _shac_menu_step() {
     local delta="$1"
     local total="${#_shac_menu_item_keys[@]}"
@@ -596,6 +609,11 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
 
     local total="${#_shac_menu_item_keys[@]}"
     if (( total == 0 )); then
+      # Even with no candidates, we may have a tip to surface (notably the
+      # unknown_command and first-run greeter, both of which fire at n=0).
+      # Render the tip alone via POSTDISPLAY before falling back, so the user
+      # sees it instead of losing it.
+      _shac_render_tip_only
       _shac_fallback_complete
       return $?
     fi
