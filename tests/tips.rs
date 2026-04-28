@@ -276,3 +276,135 @@ fn unknown_command_uses_unknown_bin_field() {
     c.unknown_bin = None;
     assert!(!triggers_for_test::unknown_command(&c));
 }
+
+use shac::tips::{select, SelectInput, SessionState};
+use shac::tips::storage::TipState;
+use std::collections::{HashMap, HashSet};
+
+fn empty_state() -> HashMap<String, TipState> { HashMap::new() }
+fn empty_session() -> SessionState { SessionState::default() }
+
+#[test]
+fn select_returns_none_when_no_trigger_matches() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = PathBuf::from("/tmp/nope");
+    let cwd = tmp.path().to_path_buf();
+    let sources = vec![];
+    let context = ctx("ls -la", &cwd, &home, &sources);
+    let input = SelectInput {
+        context: &context,
+        state: &empty_state(),
+        session: &empty_session(),
+        zero_acceptance_sources: &HashSet::new(),
+        tips_per_session_max: 3,
+    };
+    assert!(select(&input).is_none());
+}
+
+#[test]
+fn select_skips_muted() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".git")).unwrap();
+    let home = PathBuf::from("/tmp/nope");
+    let cwd = tmp.path().to_path_buf();
+    let sources = vec![];
+    let context = ctx("git checkout main", &cwd, &home, &sources);
+
+    let mut state = empty_state();
+    state.insert("git_branches".into(), TipState { muted: true, ..Default::default() });
+    let input = SelectInput {
+        context: &context,
+        state: &state,
+        session: &empty_session(),
+        zero_acceptance_sources: &HashSet::new(),
+        tips_per_session_max: 3,
+    };
+    assert!(select(&input).is_none());
+}
+
+#[test]
+fn select_skips_when_session_already_saw_tip() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".git")).unwrap();
+    let cwd = tmp.path().to_path_buf();
+    let home = PathBuf::from("/tmp/nope");
+    let sources = vec![];
+    let context = ctx("git checkout main", &cwd, &home, &sources);
+
+    let mut session = empty_session();
+    session.shown_this_session.insert("git_branches".into());
+    let input = SelectInput {
+        context: &context,
+        state: &empty_state(),
+        session: &session,
+        zero_acceptance_sources: &HashSet::new(),
+        tips_per_session_max: 3,
+    };
+    assert!(select(&input).is_none());
+}
+
+#[test]
+fn select_caps_per_session_max() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".git")).unwrap();
+    let cwd = tmp.path().to_path_buf();
+    let home = PathBuf::from("/tmp/nope");
+    let sources = vec![];
+    let context = ctx("git checkout main", &cwd, &home, &sources);
+
+    let mut session = empty_session();
+    session.shown_this_session.insert("a".into());
+    session.shown_this_session.insert("b".into());
+    session.shown_this_session.insert("c".into());
+    let input = SelectInput {
+        context: &context,
+        state: &empty_state(),
+        session: &session,
+        zero_acceptance_sources: &HashSet::new(),
+        tips_per_session_max: 3,
+    };
+    assert!(select(&input).is_none(), "session at max should suppress further tips");
+}
+
+#[test]
+fn select_capability_beats_explanation() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".git")).unwrap();
+    let cwd = tmp.path().to_path_buf();
+    let home = PathBuf::from("/tmp/nope");
+    let sources = vec!["transitions".to_string()];
+    let context = ctx("git checkout main", &cwd, &home, &sources);
+    let input = SelectInput {
+        context: &context,
+        state: &empty_state(),
+        session: &empty_session(),
+        zero_acceptance_sources: &HashSet::new(),
+        tips_per_session_max: 3,
+    };
+    let picked = select(&input).expect("a tip");
+    assert_eq!(picked.id, "git_branches");
+}
+
+#[test]
+fn select_prefers_zero_acceptance_within_category() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().to_path_buf();
+    std::fs::create_dir_all(home.join(".ssh")).unwrap();
+    std::fs::write(home.join(".ssh").join("config"), "Host x\n").unwrap();
+    let cwd = home.clone();
+    std::fs::write(cwd.join("package.json"), "{\"scripts\":{}}").unwrap();
+    let sources = vec![];
+    let context = ctx("ssh ", &cwd, &home, &sources);
+    let mut zero = HashSet::new();
+    zero.insert("ssh_hosts".to_string());
+
+    let input = SelectInput {
+        context: &context,
+        state: &empty_state(),
+        session: &empty_session(),
+        zero_acceptance_sources: &zero,
+        tips_per_session_max: 3,
+    };
+    let picked = select(&input).expect("a tip");
+    assert_eq!(picked.id, "ssh_hosts");
+}

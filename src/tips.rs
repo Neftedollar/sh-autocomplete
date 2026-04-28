@@ -246,3 +246,66 @@ pub mod storage {
         Ok(())
     }
 }
+
+use std::collections::{HashMap, HashSet};
+use std::time::Instant;
+
+#[derive(Debug, Default, Clone)]
+pub struct SessionState {
+    pub shown_this_session: HashSet<String>,
+    pub last_tab_at: Option<Instant>,
+}
+
+pub struct SelectInput<'a> {
+    pub context: &'a Context<'a>,
+    pub state: &'a HashMap<String, storage::TipState>,
+    pub session: &'a SessionState,
+    pub zero_acceptance_sources: &'a HashSet<String>,
+    pub tips_per_session_max: usize,
+}
+
+pub fn select<'a>(input: &'a SelectInput<'a>) -> Option<&'static Tip> {
+    if input.session.shown_this_session.len() >= input.tips_per_session_max {
+        return None;
+    }
+    let mut candidates: Vec<&'static Tip> = catalog().iter().filter(|t| {
+        if !(t.trigger)(input.context) { return false; }
+        if input.session.shown_this_session.contains(t.id) { return false; }
+        if let Some(s) = input.state.get(t.id) {
+            if s.muted { return false; }
+            if s.shows_count >= t.max_shows { return false; }
+        }
+        true
+    }).collect();
+
+    candidates.sort_by_key(|t| {
+        let category_rank = t.category as u8;
+        let zero_acc_priority = match t.source_hint {
+            Some(src) if input.zero_acceptance_sources.contains(src) => 0u8,
+            _ => 1u8,
+        };
+        let last_shown = input.state.get(t.id).and_then(|s| s.last_shown_at).unwrap_or(0);
+        (category_rank, zero_acc_priority, last_shown)
+    });
+
+    candidates.into_iter().next()
+}
+
+#[derive(Default)]
+pub struct Runtime {
+    sessions: std::sync::Mutex<HashMap<String, SessionState>>,
+}
+
+impl Runtime {
+    pub fn session_for(&self, tty: &str) -> SessionState {
+        let map = self.sessions.lock().expect("tips runtime mutex");
+        map.get(tty).cloned().unwrap_or_default()
+    }
+
+    pub fn record_show(&self, tty: &str, tip_id: &str) {
+        let mut map = self.sessions.lock().expect("tips runtime mutex");
+        let entry = map.entry(tty.to_string()).or_default();
+        entry.shown_this_session.insert(tip_id.to_string());
+        entry.last_tab_at = Some(Instant::now());
+    }
+}
