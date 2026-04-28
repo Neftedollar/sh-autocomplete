@@ -1251,6 +1251,17 @@ fn print_completion_response(response: serde_json::Value, format: &str) -> Resul
                 sanitize_shell_field(description)
             );
         }
+        if let Some(tip) = response.get("tip").and_then(|v| v.as_object()) {
+            let id = tip.get("id").and_then(|v| v.as_str()).unwrap_or("");
+            let text = tip.get("text").and_then(|v| v.as_str()).unwrap_or("");
+            if !id.is_empty() && !text.is_empty() {
+                println!(
+                    "__shac_tip\t{}\t{}",
+                    sanitize_shell_field(id),
+                    sanitize_shell_field(text)
+                );
+            }
+        }
     } else {
         let items = response
             .get("items")
@@ -1267,12 +1278,18 @@ fn print_completion_response(response: serde_json::Value, format: &str) -> Resul
 }
 
 fn completion_request(args: &CompletionArgs) -> CompletionRequest {
+    let mut env = std::collections::HashMap::new();
+    for key in ["SHAC_NO_TIPS", "SHAC_LOCALE", "SHAC_TIPS_DEBUG"] {
+        if let Ok(value) = std::env::var(key) {
+            env.insert(key.to_string(), value);
+        }
+    }
     CompletionRequest {
         shell: args.shell.clone(),
         line: args.line.clone(),
         cursor: args.cursor,
         cwd: canonicalize_lossy(&args.cwd),
-        env: std::env::vars().collect(),
+        env,
         session: current_session_info(),
         history_hint: shac::protocol::HistoryHint {
             prev_command: args.prev_command.clone(),

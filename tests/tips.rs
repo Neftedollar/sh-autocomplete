@@ -417,3 +417,46 @@ fn config_set_show_tips_persists() {
     let out = support::run_ok(&env, ["config", "get", "ui.show_tips"]);
     assert!(out.trim().ends_with("false"), "got: {out}");
 }
+
+#[test]
+fn complete_in_git_repo_emits_tip_line() {
+    let env = support::TestEnv::new("tip-line");
+    let _daemon = env.spawn_daemon();
+    let cwd = env.root.join("repo");
+    std::fs::create_dir_all(cwd.join(".git")).unwrap();
+
+    let out = support::run_ok(
+        &env,
+        [
+            "complete", "--shell", "zsh",
+            "--line", "git checkout main",
+            "--cursor", "20",
+            "--cwd", cwd.to_string_lossy().as_ref(),
+            "--format", "shell-tsv-v2",
+        ],
+    );
+    // First call may emit greeter; either greeter or git_branches counts.
+    assert!(out.contains("__shac_tip"), "expected __shac_tip line, got:\n{out}");
+}
+
+#[test]
+fn shac_no_tips_env_suppresses_tip_line() {
+    let env = support::TestEnv::new("no-tip-env");
+    let _daemon = env.spawn_daemon();
+    let cwd = env.root.join("repo");
+    std::fs::create_dir_all(cwd.join(".git")).unwrap();
+
+    let mut cmd = env.shac_cmd();
+    cmd.env("SHAC_NO_TIPS", "1");
+    cmd.args([
+        "complete", "--shell", "zsh",
+        "--line", "git checkout main",
+        "--cursor", "20",
+        "--cwd", cwd.to_string_lossy().as_ref(),
+        "--format", "shell-tsv-v2",
+    ]);
+    let out = cmd.output().expect("run");
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(!stdout.contains("__shac_tip"), "SHAC_NO_TIPS should suppress: {stdout}");
+}
