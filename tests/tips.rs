@@ -145,3 +145,134 @@ fn reset_hard_clears_everything() {
     let state = storage::load_all(&conn).unwrap();
     assert!(state.is_empty(), "hard reset deletes all rows");
 }
+
+use std::path::PathBuf;
+use shac::tips::{Context, triggers_for_test};
+
+fn ctx<'a>(line: &'a str, cwd: &'a PathBuf, home: &'a PathBuf, sources: &'a [String]) -> Context<'a> {
+    Context {
+        line,
+        cursor: line.len(),
+        cwd: cwd.as_path(),
+        tty: "test-tty",
+        home: home.as_path(),
+        response_sources: sources,
+        has_path_jump: sources.iter().any(|s| s == "path_jump"),
+        n_candidates: sources.len(),
+        unknown_bin: None,
+    }
+}
+
+#[test]
+fn git_branches_trigger_inside_git_repo() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".git")).unwrap();
+    let home = PathBuf::from("/tmp/nope");
+    let cwd = tmp.path().to_path_buf();
+    let sources = vec![];
+    let c = ctx("git checkout ", &cwd, &home, &sources);
+    assert!(triggers_for_test::git_branches(&c));
+}
+
+#[test]
+fn git_branches_trigger_outside_git_repo() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = PathBuf::from("/tmp/nope");
+    let cwd = tmp.path().to_path_buf();
+    let sources = vec![];
+    let c = ctx("git checkout ", &cwd, &home, &sources);
+    assert!(!triggers_for_test::git_branches(&c));
+}
+
+#[test]
+fn ssh_hosts_requires_ssh_config() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().to_path_buf();
+    let cwd = home.clone();
+    let sources = vec![];
+
+    let c = ctx("ssh ", &cwd, &home, &sources);
+    assert!(!triggers_for_test::ssh_hosts(&c));
+
+    std::fs::create_dir_all(home.join(".ssh")).unwrap();
+    std::fs::write(home.join(".ssh").join("config"), "Host foo\n  HostName 1.2.3.4\n").unwrap();
+    let c = ctx("ssh ", &cwd, &home, &sources);
+    assert!(triggers_for_test::ssh_hosts(&c));
+}
+
+#[test]
+fn npm_scripts_requires_package_json_and_command() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = PathBuf::from("/tmp/nope");
+    let cwd = tmp.path().to_path_buf();
+    let sources = vec![];
+
+    let c = ctx("npm run ", &cwd, &home, &sources);
+    assert!(!triggers_for_test::npm_scripts(&c));
+
+    std::fs::write(cwd.join("package.json"), "{\"scripts\":{\"x\":\"y\"}}").unwrap();
+    let c = ctx("npm run ", &cwd, &home, &sources);
+    assert!(triggers_for_test::npm_scripts(&c));
+
+    let c = ctx("npm install ", &cwd, &home, &sources);
+    assert!(!triggers_for_test::npm_scripts(&c), "only `run` triggers");
+}
+
+#[test]
+fn make_targets_requires_makefile_or_justfile() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = PathBuf::from("/tmp/nope");
+    let cwd = tmp.path().to_path_buf();
+    let sources = vec![];
+
+    let c = ctx("make ", &cwd, &home, &sources);
+    assert!(!triggers_for_test::make_targets(&c));
+
+    std::fs::write(cwd.join("Makefile"), "all:\n").unwrap();
+    let c = ctx("make ", &cwd, &home, &sources);
+    assert!(triggers_for_test::make_targets(&c));
+}
+
+#[test]
+fn docker_trigger_matches_run_exec_rmi() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = PathBuf::from("/tmp/nope");
+    let cwd = tmp.path().to_path_buf();
+    let sources = vec![];
+    for ok in ["docker run ", "docker exec ", "docker rmi "] {
+        let c = ctx(ok, &cwd, &home, &sources);
+        assert!(triggers_for_test::docker_images(&c), "{ok} should trigger");
+    }
+    for nope in ["docker ps ", "docker logs "] {
+        let c = ctx(nope, &cwd, &home, &sources);
+        assert!(!triggers_for_test::docker_images(&c), "{nope} should not trigger");
+    }
+}
+
+#[test]
+fn transitions_trigger_uses_response_sources() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = PathBuf::from("/tmp/nope");
+    let cwd = tmp.path().to_path_buf();
+    let with = vec!["transitions".to_string()];
+    let without = vec!["history".to_string()];
+    assert!(triggers_for_test::transitions(&ctx("foo", &cwd, &home, &with)));
+    assert!(!triggers_for_test::transitions(&ctx("foo", &cwd, &home, &without)));
+    let _ = tmp;
+}
+
+#[test]
+fn unknown_command_uses_unknown_bin_field() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = PathBuf::from("/tmp/nope");
+    let cwd = tmp.path().to_path_buf();
+    let sources = vec![];
+    let mut c = ctx("kubectx ", &cwd, &home, &sources);
+    c.unknown_bin = Some("kubectx");
+    c.n_candidates = 0;
+    assert!(triggers_for_test::unknown_command(&c));
+
+    let mut c = ctx("kubectx ", &cwd, &home, &sources);
+    c.unknown_bin = None;
+    assert!(!triggers_for_test::unknown_command(&c));
+}

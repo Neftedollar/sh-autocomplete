@@ -53,19 +53,114 @@ const CATALOG: &[Tip] = &[
 mod triggers {
     use super::Context;
 
-    // All return false until Task 6 fills them in.
-    pub fn hybrid_cd(_: &Context) -> bool { false }
-    pub fn git_branches(_: &Context) -> bool { false }
-    pub fn ssh_hosts(_: &Context) -> bool { false }
-    pub fn npm_scripts(_: &Context) -> bool { false }
-    pub fn kubectl_resources(_: &Context) -> bool { false }
-    pub fn docker_images(_: &Context) -> bool { false }
-    pub fn make_targets(_: &Context) -> bool { false }
-    pub fn transitions(_: &Context) -> bool { false }
-    pub fn path_jump_cyan(_: &Context) -> bool { false }
-    pub fn unknown_command(_: &Context) -> bool { false }
-    pub fn menu_detail_verbose(_: &Context) -> bool { false }
-    pub fn tips_off(_: &Context) -> bool { false }
+    pub fn hybrid_cd(c: &Context) -> bool {
+        starts_with_token(c.line, "cd") && c.has_path_jump
+    }
+
+    pub fn git_branches(c: &Context) -> bool {
+        if !matches_subcommand(c.line, "git", &["checkout", "switch", "merge", "rebase"]) {
+            return false;
+        }
+        let mut path = c.cwd.to_path_buf();
+        loop {
+            if path.join(".git").exists() {
+                return true;
+            }
+            if !path.pop() {
+                return false;
+            }
+        }
+    }
+
+    pub fn ssh_hosts(c: &Context) -> bool {
+        if !starts_with_token(c.line, "ssh") {
+            return false;
+        }
+        let cfg = c.home.join(".ssh").join("config");
+        std::fs::metadata(&cfg).map(|m| m.len() > 0).unwrap_or(false)
+    }
+
+    pub fn npm_scripts(c: &Context) -> bool {
+        if !matches_subcommand(c.line, "npm", &["run"])
+            && !matches_subcommand(c.line, "pnpm", &["run"])
+            && !matches_subcommand(c.line, "yarn", &["run"]) {
+            return false;
+        }
+        c.cwd.join("package.json").exists()
+    }
+
+    pub fn kubectl_resources(c: &Context) -> bool {
+        if !starts_with_token(c.line, "kubectl") { return false; }
+        let rest = c.line.strip_prefix("kubectl ").unwrap_or("");
+        if rest.split_whitespace().next().is_none() { return false; }
+        if std::env::var_os("KUBECONFIG").is_some() { return true; }
+        c.home.join(".kube").join("config").exists()
+    }
+
+    pub fn docker_images(c: &Context) -> bool {
+        matches_subcommand(c.line, "docker", &["run", "exec", "rmi"])
+    }
+
+    pub fn make_targets(c: &Context) -> bool {
+        if !starts_with_token(c.line, "make") && !starts_with_token(c.line, "just") {
+            return false;
+        }
+        c.cwd.join("Makefile").exists()
+            || c.cwd.join("makefile").exists()
+            || c.cwd.join("Justfile").exists()
+            || c.cwd.join("justfile").exists()
+    }
+
+    pub fn transitions(c: &Context) -> bool {
+        c.response_sources.iter().any(|s| s == "transitions")
+    }
+
+    pub fn path_jump_cyan(c: &Context) -> bool {
+        c.has_path_jump
+    }
+
+    pub fn unknown_command(c: &Context) -> bool {
+        c.unknown_bin.is_some() && c.n_candidates == 0
+    }
+
+    pub fn menu_detail_verbose(_: &Context) -> bool {
+        // Depends on user's historical menu open count — applied at the selection layer when wired.
+        false
+    }
+
+    pub fn tips_off(_: &Context) -> bool {
+        // Depends on overall tips-shown count — applied at the selection layer when wired.
+        false
+    }
+
+    fn starts_with_token(line: &str, token: &str) -> bool {
+        let mut parts = line.split_whitespace();
+        parts.next() == Some(token)
+    }
+
+    fn matches_subcommand(line: &str, prog: &str, subs: &[&str]) -> bool {
+        let mut parts = line.split_whitespace();
+        if parts.next() != Some(prog) { return false; }
+        match parts.next() {
+            Some(sub) => subs.contains(&sub),
+            None => false,
+        }
+    }
+}
+
+/// Public test surface for the private `triggers` module.
+pub mod triggers_for_test {
+    use super::Context;
+    pub fn git_branches(c: &Context) -> bool { super::triggers::git_branches(c) }
+    pub fn ssh_hosts(c: &Context) -> bool { super::triggers::ssh_hosts(c) }
+    pub fn npm_scripts(c: &Context) -> bool { super::triggers::npm_scripts(c) }
+    pub fn make_targets(c: &Context) -> bool { super::triggers::make_targets(c) }
+    pub fn docker_images(c: &Context) -> bool { super::triggers::docker_images(c) }
+    pub fn transitions(c: &Context) -> bool { super::triggers::transitions(c) }
+    pub fn unknown_command(c: &Context) -> bool { super::triggers::unknown_command(c) }
+    pub fn hybrid_cd(c: &Context) -> bool { super::triggers::hybrid_cd(c) }
+    pub fn kubectl_resources(c: &Context) -> bool { super::triggers::kubectl_resources(c) }
+    pub fn path_jump_cyan(c: &Context) -> bool { super::triggers::path_jump_cyan(c) }
 }
 
 pub mod storage {
