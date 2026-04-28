@@ -171,6 +171,10 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
       if [[ "$line" == __shac_request_id$'\t'* ]]; then
         local -a header=("${(ps:\t:)line}")
         request_id="${header[2]:-}"
+      elif [[ "$line" == __shac_*$'\t'* ]]; then
+        # Skip any other sentinel rows (e.g. __shac_tip) — inline mode only
+        # consumes real candidate rows.
+        continue
       elif (( !found_item )); then
         local -a fields=("${(ps:\t:)line}")
         item_key="${fields[1]:-}"
@@ -184,7 +188,7 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
         --cursor "$CURSOR" \
         --cwd "$PWD" \
         --format shell-tsv-v2 \
-        2>/dev/null | head -n2
+        2>/dev/null | head -n3
     )
     (( found_item )) && [[ -n "$insert_text" ]] || return 1
     _shac_preview_buffer_for_item "$BUFFER" "$CURSOR" "$insert_text"

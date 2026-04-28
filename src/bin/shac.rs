@@ -467,14 +467,22 @@ fn run_locale(paths: &AppPaths, args: LocaleArgs) -> Result<()> {
             Ok(())
         }
         LocaleAction::DumpKeys { missing } => {
+            // For --missing <target>, build the catalog around <target> so the
+            // user's <target>.toml is merged. Otherwise resolve the active
+            // locale (only matters for the no-missing path which lists en keys).
             let cfg = AppConfig::load(paths)?;
-            let resolved = resolve_locale(
-                std::env::var("SHAC_LOCALE").ok(),
-                Some(cfg.ui.locale),
-                std::env::var("LC_MESSAGES").ok(),
-                std::env::var("LANG").ok(),
-            );
-            let catalog = Catalog::build(&paths.config_dir, &resolved.lang);
+            let lang = if let Some(target) = &missing {
+                target.clone()
+            } else {
+                resolve_locale(
+                    std::env::var("SHAC_LOCALE").ok(),
+                    Some(cfg.ui.locale),
+                    std::env::var("LC_MESSAGES").ok(),
+                    std::env::var("LANG").ok(),
+                )
+                .lang
+            };
+            let catalog = Catalog::build(&paths.config_dir, &lang);
             if let Some(target) = missing {
                 for k in catalog.missing_keys(&target) {
                     println!("{k}");
