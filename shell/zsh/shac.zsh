@@ -614,9 +614,15 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
     if (( total == 0 )); then
       # Even with no candidates, we may have a tip to surface (notably the
       # unknown_command and first-run greeter, both of which fire at n=0).
-      # Render the tip alone via POSTDISPLAY before falling back, so the user
-      # sees it instead of losing it.
-      _shac_render_tip_only
+      # Render the tip alone via POSTDISPLAY, then invoke the original
+      # completer DIRECTLY (skipping _shac_fallback_complete, which calls
+      # _shac_close_menu and clears POSTDISPLAY before the user sees the tip).
+      if [[ -n "$_shac_pending_tip_text" && -z "${SHAC_NO_TIPS:-}" ]]; then
+        _shac_render_tip_only
+        _shac_reset_menu_state
+        zle _shac_orig_expand_or_complete -- "$@"
+        return $?
+      fi
       _shac_fallback_complete
       return $?
     fi
