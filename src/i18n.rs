@@ -42,14 +42,40 @@ impl Catalog {
         let mut catalog = Self::bundled_en();
         let user_lang = config_dir.join("locales").join(format!("{lang}.toml"));
         if lang != "en" && user_lang.exists() {
-            if let Ok(raw) = fs::read_to_string(&user_lang) {
-                let _ = catalog.merge_locale(lang, &raw);
+            match fs::read_to_string(&user_lang) {
+                Ok(raw) => {
+                    if let Err(e) = catalog.merge_locale(lang, &raw) {
+                        eprintln!(
+                            "shac: failed to parse user locale {}: {e:#}",
+                            user_lang.display()
+                        );
+                    }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "shac: failed to read user locale {}: {e:#}",
+                        user_lang.display()
+                    );
+                }
             }
         }
         let user_en = config_dir.join("locales").join("en.toml");
         if user_en.exists() {
-            if let Ok(raw) = fs::read_to_string(&user_en) {
-                let _ = catalog.merge_locale("en", &raw);
+            match fs::read_to_string(&user_en) {
+                Ok(raw) => {
+                    if let Err(e) = catalog.merge_locale("en", &raw) {
+                        eprintln!(
+                            "shac: failed to parse user locale {}: {e:#}",
+                            user_en.display()
+                        );
+                    }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "shac: failed to read user locale {}: {e:#}",
+                        user_en.display()
+                    );
+                }
             }
         }
         catalog
@@ -116,6 +142,7 @@ impl Translator {
     }
 }
 
+// Inputs assumed to not contain `{...}` substrings; tip texts are bundled and trusted.
 fn interpolate(template: &str, vars: &[(&str, &str)]) -> String {
     let mut out = template.to_string();
     for (name, value) in vars {
