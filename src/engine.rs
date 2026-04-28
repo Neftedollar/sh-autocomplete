@@ -187,7 +187,7 @@ impl Engine {
         let parsed = context::parse(&req.line, req.cursor, Path::new(&req.cwd));
         let mut candidates = self.collect_candidates(&req, &parsed)?;
         if candidates.is_empty() {
-            let tip = self.maybe_pick_tip(&req, &[]);
+            let tip = self.maybe_pick_tip(&req, &[], 0);
             return Ok(CompletionResponse {
                 request_id: None,
                 items: Vec::new(),
@@ -219,8 +219,9 @@ impl Engine {
 
         items.sort_by(|left, right| cmp_score(right.item.score, left.item.score));
         items.truncate(self.config.max_results);
-        let final_items: Vec<CompletionItem> = items.iter().map(|i| i.item.clone()).collect();
-        let tip = self.maybe_pick_tip(&req, &final_items);
+        let response_sources: Vec<String> =
+            items.iter().map(|i| i.item.source.clone()).collect();
+        let tip = self.maybe_pick_tip(&req, &response_sources, items.len());
         let request_id = self.db.record_completion_request(
             &req.shell,
             &req.cwd,
@@ -388,7 +389,8 @@ impl Engine {
     fn maybe_pick_tip(
         &self,
         request: &CompletionRequest,
-        items: &[CompletionItem],
+        response_sources: &[String],
+        n_candidates: usize,
     ) -> Option<CompletionTip> {
         // SHAC_NO_TIPS env override (also gate via config).
         if request
@@ -407,8 +409,7 @@ impl Engine {
         }
 
         // First-run greeter wins over normal selection.
-        if self.config.ui.first_run_greeter && self.db.is_first_run().unwrap_or(false) {
-            let _ = self.db.mark_first_run_done();
+        if self.config.ui.first_run_greeter && self.db.try_claim_first_run().unwrap_or(false) {
             let text = self.translator().lookup("greeter.first_run");
             return Some(CompletionTip {
                 id: "__greeter__".into(),
@@ -420,9 +421,8 @@ impl Engine {
         let cwd = std::path::Path::new(&request.cwd);
         let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/"));
         let tty = request.session.tty.as_deref().unwrap_or("");
-        let response_sources: Vec<String> = items.iter().map(|i| i.source.clone()).collect();
         let has_path_jump = response_sources.iter().any(|s| s == "path_jump");
-        let unknown_bin: Option<&str> = if items.is_empty() {
+        let unknown_bin: Option<&str> = if n_candidates == 0 {
             request.line.split_whitespace().next().filter(|bin| {
                 self.db
                     .command_known(bin)
@@ -439,9 +439,9 @@ impl Engine {
             cwd,
             tty,
             home: &home,
-            response_sources: &response_sources,
+            response_sources,
             has_path_jump,
-            n_candidates: items.len(),
+            n_candidates,
             unknown_bin,
         };
 

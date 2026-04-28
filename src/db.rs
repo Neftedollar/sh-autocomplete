@@ -1316,27 +1316,18 @@ impl AppDb {
         crate::tips::storage::record_show(&self.conn, tip_id, now)
     }
 
-    pub fn is_first_run(&self) -> Result<bool> {
-        let row: Option<String> = self
+    /// Atomically claim "first run done". Returns true if this call was the first
+    /// to mark it (caller should emit the greeter); false if it was already marked.
+    pub fn try_claim_first_run(&self) -> Result<bool> {
+        let rows = self
             .conn
-            .query_row(
-                "SELECT value FROM app_meta WHERE key = 'tips_first_run_done'",
-                [],
-                |r| r.get(0),
-            )
-            .optional()?;
-        Ok(row.is_none())
-    }
-
-    pub fn mark_first_run_done(&self) -> Result<()> {
-        self.conn
             .execute(
                 "INSERT INTO app_meta(key, value) VALUES ('tips_first_run_done', '1') \
-                 ON CONFLICT(key) DO UPDATE SET value = '1'",
+                 ON CONFLICT(key) DO NOTHING",
                 [],
             )
-            .context("mark first run done")?;
-        Ok(())
+            .context("claim first run")?;
+        Ok(rows == 1)
     }
 
     pub fn command_known(&self, name: &str) -> Result<bool> {
@@ -1348,6 +1339,8 @@ impl AppDb {
         Ok(n > 0)
     }
 
+    // TODO(v0.6): wire to actual acceptance counts from completion_requests.
+    // v0.5.0 returns empty (neutral priority signal — see spec § Selection algorithm).
     pub fn zero_acceptance_sources(&self) -> Result<std::collections::HashSet<String>> {
         // v1: returns empty (soft signal not wired). Spec calls this out as deferred.
         Ok(std::collections::HashSet::new())
