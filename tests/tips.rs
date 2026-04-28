@@ -408,3 +408,12 @@ fn select_prefers_zero_acceptance_within_category() {
     let picked = select(&input).expect("a tip");
     assert_eq!(picked.id, "ssh_hosts");
 }
+
+#[test]
+fn config_set_show_tips_persists() {
+    let env = support::TestEnv::new("config-show-tips");
+    let _daemon = env.spawn_daemon();
+    support::run_ok(&env, ["config", "set", "ui.show_tips", "false"]);
+    let out = support::run_ok(&env, ["config", "get", "ui.show_tips"]);
+    assert!(out.trim().ends_with("false"), "got: {out}");
+}

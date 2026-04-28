@@ -61,10 +61,28 @@ impl Default for RankingWeights {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct UiConfig {
     pub zsh: ZshUiConfig,
+    pub show_tips: bool,
+    pub tips_per_session_max: usize,
+    pub tips_max_shows_default: u32,
+    pub first_run_greeter: bool,
+    pub locale: String,
+}
+
+impl Default for UiConfig {
+    fn default() -> Self {
+        Self {
+            zsh: ZshUiConfig::default(),
+            show_tips: true,
+            tips_per_session_max: 3,
+            tips_max_shows_default: 3,
+            first_run_greeter: true,
+            locale: String::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -215,6 +233,11 @@ impl AppConfig {
             "ui.zsh.show_description" => Some(self.ui.zsh.show_description.to_string()),
             "ui.zsh.max_description_width" => Some(self.ui.zsh.max_description_width.to_string()),
             "ui.zsh.max_items" => Some(self.ui.zsh.max_items.to_string()),
+            "ui.show_tips" => Some(self.ui.show_tips.to_string()),
+            "ui.tips_per_session_max" => Some(self.ui.tips_per_session_max.to_string()),
+            "ui.tips_max_shows_default" => Some(self.ui.tips_max_shows_default.to_string()),
+            "ui.first_run_greeter" => Some(self.ui.first_run_greeter.to_string()),
+            "ui.locale" => Some(self.ui.locale.clone()),
             _ => None,
         }
     }
@@ -256,6 +279,11 @@ impl AppConfig {
             "ui.zsh.show_description" => self.ui.zsh.show_description = parse_bool(value)?,
             "ui.zsh.max_description_width" => self.ui.zsh.max_description_width = value.parse()?,
             "ui.zsh.max_items" => self.ui.zsh.max_items = value.parse()?,
+            "ui.show_tips" => self.ui.show_tips = parse_bool(value)?,
+            "ui.tips_per_session_max" => self.ui.tips_per_session_max = value.parse()?,
+            "ui.tips_max_shows_default" => self.ui.tips_max_shows_default = value.parse()?,
+            "ui.first_run_greeter" => self.ui.first_run_greeter = parse_bool(value)?,
+            "ui.locale" => self.ui.locale = value.to_string(),
             _ => anyhow::bail!("unsupported config key: {key}"),
         }
         Ok(())
