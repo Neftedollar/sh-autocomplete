@@ -440,6 +440,26 @@ fn complete_in_git_repo_emits_tip_line() {
 }
 
 #[test]
+fn tips_mute_then_list_shows_muted() {
+    let env = support::TestEnv::new("tips-cli");
+    let _daemon = env.spawn_daemon();
+    support::run_ok(&env, ["tips", "mute", "git_branches"]);
+    let out = support::run_ok(&env, ["tips", "list", "--muted"]);
+    assert!(out.contains("git_branches"));
+    assert!(out.contains("muted"));
+}
+
+#[test]
+fn tips_reset_hard_clears_state() {
+    let env = support::TestEnv::new("tips-reset");
+    let _daemon = env.spawn_daemon();
+    support::run_ok(&env, ["tips", "mute", "git_branches"]);
+    support::run_ok(&env, ["tips", "reset", "--hard"]);
+    let out = support::run_ok(&env, ["tips", "list", "--all"]);
+    assert!(!out.contains("muted"), "expected no muted after hard reset, got:\n{out}");
+}
+
+#[test]
 fn shac_no_tips_env_suppresses_tip_line() {
     let env = support::TestEnv::new("no-tip-env");
     let _daemon = env.spawn_daemon();

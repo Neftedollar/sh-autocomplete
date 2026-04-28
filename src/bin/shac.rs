@@ -46,6 +46,33 @@ enum Commands {
     TrainModel(TrainModelArgs),
     Import(ImportArgs),
     ScanProjects(ScanProjectsArgs),
+    Tips(TipsArgs),
+}
+
+#[derive(Debug, Args)]
+struct TipsArgs {
+    #[command(subcommand)]
+    action: TipsAction,
+}
+
+#[derive(Debug, Subcommand)]
+enum TipsAction {
+    List {
+        #[arg(long)]
+        all: bool,
+        #[arg(long)]
+        muted: bool,
+    },
+    Mute {
+        id: String,
+    },
+    Unmute {
+        id: String,
+    },
+    Reset {
+        #[arg(long)]
+        hard: bool,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -333,7 +360,66 @@ fn main() -> Result<()> {
         Commands::TrainModel(args) => train_model_file(&paths, args),
         Commands::Import(args) => import_action(&paths, args),
         Commands::ScanProjects(args) => scan_projects_action(&paths, args),
+        Commands::Tips(args) => run_tips(&paths, args),
     }
+}
+
+fn run_tips(paths: &AppPaths, args: TipsArgs) -> Result<()> {
+    let conn = rusqlite::Connection::open(&paths.db_file)
+        .with_context(|| format!("open db at {:?}", paths.db_file))?;
+    match args.action {
+        TipsAction::List { all, muted } => {
+            let state = shac::tips::storage::load_all(&conn)?;
+            let catalog = shac::tips::catalog();
+            for tip in catalog {
+                let s = state.get(tip.id);
+                let is_muted = s.map(|x| x.muted).unwrap_or(false);
+                let count = s.map(|x| x.shows_count).unwrap_or(0);
+                if muted && !is_muted {
+                    continue;
+                }
+                if !all && !muted && count == 0 && !is_muted {
+                    continue;
+                }
+                let status = if is_muted { "muted" } else { "active" };
+                println!(
+                    "{:30} {:11} shows={}/{}",
+                    tip.id, status, count, tip.max_shows
+                );
+            }
+            Ok(())
+        }
+        TipsAction::Mute { id } => {
+            let now = unix_now_secs();
+            shac::tips::storage::mute(&conn, &id, now)?;
+            println!("muted: {id}");
+            Ok(())
+        }
+        TipsAction::Unmute { id } => {
+            shac::tips::storage::unmute(&conn, &id)?;
+            println!("unmuted: {id}");
+            Ok(())
+        }
+        TipsAction::Reset { hard } => {
+            shac::tips::storage::reset(&conn, hard)?;
+            println!(
+                "{}",
+                if hard {
+                    "tips state reset (hard)"
+                } else {
+                    "tips state reset (soft)"
+                }
+            );
+            Ok(())
+        }
+    }
+}
+
+fn unix_now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 fn index_action(paths: &AppPaths, action: IndexAction) -> Result<()> {
