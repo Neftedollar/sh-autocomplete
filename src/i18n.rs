@@ -44,11 +44,22 @@ fn non_empty(s: Option<String>) -> Option<String> {
     s.filter(|v| !v.trim().is_empty())
 }
 
+// TODO(v0.6+): Handle IETF BCP 47 tags like `zh-Hans-CN` more richly. Today we
+// strip everything after the first `-`/`_`/`.` separator, which discards script
+// and region subtags (e.g. `Hans` vs `Hant`). Acceptable for v0.5 since we only
+// ship language-level translations, but revisit when script-aware locales land.
 fn normalize(raw: &str) -> String {
     let lowercase = raw.to_ascii_lowercase();
     let cut = lowercase
         .split(|c: char| c == '_' || c == '.' || c == '-')
         .next()
-        .unwrap_or("en");
-    if cut.is_empty() { "en".into() } else { cut.into() }
+        .unwrap_or("");
+    if cut.is_empty() {
+        return "en".into();
+    }
+    // POSIX convention: `C` and `POSIX` mean the C/English fallback locale.
+    if cut == "c" || cut == "posix" {
+        return "en".into();
+    }
+    cut.into()
 }

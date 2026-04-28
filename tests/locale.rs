@@ -53,3 +53,15 @@ fn normalizes_locale_strings() {
     assert_eq!(resolve_locale(Some("de.UTF-8".to_string()), None, None, None).lang, "de");
     assert_eq!(resolve_locale(Some("EN".to_string()), None, None, None).lang, "en");
 }
+
+#[test]
+fn lang_c_normalizes_to_en() {
+    assert_eq!(resolve_locale(Some("C".to_string()), None, None, None).lang, "en");
+    assert_eq!(resolve_locale(Some("c".to_string()), None, None, None).lang, "en");
+}
+
+#[test]
+fn lang_posix_normalizes_to_en() {
+    assert_eq!(resolve_locale(Some("POSIX".to_string()), None, None, None).lang, "en");
+    assert_eq!(resolve_locale(Some("posix".to_string()), None, None, None).lang, "en");
+}
