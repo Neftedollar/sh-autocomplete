@@ -40,6 +40,8 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
   typeset -g _shac_inline_suffix=""
   typeset -g _shac_inline_item_key=""
   typeset -g _shac_inline_request_id=""
+  typeset -g _shac_pending_tip_id=""
+  typeset -g _shac_pending_tip_text=""
 
   if command -v shac >/dev/null 2>&1; then
     eval "$(shac shell-env --shell zsh 2>/dev/null)"
@@ -64,6 +66,8 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
     _shac_menu_kinds=()
     _shac_menu_sources=()
     _shac_menu_descriptions=()
+    _shac_pending_tip_id=""
+    _shac_pending_tip_text=""
   }
 
   function _shac_set_input_provenance() {
@@ -452,6 +456,15 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
       lines+=("$line")
     done
 
+    if [[ -n "$_shac_pending_tip_text" && -z "${SHAC_NO_TIPS:-}" ]]; then
+      local bullet="💡"
+      if [[ -n "${SHAC_NO_COLOR:-}" ]]; then
+        bullet="tip:"
+      fi
+      lines+=("")
+      lines+=("  ${bullet} ${_shac_pending_tip_text}")
+    fi
+
     POSTDISPLAY=$'\n'"${(F)lines}"
     if zle; then
       zle -R
@@ -495,6 +508,13 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
         local -a header
         header=("${(ps:\t:)line}")
         _shac_last_request_id="${header[2]:-}"
+      elif [[ "$line" == __shac_tip$'\t'* ]]; then
+        if [[ -z "${SHAC_NO_TIPS:-}" ]]; then
+          local -a tip_fields
+          tip_fields=("${(ps:\t:)line}")
+          _shac_pending_tip_id="${tip_fields[2]:-}"
+          _shac_pending_tip_text="${tip_fields[3]:-}"
+        fi
       else
         local -a fields
         fields=("${(ps:\t:)line}")

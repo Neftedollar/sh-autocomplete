@@ -272,3 +272,56 @@ source "{script_path}"
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[test]
+fn zsh_render_menu_includes_tip_footer() {
+    if !support::command_available("zsh") {
+        eprintln!("skipping zsh function tests: zsh is unavailable");
+        return;
+    }
+
+    let manifest = env!("CARGO_MANIFEST_DIR");
+    let adapter = format!("{manifest}/shell/zsh/shac.zsh");
+    let harness = format!("{manifest}/tests/zsh_render.sh");
+    let out = std::process::Command::new("zsh")
+        .arg(&harness)
+        .arg(&adapter)
+        .arg("hello tip world")
+        .output()
+        .expect("run zsh harness");
+    assert!(
+        out.status.success(),
+        "harness failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("hello tip world"),
+        "expected tip text in POSTDISPLAY, got:\n{stdout}"
+    );
+}
+
+#[test]
+fn zsh_render_menu_skips_tip_when_no_tips_env_set() {
+    if !support::command_available("zsh") {
+        eprintln!("skipping zsh function tests: zsh is unavailable");
+        return;
+    }
+
+    let manifest = env!("CARGO_MANIFEST_DIR");
+    let adapter = format!("{manifest}/shell/zsh/shac.zsh");
+    let harness = format!("{manifest}/tests/zsh_render.sh");
+    let out = std::process::Command::new("zsh")
+        .arg(&harness)
+        .arg(&adapter)
+        .arg("hello tip world")
+        .arg("1")
+        .output()
+        .expect("run zsh harness");
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("hello tip world"),
+        "expected no tip when SHAC_NO_TIPS=1, got:\n{stdout}"
+    );
+}
