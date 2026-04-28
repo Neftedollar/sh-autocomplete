@@ -48,6 +48,7 @@ enum Commands {
     ScanProjects(ScanProjectsArgs),
     Tips(TipsArgs),
     Locale(LocaleArgs),
+    Suggest(SuggestArgs),
 }
 
 #[derive(Debug, Args)]
@@ -298,6 +299,16 @@ struct TrainingDataArgs {
 }
 
 #[derive(Debug, Args)]
+struct SuggestArgs {
+    #[arg(long, default_value = ".")]
+    cwd: String,
+    #[arg(long)]
+    all: bool,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
 struct TrainModelArgs {
     #[arg(long)]
     output: String,
@@ -385,7 +396,32 @@ fn main() -> Result<()> {
         Commands::ScanProjects(args) => scan_projects_action(&paths, args),
         Commands::Tips(args) => run_tips(&paths, args),
         Commands::Locale(args) => run_locale(&paths, args),
+        Commands::Suggest(args) => run_suggest(&paths, args),
     }
+}
+
+fn run_suggest(paths: &AppPaths, args: SuggestArgs) -> Result<()> {
+    let cwd = std::path::PathBuf::from(&args.cwd)
+        .canonicalize()
+        .unwrap_or_else(|_| std::path::PathBuf::from(&args.cwd));
+    let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/"));
+    let cfg = AppConfig::load(paths).unwrap_or_default();
+
+    let input = shac::suggest::SuggestInput {
+        cwd: &cwd,
+        home: &home,
+        config_dir: &paths.config_dir,
+        config: &cfg,
+        all: args.all,
+        accepted_sources_recent: std::collections::HashSet::new(),
+    };
+    let output = shac::suggest::run(&input)?;
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&output)?);
+    } else {
+        print!("{}", shac::suggest::render_text(&output));
+    }
+    Ok(())
 }
 
 fn run_locale(paths: &AppPaths, args: LocaleArgs) -> Result<()> {

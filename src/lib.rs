@@ -10,5 +10,6 @@ pub mod priors;
 pub mod profiles;
 pub mod protocol;
 pub mod shell;
+pub mod suggest;
 pub mod tips;
 pub mod tools;
