@@ -1306,6 +1306,53 @@ impl AppDb {
             [], |row| row.get(0))?)
     }
 
+    pub fn load_tips_state(
+        &self,
+    ) -> Result<std::collections::HashMap<String, crate::tips::storage::TipState>> {
+        crate::tips::storage::load_all(&self.conn)
+    }
+
+    pub fn record_tip_show(&self, tip_id: &str, now: i64) -> Result<()> {
+        crate::tips::storage::record_show(&self.conn, tip_id, now)
+    }
+
+    pub fn is_first_run(&self) -> Result<bool> {
+        let row: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT value FROM app_meta WHERE key = 'tips_first_run_done'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(row.is_none())
+    }
+
+    pub fn mark_first_run_done(&self) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO app_meta(key, value) VALUES ('tips_first_run_done', '1') \
+                 ON CONFLICT(key) DO UPDATE SET value = '1'",
+                [],
+            )
+            .context("mark first run done")?;
+        Ok(())
+    }
+
+    pub fn command_known(&self, name: &str) -> Result<bool> {
+        let n: i64 = self.conn.query_row(
+            "SELECT count(*) FROM commands WHERE name = ?1",
+            params![name],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
+    pub fn zero_acceptance_sources(&self) -> Result<std::collections::HashSet<String>> {
+        // v1: returns empty (soft signal not wired). Spec calls this out as deferred.
+        Ok(std::collections::HashSet::new())
+    }
+
     pub fn reset_personalization(&self) -> Result<()> {
         self.conn.execute_batch(
             r#"

@@ -64,11 +64,19 @@ pub struct CompletionItem {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompletionTip {
+    pub id: String,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompletionResponse {
     pub request_id: Option<i64>,
     pub items: Vec<CompletionItem>,
     pub mode: String,
     pub fallback: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tip: Option<CompletionTip>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

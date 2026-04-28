@@ -116,9 +116,9 @@ use crate::db::{AppDb, LoggedCompletionItem, StoredDoc};
 use crate::indexer;
 use crate::ml::{train_model, MlModel, TrainOptions, TrainingSample};
 use crate::protocol::{
-    CompletionItem, CompletionMeta, CompletionRequest, CompletionResponse, ExplainFeature,
-    ExplainItem, ExplainResponse, MigrationStatusResponse, RecentEvent, RecordCommandRequest,
-    StatsResponse, TRUST_INTERACTIVE, TRUST_UNKNOWN,
+    CompletionItem, CompletionMeta, CompletionRequest, CompletionResponse, CompletionTip,
+    ExplainFeature, ExplainItem, ExplainResponse, MigrationStatusResponse, RecentEvent,
+    RecordCommandRequest, StatsResponse, TRUST_INTERACTIVE, TRUST_UNKNOWN,
 };
 
 #[derive(Debug, Clone)]
@@ -147,7 +147,10 @@ struct RankedCandidate {
 pub struct Engine {
     config: AppConfig,
     db: AppDb,
+    paths: AppPaths,
     ml_model: Option<MlModel>,
+    tips_runtime: crate::tips::Runtime,
+    translator_cache: std::sync::OnceLock<crate::i18n::Translator>,
 }
 
 impl Engine {
@@ -165,7 +168,10 @@ impl Engine {
         Ok(Self {
             config,
             db,
+            paths: paths.clone(),
             ml_model,
+            tips_runtime: crate::tips::Runtime::default(),
+            translator_cache: std::sync::OnceLock::new(),
         })
     }
 
@@ -181,11 +187,13 @@ impl Engine {
         let parsed = context::parse(&req.line, req.cursor, Path::new(&req.cwd));
         let mut candidates = self.collect_candidates(&req, &parsed)?;
         if candidates.is_empty() {
+            let tip = self.maybe_pick_tip(&req, &[]);
             return Ok(CompletionResponse {
                 request_id: None,
                 items: Vec::new(),
                 mode: "replace_token".to_string(),
                 fallback: true,
+                tip,
             });
         }
 
@@ -211,6 +219,8 @@ impl Engine {
 
         items.sort_by(|left, right| cmp_score(right.item.score, left.item.score));
         items.truncate(self.config.max_results);
+        let final_items: Vec<CompletionItem> = items.iter().map(|i| i.item.clone()).collect();
+        let tip = self.maybe_pick_tip(&req, &final_items);
         let request_id = self.db.record_completion_request(
             &req.shell,
             &req.cwd,
@@ -245,6 +255,7 @@ impl Engine {
             items: items.into_iter().map(|item| item.item).collect(),
             mode: "replace_token".to_string(),
             fallback: false,
+            tip,
         })
     }
 
@@ -361,6 +372,106 @@ pub fn maybe_auto_train(paths: &AppPaths) -> Result<bool> {
 }
 
 impl Engine {
+    fn translator(&self) -> &crate::i18n::Translator {
+        self.translator_cache.get_or_init(|| {
+            let resolved = crate::i18n::resolve_locale(
+                std::env::var("SHAC_LOCALE").ok(),
+                Some(self.config.ui.locale.clone()),
+                std::env::var("LC_MESSAGES").ok(),
+                std::env::var("LANG").ok(),
+            );
+            let catalog = crate::i18n::Catalog::build(&self.paths.config_dir, &resolved.lang);
+            crate::i18n::Translator::new(resolved.lang, catalog)
+        })
+    }
+
+    fn maybe_pick_tip(
+        &self,
+        request: &CompletionRequest,
+        items: &[CompletionItem],
+    ) -> Option<CompletionTip> {
+        // SHAC_NO_TIPS env override (also gate via config).
+        if request
+            .env
+            .get("SHAC_NO_TIPS")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+        {
+            return None;
+        }
+        if !self.config.ui.show_tips {
+            return None;
+        }
+        if self.config.ui.zsh.menu_detail == "minimal" {
+            return None;
+        }
+
+        // First-run greeter wins over normal selection.
+        if self.config.ui.first_run_greeter && self.db.is_first_run().unwrap_or(false) {
+            let _ = self.db.mark_first_run_done();
+            let text = self.translator().lookup("greeter.first_run");
+            return Some(CompletionTip {
+                id: "__greeter__".into(),
+                text,
+            });
+        }
+
+        // Build context.
+        let cwd = std::path::Path::new(&request.cwd);
+        let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/"));
+        let tty = request.session.tty.as_deref().unwrap_or("");
+        let response_sources: Vec<String> = items.iter().map(|i| i.source.clone()).collect();
+        let has_path_jump = response_sources.iter().any(|s| s == "path_jump");
+        let unknown_bin: Option<&str> = if items.is_empty() {
+            request.line.split_whitespace().next().filter(|bin| {
+                self.db
+                    .command_known(bin)
+                    .map(|known| !known)
+                    .unwrap_or(false)
+            })
+        } else {
+            None
+        };
+
+        let context = crate::tips::Context {
+            line: &request.line,
+            cursor: request.cursor,
+            cwd,
+            tty,
+            home: &home,
+            response_sources: &response_sources,
+            has_path_jump,
+            n_candidates: items.len(),
+            unknown_bin,
+        };
+
+        let state = self.db.load_tips_state().ok()?;
+        let session = self.tips_runtime.session_for(tty);
+        let zero_acceptance_sources = self.db.zero_acceptance_sources().unwrap_or_default();
+
+        let input = crate::tips::SelectInput {
+            context: &context,
+            state: &state,
+            session: &session,
+            zero_acceptance_sources: &zero_acceptance_sources,
+            tips_per_session_max: self.config.ui.tips_per_session_max,
+        };
+        let picked = crate::tips::select(&input)?;
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let _ = self.db.record_tip_show(picked.id, now);
+        self.tips_runtime.record_show(tty, picked.id);
+
+        let text = self.translator().lookup(picked.text_key);
+        Some(CompletionTip {
+            id: picked.id.into(),
+            text,
+        })
+    }
+
     fn collect_candidates(
         &self,
         req: &CompletionRequest,
