@@ -554,7 +554,10 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
         2>/dev/null
     )
 
-    [[ -n "$_shac_last_request_id" || ${#_shac_menu_item_keys[@]} -gt 0 ]]
+    # Treat the fetch as successful if we got ANY signal back from the daemon:
+    # a request id, candidate rows, OR a tip-only response (e.g. unknown_command
+    # and first-run greeter both return zero items + a tip line).
+    [[ -n "$_shac_last_request_id" || ${#_shac_menu_item_keys[@]} -gt 0 || -n "$_shac_pending_tip_text" ]]
   }
 
   function _shac_fallback_complete() {
