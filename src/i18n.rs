@@ -80,6 +80,51 @@ impl Catalog {
         }
         catalog
     }
+
+    /// Return all keys present in the bundled (and merged) `en` locale, sorted.
+    pub fn known_keys(&self) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .locales
+            .get("en")
+            .map(|m| m.keys().cloned().collect())
+            .unwrap_or_default();
+        out.sort();
+        out
+    }
+
+    /// Keys present in `en` but missing in `lang`. Sorted.
+    pub fn missing_keys(&self, lang: &str) -> Vec<String> {
+        let en = match self.locales.get("en") {
+            Some(m) => m,
+            None => return vec![],
+        };
+        let other = self.locales.get(lang);
+        let mut out: Vec<String> = en
+            .keys()
+            .filter(|k| other.map(|m| !m.contains_key(*k)).unwrap_or(true))
+            .cloned()
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// Locale files found at `<config_dir>/locales/*.toml` (just the language stems).
+    pub fn user_locale_files(config_dir: &std::path::Path) -> Vec<String> {
+        let dir = config_dir.join("locales");
+        let mut out = vec![];
+        if let Ok(rd) = std::fs::read_dir(&dir) {
+            for entry in rd.flatten() {
+                if let Some(name) = entry.file_name().to_str().map(|s| s.to_string()) {
+                    if let Some(stem) = name.strip_suffix(".toml") {
+                        out.push(stem.to_string());
+                    }
+                }
+            }
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
 }
 
 fn flatten(out: &mut LangMap, prefix: &str, value: &toml::Value) {

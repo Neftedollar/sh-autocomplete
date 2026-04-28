@@ -47,6 +47,29 @@ enum Commands {
     Import(ImportArgs),
     ScanProjects(ScanProjectsArgs),
     Tips(TipsArgs),
+    Locale(LocaleArgs),
+}
+
+#[derive(Debug, Args)]
+struct LocaleArgs {
+    #[command(subcommand)]
+    action: LocaleAction,
+}
+
+#[derive(Debug, Subcommand)]
+enum LocaleAction {
+    List,
+    Current,
+    Set {
+        #[arg(value_name = "LANG")]
+        lang: Option<String>,
+        #[arg(long)]
+        unset: bool,
+    },
+    DumpKeys {
+        #[arg(long)]
+        missing: Option<String>,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -361,6 +384,72 @@ fn main() -> Result<()> {
         Commands::Import(args) => import_action(&paths, args),
         Commands::ScanProjects(args) => scan_projects_action(&paths, args),
         Commands::Tips(args) => run_tips(&paths, args),
+        Commands::Locale(args) => run_locale(&paths, args),
+    }
+}
+
+fn run_locale(paths: &AppPaths, args: LocaleArgs) -> Result<()> {
+    use shac::i18n::{resolve_locale, Catalog};
+    match args.action {
+        LocaleAction::List => {
+            println!("en  (bundled)");
+            for lang in Catalog::user_locale_files(&paths.config_dir) {
+                println!("{lang}  (user)");
+            }
+            Ok(())
+        }
+        LocaleAction::Current => {
+            let cfg = AppConfig::load(paths)?;
+            let resolved = resolve_locale(
+                std::env::var("SHAC_LOCALE").ok(),
+                Some(cfg.ui.locale),
+                std::env::var("LC_MESSAGES").ok(),
+                std::env::var("LANG").ok(),
+            );
+            let source_label = match resolved.source {
+                shac::i18n::LocaleSource::Env => "SHAC_LOCALE env",
+                shac::i18n::LocaleSource::Config => "ui.locale config",
+                shac::i18n::LocaleSource::AutoLcMessages => "LC_MESSAGES env",
+                shac::i18n::LocaleSource::AutoLang => "LANG env",
+                shac::i18n::LocaleSource::Default => "default (en)",
+            };
+            println!("{} (source: {source_label})", resolved.lang);
+            Ok(())
+        }
+        LocaleAction::Set { lang, unset } => {
+            let mut cfg = AppConfig::load(paths)?;
+            if unset {
+                cfg.ui.locale = String::new();
+                cfg.save(paths)?;
+                println!("ui.locale unset (back to auto-detect)");
+            } else {
+                let lang = lang.context("locale required unless --unset")?;
+                cfg.ui.locale = lang.clone();
+                cfg.save(paths)?;
+                println!("ui.locale = {lang}");
+            }
+            Ok(())
+        }
+        LocaleAction::DumpKeys { missing } => {
+            let cfg = AppConfig::load(paths)?;
+            let resolved = resolve_locale(
+                std::env::var("SHAC_LOCALE").ok(),
+                Some(cfg.ui.locale),
+                std::env::var("LC_MESSAGES").ok(),
+                std::env::var("LANG").ok(),
+            );
+            let catalog = Catalog::build(&paths.config_dir, &resolved.lang);
+            if let Some(target) = missing {
+                for k in catalog.missing_keys(&target) {
+                    println!("{k}");
+                }
+            } else {
+                for k in catalog.known_keys() {
+                    println!("{k}");
+                }
+            }
+            Ok(())
+        }
     }
 }
 

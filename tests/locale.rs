@@ -1,3 +1,5 @@
+mod support;
+
 use shac::i18n::{resolve_locale, Catalog, LocaleSource, Translator};
 
 #[test]
@@ -104,4 +106,27 @@ fn interpolation_leaves_literal_when_placeholder_missing() {
     let translator = Translator::new_for_test("en", &Catalog::bundled_en());
     let out = translator.lookup_with("tips.unknown_command", &[]);
     assert!(out.contains("{bin}"), "missing placeholder leaves literal {{bin}}");
+}
+
+#[test]
+fn locale_current_reports_default_when_unset() {
+    let env = support::TestEnv::new("locale-current");
+    let out = support::run_ok(&env, ["locale", "current"]);
+    assert!(out.contains("en"), "expected en default, got: {out}");
+}
+
+#[test]
+fn locale_set_persists_to_config() {
+    let env = support::TestEnv::new("locale-set");
+    support::run_ok(&env, ["locale", "set", "ru"]);
+    let out = support::run_ok(&env, ["config", "get", "ui.locale"]);
+    assert!(out.contains("ru"), "expected ru in config, got:\n{out}");
+}
+
+#[test]
+fn locale_dump_keys_lists_known_keys() {
+    let env = support::TestEnv::new("locale-dump");
+    let out = support::run_ok(&env, ["locale", "dump-keys"]);
+    assert!(out.contains("tips.git_branches"));
+    assert!(out.contains("greeter.first_run"));
 }
