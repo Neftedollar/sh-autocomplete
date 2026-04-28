@@ -21,9 +21,23 @@ const MAX_DESCRIPTION_LEN: usize = 160;
 /// the system, especially on macOS where the bg indexer can spawn many at
 /// once. Skip them entirely — extracting docs requires a TTY anyway.
 const GUI_APP_DENYLIST: &[&str] = &[
-    "wish", "tkcon", "tclsh", "tkdiff", "gitk", "git-gui", "git-citool",
-    "idle", "idle3", "idle3.10", "idle3.11", "idle3.12", "idle3.13",
-    "osascript", "open", "Wish", "Wish.app",
+    "wish",
+    "tkcon",
+    "tclsh",
+    "tkdiff",
+    "gitk",
+    "git-gui",
+    "git-citool",
+    "idle",
+    "idle3",
+    "idle3.10",
+    "idle3.11",
+    "idle3.12",
+    "idle3.13",
+    "osascript",
+    "open",
+    "Wish",
+    "Wish.app",
 ];
 
 /// Index PATH binaries into the `commands` table by name + path + mtime.
@@ -154,7 +168,13 @@ fn is_gui_app(name: &str, path: &Path) -> bool {
         let mut head = [0u8; 256];
         if let Ok(n) = f.read(&mut head) {
             let prefix = String::from_utf8_lossy(&head[..n]);
-            for needle in &["exec wish", "exec tclsh", "exec expect", "osascript", "/Wish.app"] {
+            for needle in &[
+                "exec wish",
+                "exec tclsh",
+                "exec expect",
+                "osascript",
+                "/Wish.app",
+            ] {
                 if prefix.contains(needle) {
                     return true;
                 }

@@ -26,8 +26,10 @@ impl TestDir {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        let path = std::env::temp_dir()
-            .join(format!("shac-target-{label}-{}-{nanos}", std::process::id()));
+        let path = std::env::temp_dir().join(format!(
+            "shac-target-{label}-{}-{nanos}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&path).expect("create test dir");
         Self { path }
     }
@@ -196,8 +198,14 @@ fn make_walks_up_to_project_root() {
         .filter(|i| i.kind == "build_target")
         .map(|i| i.display.as_str())
         .collect();
-    assert!(names.contains(&"build"), "build must appear from walk-up: {names:?}");
-    assert!(names.contains(&"test"), "test must appear from walk-up: {names:?}");
+    assert!(
+        names.contains(&"build"),
+        "build must appear from walk-up: {names:?}"
+    );
+    assert!(
+        names.contains(&"test"),
+        "test must appear from walk-up: {names:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -370,7 +378,11 @@ fn target_handles_malformed_files() {
     let dir = TestDir::new("target-malformed");
 
     // Malformed Makefile
-    std::fs::write(dir.path.join("Makefile"), "this is \0 not a valid \t makefile {{{}}}").expect("write");
+    std::fs::write(
+        dir.path.join("Makefile"),
+        "this is \0 not a valid \t makefile {{{}}}",
+    )
+    .expect("write");
 
     let engine = make_engine(&dir);
     let cwd = dir.path.to_string_lossy().to_string();
@@ -409,7 +421,10 @@ fn target_collector_active_prefix_filter() {
         .filter(|i| i.kind == "build_target")
         .map(|i| i.display.as_str())
         .collect();
-    assert!(names.contains(&"build"), "build must match prefix 'bu': {names:?}");
+    assert!(
+        names.contains(&"build"),
+        "build must match prefix 'bu': {names:?}"
+    );
     assert!(
         !names.contains(&"clean"),
         "clean must not match prefix 'bu': {names:?}"

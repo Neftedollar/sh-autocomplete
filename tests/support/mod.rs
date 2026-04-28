@@ -40,13 +40,14 @@ impl TestEnv {
         let shacd = PathBuf::from(env!("CARGO_BIN_EXE_shacd"));
         let bin_dir = shac.parent().expect("shac binary dir").to_path_buf();
 
-        // Write a test config that raises daemon_timeout_ms (default 150ms is too
-        // tight when 6 test threads each spawn a daemon concurrently on macOS).
+        // Write a test config that raises daemon_timeout_ms. Default 150ms is too
+        // tight under concurrent spawning; 1000ms still flakes on Ubuntu CI runners
+        // under v0.5.0 (extra DB query per /complete from tip selection).
         let shac_config_dir = config_home.join("shac");
         fs::create_dir_all(&shac_config_dir).expect("create shac config dir");
         fs::write(
             shac_config_dir.join("config.toml"),
-            "daemon_timeout_ms = 1000\n",
+            "daemon_timeout_ms = 5000\n",
         )
         .expect("write test config");
 

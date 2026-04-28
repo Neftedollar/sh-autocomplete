@@ -51,163 +51,259 @@ pub struct CommandProfile {
 /// `PLAN-cold-start-and-hybrid-cd.md` §3.
 static PROFILES: &[CommandProfile] = &[
     // Directory-changing builtins.
-    CommandProfile { command: "cd",     default_arg: ArgType::Directory, subcommands: &[] },
-    CommandProfile { command: "pushd",  default_arg: ArgType::Directory, subcommands: &[] },
-    CommandProfile { command: "popd",   default_arg: ArgType::Directory, subcommands: &[] },
-
+    CommandProfile {
+        command: "cd",
+        default_arg: ArgType::Directory,
+        subcommands: &[],
+    },
+    CommandProfile {
+        command: "pushd",
+        default_arg: ArgType::Directory,
+        subcommands: &[],
+    },
+    CommandProfile {
+        command: "popd",
+        default_arg: ArgType::Directory,
+        subcommands: &[],
+    },
     // git: subcommand-driven, with branch- and path-level overrides.
     CommandProfile {
         command: "git",
         default_arg: ArgType::Subcommand,
         subcommands: &[
             ("checkout", ArgType::Branch),
-            ("switch",   ArgType::Branch),
-            ("branch",   ArgType::Branch),
-            ("merge",    ArgType::Branch),
-            ("rebase",   ArgType::Branch),
+            ("switch", ArgType::Branch),
+            ("branch", ArgType::Branch),
+            ("merge", ArgType::Branch),
+            ("rebase", ArgType::Branch),
             ("worktree", ArgType::Subcommand),
-            ("clone",    ArgType::Path),
-            ("add",      ArgType::Path),
-            ("rm",       ArgType::Path),
-            ("mv",       ArgType::Path),
+            ("clone", ArgType::Path),
+            ("add", ArgType::Path),
+            ("rm", ArgType::Path),
+            ("mv", ArgType::Path),
         ],
     },
-
     // Remote-host commands.
-    CommandProfile { command: "ssh",   default_arg: ArgType::Host, subcommands: &[] },
-    CommandProfile { command: "scp",   default_arg: ArgType::Path, subcommands: &[] },
-    CommandProfile { command: "mosh",  default_arg: ArgType::Host, subcommands: &[] },
-    CommandProfile { command: "rsync", default_arg: ArgType::Path, subcommands: &[] },
-
+    CommandProfile {
+        command: "ssh",
+        default_arg: ArgType::Host,
+        subcommands: &[],
+    },
+    CommandProfile {
+        command: "scp",
+        default_arg: ArgType::Path,
+        subcommands: &[],
+    },
+    CommandProfile {
+        command: "mosh",
+        default_arg: ArgType::Host,
+        subcommands: &[],
+    },
+    CommandProfile {
+        command: "rsync",
+        default_arg: ArgType::Path,
+        subcommands: &[],
+    },
     // Node package managers.
     CommandProfile {
         command: "npm",
         default_arg: ArgType::Subcommand,
         subcommands: &[
-            ("run",       ArgType::Script),
-            ("install",   ArgType::None),
-            ("i",         ArgType::None),
+            ("run", ArgType::Script),
+            ("install", ArgType::None),
+            ("i", ArgType::None),
             ("uninstall", ArgType::None),
         ],
     },
     CommandProfile {
         command: "pnpm",
         default_arg: ArgType::Subcommand,
-        subcommands: &[
-            ("run",     ArgType::Script),
-            ("install", ArgType::None),
-        ],
+        subcommands: &[("run", ArgType::Script), ("install", ArgType::None)],
     },
     CommandProfile {
         command: "yarn",
         default_arg: ArgType::Subcommand,
         subcommands: &[("run", ArgType::Script)],
     },
-
     // Cluster / container tooling.
     CommandProfile {
         command: "kubectl",
         default_arg: ArgType::Subcommand,
         subcommands: &[
-            ("get",      ArgType::Resource),
+            ("get", ArgType::Resource),
             ("describe", ArgType::Resource),
-            ("delete",   ArgType::Resource),
-            ("apply",    ArgType::Path),
-            ("logs",     ArgType::Resource),
-            ("exec",     ArgType::Resource),
+            ("delete", ArgType::Resource),
+            ("apply", ArgType::Path),
+            ("logs", ArgType::Resource),
+            ("exec", ArgType::Resource),
         ],
     },
     CommandProfile {
         command: "docker",
         default_arg: ArgType::Subcommand,
         subcommands: &[
-            ("run",  ArgType::Image),
+            ("run", ArgType::Image),
             ("pull", ArgType::Image),
             ("push", ArgType::Image),
-            ("rmi",  ArgType::Image),
+            ("rmi", ArgType::Image),
             ("exec", ArgType::Resource),
         ],
     },
-
     // Rust.
     CommandProfile {
         command: "cargo",
         default_arg: ArgType::Subcommand,
         subcommands: &[
-            ("run",   ArgType::None),
-            ("test",  ArgType::None),
+            ("run", ArgType::None),
+            ("test", ArgType::None),
             ("build", ArgType::None),
         ],
     },
-
     // Task runners — treat first positional arg as a target.
-    CommandProfile { command: "make", default_arg: ArgType::Target, subcommands: &[] },
-    CommandProfile { command: "just", default_arg: ArgType::Target, subcommands: &[] },
-    CommandProfile { command: "task", default_arg: ArgType::Target, subcommands: &[] },
-
+    CommandProfile {
+        command: "make",
+        default_arg: ArgType::Target,
+        subcommands: &[],
+    },
+    CommandProfile {
+        command: "just",
+        default_arg: ArgType::Target,
+        subcommands: &[],
+    },
+    CommandProfile {
+        command: "task",
+        default_arg: ArgType::Target,
+        subcommands: &[],
+    },
     // Editors (workspace = directory or .code-workspace, etc.).
-    CommandProfile { command: "code", default_arg: ArgType::Workspace, subcommands: &[] },
-    CommandProfile { command: "subl", default_arg: ArgType::Workspace, subcommands: &[] },
-    CommandProfile { command: "idea", default_arg: ArgType::Workspace, subcommands: &[] },
-
+    CommandProfile {
+        command: "code",
+        default_arg: ArgType::Workspace,
+        subcommands: &[],
+    },
+    CommandProfile {
+        command: "subl",
+        default_arg: ArgType::Workspace,
+        subcommands: &[],
+    },
+    CommandProfile {
+        command: "idea",
+        default_arg: ArgType::Workspace,
+        subcommands: &[],
+    },
     // Terminal editors and interpreters take file paths.
-    CommandProfile { command: "nvim",    default_arg: ArgType::Path, subcommands: &[] },
-    CommandProfile { command: "vim",     default_arg: ArgType::Path, subcommands: &[] },
-    CommandProfile { command: "vi",      default_arg: ArgType::Path, subcommands: &[] },
-    CommandProfile { command: "python",  default_arg: ArgType::Path, subcommands: &[] },
-    CommandProfile { command: "python3", default_arg: ArgType::Path, subcommands: &[] },
-
+    CommandProfile {
+        command: "nvim",
+        default_arg: ArgType::Path,
+        subcommands: &[],
+    },
+    CommandProfile {
+        command: "vim",
+        default_arg: ArgType::Path,
+        subcommands: &[],
+    },
+    CommandProfile {
+        command: "vi",
+        default_arg: ArgType::Path,
+        subcommands: &[],
+    },
+    CommandProfile {
+        command: "python",
+        default_arg: ArgType::Path,
+        subcommands: &[],
+    },
+    CommandProfile {
+        command: "python3",
+        default_arg: ArgType::Path,
+        subcommands: &[],
+    },
     // Package / repo CLIs that route through a subcommand layer.
     CommandProfile {
         command: "brew",
         default_arg: ArgType::Subcommand,
         subcommands: &[
-            ("install",   ArgType::Subcommand),
+            ("install", ArgType::Subcommand),
             ("uninstall", ArgType::Subcommand),
-            ("info",      ArgType::Subcommand),
-            ("cask",      ArgType::Subcommand),
+            ("info", ArgType::Subcommand),
+            ("cask", ArgType::Subcommand),
         ],
     },
     CommandProfile {
         command: "gh",
         default_arg: ArgType::Subcommand,
         subcommands: &[
-            ("pr",    ArgType::Subcommand),
+            ("pr", ArgType::Subcommand),
             ("issue", ArgType::Subcommand),
-            ("repo",  ArgType::Subcommand),
+            ("repo", ArgType::Subcommand),
         ],
     },
     CommandProfile {
         command: "dotnet",
         default_arg: ArgType::Subcommand,
         subcommands: &[
-            ("run",   ArgType::None),
+            ("run", ArgType::None),
             ("build", ArgType::None),
-            ("test",  ArgType::None),
-            ("add",   ArgType::Path),
-            ("new",   ArgType::Subcommand),
+            ("test", ArgType::None),
+            ("add", ArgType::Path),
+            ("new", ArgType::Subcommand),
         ],
     },
-
     // Pytest takes a file/directory path.
-    CommandProfile { command: "pytest", default_arg: ArgType::Path, subcommands: &[] },
-
+    CommandProfile {
+        command: "pytest",
+        default_arg: ArgType::Path,
+        subcommands: &[],
+    },
     // Shells invoked positionally take a script path.
-    CommandProfile { command: "bash", default_arg: ArgType::Script, subcommands: &[] },
-    CommandProfile { command: "sh",   default_arg: ArgType::Script, subcommands: &[] },
-    CommandProfile { command: "zsh",  default_arg: ArgType::Script, subcommands: &[] },
-
+    CommandProfile {
+        command: "bash",
+        default_arg: ArgType::Script,
+        subcommands: &[],
+    },
+    CommandProfile {
+        command: "sh",
+        default_arg: ArgType::Script,
+        subcommands: &[],
+    },
+    CommandProfile {
+        command: "zsh",
+        default_arg: ArgType::Script,
+        subcommands: &[],
+    },
     // Introspection commands take a command name (treated as Subcommand here —
     // engine will surface known commands).
-    CommandProfile { command: "which", default_arg: ArgType::Subcommand, subcommands: &[] },
-    CommandProfile { command: "type",  default_arg: ArgType::Subcommand, subcommands: &[] },
-    CommandProfile { command: "man",   default_arg: ArgType::Subcommand, subcommands: &[] },
-    CommandProfile { command: "help",  default_arg: ArgType::Subcommand, subcommands: &[] },
-
+    CommandProfile {
+        command: "which",
+        default_arg: ArgType::Subcommand,
+        subcommands: &[],
+    },
+    CommandProfile {
+        command: "type",
+        default_arg: ArgType::Subcommand,
+        subcommands: &[],
+    },
+    CommandProfile {
+        command: "man",
+        default_arg: ArgType::Subcommand,
+        subcommands: &[],
+    },
+    CommandProfile {
+        command: "help",
+        default_arg: ArgType::Subcommand,
+        subcommands: &[],
+    },
     // Multiplexers / cloud CLIs — subcommand-first; leaving overrides empty
     // for v1 and letting the default Subcommand label catch it.
-    CommandProfile { command: "tmux", default_arg: ArgType::Subcommand, subcommands: &[] },
-    CommandProfile { command: "aws",  default_arg: ArgType::Subcommand, subcommands: &[] },
+    CommandProfile {
+        command: "tmux",
+        default_arg: ArgType::Subcommand,
+        subcommands: &[],
+    },
+    CommandProfile {
+        command: "aws",
+        default_arg: ArgType::Subcommand,
+        subcommands: &[],
+    },
 ];
 
 /// Look up a static profile for the bare command name. Returns `None` if no

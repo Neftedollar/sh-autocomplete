@@ -40,6 +40,8 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
   typeset -g _shac_inline_suffix=""
   typeset -g _shac_inline_item_key=""
   typeset -g _shac_inline_request_id=""
+  typeset -g _shac_pending_tip_id=""
+  typeset -g _shac_pending_tip_text=""
 
   if command -v shac >/dev/null 2>&1; then
     eval "$(shac shell-env --shell zsh 2>/dev/null)"
@@ -64,6 +66,8 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
     _shac_menu_kinds=()
     _shac_menu_sources=()
     _shac_menu_descriptions=()
+    _shac_pending_tip_id=""
+    _shac_pending_tip_text=""
   }
 
   function _shac_set_input_provenance() {
@@ -167,6 +171,10 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
       if [[ "$line" == __shac_request_id$'\t'* ]]; then
         local -a header=("${(ps:\t:)line}")
         request_id="${header[2]:-}"
+      elif [[ "$line" == __shac_*$'\t'* ]]; then
+        # Skip any other sentinel rows (e.g. __shac_tip) — inline mode only
+        # consumes real candidate rows.
+        continue
       elif (( !found_item )); then
         local -a fields=("${(ps:\t:)line}")
         item_key="${fields[1]:-}"
@@ -180,7 +188,7 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
         --cursor "$CURSOR" \
         --cwd "$PWD" \
         --format shell-tsv-v2 \
-        2>/dev/null | head -n2
+        2>/dev/null | head -n3
     )
     (( found_item )) && [[ -n "$insert_text" ]] || return 1
     _shac_preview_buffer_for_item "$BUFFER" "$CURSOR" "$insert_text"
@@ -452,7 +460,29 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
       lines+=("$line")
     done
 
+    if [[ -n "$_shac_pending_tip_text" && -z "${SHAC_NO_TIPS:-}" ]]; then
+      local bullet="💡"
+      if [[ -n "${SHAC_NO_COLOR:-}" ]]; then
+        bullet="tip:"
+      fi
+      lines+=("")
+      lines+=("  ${bullet} ${_shac_pending_tip_text}")
+    fi
+
     POSTDISPLAY=$'\n'"${(F)lines}"
+    if zle; then
+      zle -R
+    fi
+  }
+
+  function _shac_render_tip_only() {
+    [[ -z "$_shac_pending_tip_text" ]] && return 0
+    [[ -n "${SHAC_NO_TIPS:-}" ]] && return 0
+    local bullet="💡"
+    if [[ -n "${SHAC_NO_COLOR:-}" ]]; then
+      bullet="tip:"
+    fi
+    POSTDISPLAY=$'\n  '"${bullet} ${_shac_pending_tip_text}"
     if zle; then
       zle -R
     fi
@@ -495,6 +525,13 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
         local -a header
         header=("${(ps:\t:)line}")
         _shac_last_request_id="${header[2]:-}"
+      elif [[ "$line" == __shac_tip$'\t'* ]]; then
+        if [[ -z "${SHAC_NO_TIPS:-}" ]]; then
+          local -a tip_fields
+          tip_fields=("${(ps:\t:)line}")
+          _shac_pending_tip_id="${tip_fields[2]:-}"
+          _shac_pending_tip_text="${tip_fields[3]:-}"
+        fi
       else
         local -a fields
         fields=("${(ps:\t:)line}")
@@ -517,7 +554,10 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
         2>/dev/null
     )
 
-    [[ -n "$_shac_last_request_id" || ${#_shac_menu_item_keys[@]} -gt 0 ]]
+    # Treat the fetch as successful if we got ANY signal back from the daemon:
+    # a request id, candidate rows, OR a tip-only response (e.g. unknown_command
+    # and first-run greeter both return zero items + a tip line).
+    [[ -n "$_shac_last_request_id" || ${#_shac_menu_item_keys[@]} -gt 0 || -n "$_shac_pending_tip_text" ]]
   }
 
   function _shac_fallback_complete() {
@@ -572,6 +612,11 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
 
     local total="${#_shac_menu_item_keys[@]}"
     if (( total == 0 )); then
+      # Even with no candidates, we may have a tip to surface (notably the
+      # unknown_command and first-run greeter, both of which fire at n=0).
+      # Render the tip alone via POSTDISPLAY before falling back, so the user
+      # sees it instead of losing it.
+      _shac_render_tip_only
       _shac_fallback_complete
       return $?
     fi

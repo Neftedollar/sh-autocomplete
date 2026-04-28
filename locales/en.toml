@@ -1,0 +1,22 @@
+[tips]
+hybrid_cd        = "cd <Tab> works from anywhere — global frecent paths shown with → prefix"
+git_branches     = "branches of this repo are pulled automatically"
+ssh_hosts        = "hosts from ~/.ssh/config — partial match filters live"
+npm_scripts      = "scripts from package.json"
+kubectl_resources = "cluster resources via kubectl: get/describe/logs/exec"
+docker_images    = "local images from docker daemon"
+make_targets     = "targets from Makefile/Justfile"
+transitions      = "this candidate appears because it often follows your previous command"
+path_jump_cyan   = "→ in cyan means a global frecent path, not a cwd child"
+unknown_command  = "shac doesn't know '{bin}'. Run `shac index add-command {bin}` to teach it"
+menu_detail_verbose = "more detail in menu: shac config set ui.zsh.menu_detail verbose"
+tips_off         = "tips bothering you? shac config set ui.show_tips false"
+
+[suggest]
+header_available = "shac is available in this directory:"
+header_unused    = "Not used recently:"
+header_links     = "Full feature list:"
+no_matches       = "No applicable shac features found in this directory."
+
+[greeter]
+first_run = "shac is ready. Run `shac suggest` to see what's available here. `shac config` to tune."

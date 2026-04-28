@@ -52,138 +52,567 @@ pub static PRIORS: &[Prior] = &[
     // ------------------------------------------------------------------
     // git
     // ------------------------------------------------------------------
-    Prior { command: "git", item_type: "subcommand", item_value: "status",        description: "Show working tree status" },
-    Prior { command: "git", item_type: "subcommand", item_value: "push",          description: "Update remote refs along with associated objects" },
-    Prior { command: "git", item_type: "subcommand", item_value: "pull",          description: "Fetch from and integrate with another repository" },
-    Prior { command: "git", item_type: "subcommand", item_value: "commit",        description: "Record changes to the repository" },
-    Prior { command: "git", item_type: "subcommand", item_value: "commit -m",     description: "Commit with an inline message" },
-    Prior { command: "git", item_type: "subcommand", item_value: "log",           description: "Show commit logs" },
-    Prior { command: "git", item_type: "subcommand", item_value: "log --oneline", description: "Compact one-line commit log" },
-    Prior { command: "git", item_type: "subcommand", item_value: "checkout",      description: "Switch branches or restore working tree files" },
-    Prior { command: "git", item_type: "subcommand", item_value: "switch",        description: "Switch branches" },
-    Prior { command: "git", item_type: "subcommand", item_value: "rebase",        description: "Reapply commits on top of another base tip" },
-    Prior { command: "git", item_type: "subcommand", item_value: "rebase -i",     description: "Interactive rebase" },
-    Prior { command: "git", item_type: "subcommand", item_value: "stash",         description: "Stash the changes in a dirty working directory" },
-    Prior { command: "git", item_type: "subcommand", item_value: "merge",         description: "Join two or more development histories together" },
-    Prior { command: "git", item_type: "subcommand", item_value: "diff",          description: "Show changes between commits, commit and working tree, etc." },
-    Prior { command: "git", item_type: "subcommand", item_value: "diff --stat",   description: "Diffstat summary" },
-    Prior { command: "git", item_type: "subcommand", item_value: "branch -a",     description: "List all (local + remote) branches" },
-    Prior { command: "git", item_type: "subcommand", item_value: "fetch",         description: "Download objects and refs from another repository" },
-    Prior { command: "git", item_type: "subcommand", item_value: "reset",         description: "Reset current HEAD to the specified state" },
-
+    Prior {
+        command: "git",
+        item_type: "subcommand",
+        item_value: "status",
+        description: "Show working tree status",
+    },
+    Prior {
+        command: "git",
+        item_type: "subcommand",
+        item_value: "push",
+        description: "Update remote refs along with associated objects",
+    },
+    Prior {
+        command: "git",
+        item_type: "subcommand",
+        item_value: "pull",
+        description: "Fetch from and integrate with another repository",
+    },
+    Prior {
+        command: "git",
+        item_type: "subcommand",
+        item_value: "commit",
+        description: "Record changes to the repository",
+    },
+    Prior {
+        command: "git",
+        item_type: "subcommand",
+        item_value: "commit -m",
+        description: "Commit with an inline message",
+    },
+    Prior {
+        command: "git",
+        item_type: "subcommand",
+        item_value: "log",
+        description: "Show commit logs",
+    },
+    Prior {
+        command: "git",
+        item_type: "subcommand",
+        item_value: "log --oneline",
+        description: "Compact one-line commit log",
+    },
+    Prior {
+        command: "git",
+        item_type: "subcommand",
+        item_value: "checkout",
+        description: "Switch branches or restore working tree files",
+    },
+    Prior {
+        command: "git",
+        item_type: "subcommand",
+        item_value: "switch",
+        description: "Switch branches",
+    },
+    Prior {
+        command: "git",
+        item_type: "subcommand",
+        item_value: "rebase",
+        description: "Reapply commits on top of another base tip",
+    },
+    Prior {
+        command: "git",
+        item_type: "subcommand",
+        item_value: "rebase -i",
+        description: "Interactive rebase",
+    },
+    Prior {
+        command: "git",
+        item_type: "subcommand",
+        item_value: "stash",
+        description: "Stash the changes in a dirty working directory",
+    },
+    Prior {
+        command: "git",
+        item_type: "subcommand",
+        item_value: "merge",
+        description: "Join two or more development histories together",
+    },
+    Prior {
+        command: "git",
+        item_type: "subcommand",
+        item_value: "diff",
+        description: "Show changes between commits, commit and working tree, etc.",
+    },
+    Prior {
+        command: "git",
+        item_type: "subcommand",
+        item_value: "diff --stat",
+        description: "Diffstat summary",
+    },
+    Prior {
+        command: "git",
+        item_type: "subcommand",
+        item_value: "branch -a",
+        description: "List all (local + remote) branches",
+    },
+    Prior {
+        command: "git",
+        item_type: "subcommand",
+        item_value: "fetch",
+        description: "Download objects and refs from another repository",
+    },
+    Prior {
+        command: "git",
+        item_type: "subcommand",
+        item_value: "reset",
+        description: "Reset current HEAD to the specified state",
+    },
     // ------------------------------------------------------------------
     // npm
     // ------------------------------------------------------------------
-    Prior { command: "npm", item_type: "subcommand", item_value: "install",   description: "Install a package and its dependencies" },
-    Prior { command: "npm", item_type: "subcommand", item_value: "run dev",   description: "Run the project's dev script" },
-    Prior { command: "npm", item_type: "subcommand", item_value: "run build", description: "Run the project's build script" },
-    Prior { command: "npm", item_type: "subcommand", item_value: "run test",  description: "Run the project's test script" },
-    Prior { command: "npm", item_type: "subcommand", item_value: "run lint",  description: "Run the project's lint script" },
-    Prior { command: "npm", item_type: "subcommand", item_value: "audit",     description: "Run a security audit" },
-    Prior { command: "npm", item_type: "subcommand", item_value: "ci",        description: "Clean install from package-lock.json" },
-
+    Prior {
+        command: "npm",
+        item_type: "subcommand",
+        item_value: "install",
+        description: "Install a package and its dependencies",
+    },
+    Prior {
+        command: "npm",
+        item_type: "subcommand",
+        item_value: "run dev",
+        description: "Run the project's dev script",
+    },
+    Prior {
+        command: "npm",
+        item_type: "subcommand",
+        item_value: "run build",
+        description: "Run the project's build script",
+    },
+    Prior {
+        command: "npm",
+        item_type: "subcommand",
+        item_value: "run test",
+        description: "Run the project's test script",
+    },
+    Prior {
+        command: "npm",
+        item_type: "subcommand",
+        item_value: "run lint",
+        description: "Run the project's lint script",
+    },
+    Prior {
+        command: "npm",
+        item_type: "subcommand",
+        item_value: "audit",
+        description: "Run a security audit",
+    },
+    Prior {
+        command: "npm",
+        item_type: "subcommand",
+        item_value: "ci",
+        description: "Clean install from package-lock.json",
+    },
     // ------------------------------------------------------------------
     // pnpm
     // ------------------------------------------------------------------
-    Prior { command: "pnpm", item_type: "subcommand", item_value: "install",   description: "Install dependencies" },
-    Prior { command: "pnpm", item_type: "subcommand", item_value: "run dev",   description: "Run the project's dev script" },
-    Prior { command: "pnpm", item_type: "subcommand", item_value: "run build", description: "Run the project's build script" },
-    Prior { command: "pnpm", item_type: "subcommand", item_value: "run test",  description: "Run the project's test script" },
-
+    Prior {
+        command: "pnpm",
+        item_type: "subcommand",
+        item_value: "install",
+        description: "Install dependencies",
+    },
+    Prior {
+        command: "pnpm",
+        item_type: "subcommand",
+        item_value: "run dev",
+        description: "Run the project's dev script",
+    },
+    Prior {
+        command: "pnpm",
+        item_type: "subcommand",
+        item_value: "run build",
+        description: "Run the project's build script",
+    },
+    Prior {
+        command: "pnpm",
+        item_type: "subcommand",
+        item_value: "run test",
+        description: "Run the project's test script",
+    },
     // ------------------------------------------------------------------
     // yarn
     // ------------------------------------------------------------------
-    Prior { command: "yarn", item_type: "subcommand", item_value: "install",   description: "Install dependencies" },
-    Prior { command: "yarn", item_type: "subcommand", item_value: "dev",       description: "Run the dev script" },
-    Prior { command: "yarn", item_type: "subcommand", item_value: "build",     description: "Run the build script" },
-    Prior { command: "yarn", item_type: "subcommand", item_value: "test",      description: "Run the test script" },
-
+    Prior {
+        command: "yarn",
+        item_type: "subcommand",
+        item_value: "install",
+        description: "Install dependencies",
+    },
+    Prior {
+        command: "yarn",
+        item_type: "subcommand",
+        item_value: "dev",
+        description: "Run the dev script",
+    },
+    Prior {
+        command: "yarn",
+        item_type: "subcommand",
+        item_value: "build",
+        description: "Run the build script",
+    },
+    Prior {
+        command: "yarn",
+        item_type: "subcommand",
+        item_value: "test",
+        description: "Run the test script",
+    },
     // ------------------------------------------------------------------
     // cargo
     // ------------------------------------------------------------------
-    Prior { command: "cargo", item_type: "subcommand", item_value: "build",           description: "Compile the current package" },
-    Prior { command: "cargo", item_type: "subcommand", item_value: "build --release", description: "Compile with release optimizations" },
-    Prior { command: "cargo", item_type: "subcommand", item_value: "test",            description: "Run the tests" },
-    Prior { command: "cargo", item_type: "subcommand", item_value: "run",             description: "Run a binary or example" },
-    Prior { command: "cargo", item_type: "subcommand", item_value: "check",           description: "Analyze without producing artifacts" },
-    Prior { command: "cargo", item_type: "subcommand", item_value: "clippy",          description: "Run the clippy linter" },
-    Prior { command: "cargo", item_type: "subcommand", item_value: "fmt",             description: "Format the source code" },
-    Prior { command: "cargo", item_type: "subcommand", item_value: "add",             description: "Add a dependency to Cargo.toml" },
-
+    Prior {
+        command: "cargo",
+        item_type: "subcommand",
+        item_value: "build",
+        description: "Compile the current package",
+    },
+    Prior {
+        command: "cargo",
+        item_type: "subcommand",
+        item_value: "build --release",
+        description: "Compile with release optimizations",
+    },
+    Prior {
+        command: "cargo",
+        item_type: "subcommand",
+        item_value: "test",
+        description: "Run the tests",
+    },
+    Prior {
+        command: "cargo",
+        item_type: "subcommand",
+        item_value: "run",
+        description: "Run a binary or example",
+    },
+    Prior {
+        command: "cargo",
+        item_type: "subcommand",
+        item_value: "check",
+        description: "Analyze without producing artifacts",
+    },
+    Prior {
+        command: "cargo",
+        item_type: "subcommand",
+        item_value: "clippy",
+        description: "Run the clippy linter",
+    },
+    Prior {
+        command: "cargo",
+        item_type: "subcommand",
+        item_value: "fmt",
+        description: "Format the source code",
+    },
+    Prior {
+        command: "cargo",
+        item_type: "subcommand",
+        item_value: "add",
+        description: "Add a dependency to Cargo.toml",
+    },
     // ------------------------------------------------------------------
     // docker
     // ------------------------------------------------------------------
-    Prior { command: "docker", item_type: "subcommand", item_value: "ps",            description: "List running containers" },
-    Prior { command: "docker", item_type: "subcommand", item_value: "ps -a",         description: "List all containers (running and stopped)" },
-    Prior { command: "docker", item_type: "subcommand", item_value: "images",        description: "List images" },
-    Prior { command: "docker", item_type: "subcommand", item_value: "run -it",       description: "Run a container interactively" },
-    Prior { command: "docker", item_type: "subcommand", item_value: "build -t",      description: "Build an image with a tag" },
-    Prior { command: "docker", item_type: "subcommand", item_value: "exec -it",      description: "Exec into a running container" },
-    Prior { command: "docker", item_type: "subcommand", item_value: "logs -f",       description: "Follow container logs" },
-    Prior { command: "docker", item_type: "subcommand", item_value: "compose up",    description: "Create and start compose services" },
-    Prior { command: "docker", item_type: "subcommand", item_value: "compose down",  description: "Stop and remove compose services" },
-
+    Prior {
+        command: "docker",
+        item_type: "subcommand",
+        item_value: "ps",
+        description: "List running containers",
+    },
+    Prior {
+        command: "docker",
+        item_type: "subcommand",
+        item_value: "ps -a",
+        description: "List all containers (running and stopped)",
+    },
+    Prior {
+        command: "docker",
+        item_type: "subcommand",
+        item_value: "images",
+        description: "List images",
+    },
+    Prior {
+        command: "docker",
+        item_type: "subcommand",
+        item_value: "run -it",
+        description: "Run a container interactively",
+    },
+    Prior {
+        command: "docker",
+        item_type: "subcommand",
+        item_value: "build -t",
+        description: "Build an image with a tag",
+    },
+    Prior {
+        command: "docker",
+        item_type: "subcommand",
+        item_value: "exec -it",
+        description: "Exec into a running container",
+    },
+    Prior {
+        command: "docker",
+        item_type: "subcommand",
+        item_value: "logs -f",
+        description: "Follow container logs",
+    },
+    Prior {
+        command: "docker",
+        item_type: "subcommand",
+        item_value: "compose up",
+        description: "Create and start compose services",
+    },
+    Prior {
+        command: "docker",
+        item_type: "subcommand",
+        item_value: "compose down",
+        description: "Stop and remove compose services",
+    },
     // ------------------------------------------------------------------
     // kubectl
     // ------------------------------------------------------------------
-    Prior { command: "kubectl", item_type: "subcommand", item_value: "get pods",            description: "List pods in the current namespace" },
-    Prior { command: "kubectl", item_type: "subcommand", item_value: "get svc",             description: "List services" },
-    Prior { command: "kubectl", item_type: "subcommand", item_value: "apply -f",            description: "Apply a configuration from a file" },
-    Prior { command: "kubectl", item_type: "subcommand", item_value: "describe pod",        description: "Show details of a pod" },
-    Prior { command: "kubectl", item_type: "subcommand", item_value: "logs -f",             description: "Stream logs from a pod" },
-    Prior { command: "kubectl", item_type: "subcommand", item_value: "exec -it",            description: "Exec into a running pod" },
-    Prior { command: "kubectl", item_type: "subcommand", item_value: "delete pod",          description: "Delete a pod" },
-    Prior { command: "kubectl", item_type: "subcommand", item_value: "config use-context",  description: "Switch the active kubeconfig context" },
-
+    Prior {
+        command: "kubectl",
+        item_type: "subcommand",
+        item_value: "get pods",
+        description: "List pods in the current namespace",
+    },
+    Prior {
+        command: "kubectl",
+        item_type: "subcommand",
+        item_value: "get svc",
+        description: "List services",
+    },
+    Prior {
+        command: "kubectl",
+        item_type: "subcommand",
+        item_value: "apply -f",
+        description: "Apply a configuration from a file",
+    },
+    Prior {
+        command: "kubectl",
+        item_type: "subcommand",
+        item_value: "describe pod",
+        description: "Show details of a pod",
+    },
+    Prior {
+        command: "kubectl",
+        item_type: "subcommand",
+        item_value: "logs -f",
+        description: "Stream logs from a pod",
+    },
+    Prior {
+        command: "kubectl",
+        item_type: "subcommand",
+        item_value: "exec -it",
+        description: "Exec into a running pod",
+    },
+    Prior {
+        command: "kubectl",
+        item_type: "subcommand",
+        item_value: "delete pod",
+        description: "Delete a pod",
+    },
+    Prior {
+        command: "kubectl",
+        item_type: "subcommand",
+        item_value: "config use-context",
+        description: "Switch the active kubeconfig context",
+    },
     // ------------------------------------------------------------------
     // gh
     // ------------------------------------------------------------------
-    Prior { command: "gh", item_type: "subcommand", item_value: "pr list",     description: "List pull requests in this repo" },
-    Prior { command: "gh", item_type: "subcommand", item_value: "pr view",     description: "View a pull request" },
-    Prior { command: "gh", item_type: "subcommand", item_value: "pr create",   description: "Create a pull request" },
-    Prior { command: "gh", item_type: "subcommand", item_value: "pr checkout", description: "Checkout a pull request locally" },
-    Prior { command: "gh", item_type: "subcommand", item_value: "issue list",  description: "List issues" },
-    Prior { command: "gh", item_type: "subcommand", item_value: "repo clone",  description: "Clone a repository" },
-    Prior { command: "gh", item_type: "subcommand", item_value: "repo view",   description: "View a repository" },
-
+    Prior {
+        command: "gh",
+        item_type: "subcommand",
+        item_value: "pr list",
+        description: "List pull requests in this repo",
+    },
+    Prior {
+        command: "gh",
+        item_type: "subcommand",
+        item_value: "pr view",
+        description: "View a pull request",
+    },
+    Prior {
+        command: "gh",
+        item_type: "subcommand",
+        item_value: "pr create",
+        description: "Create a pull request",
+    },
+    Prior {
+        command: "gh",
+        item_type: "subcommand",
+        item_value: "pr checkout",
+        description: "Checkout a pull request locally",
+    },
+    Prior {
+        command: "gh",
+        item_type: "subcommand",
+        item_value: "issue list",
+        description: "List issues",
+    },
+    Prior {
+        command: "gh",
+        item_type: "subcommand",
+        item_value: "repo clone",
+        description: "Clone a repository",
+    },
+    Prior {
+        command: "gh",
+        item_type: "subcommand",
+        item_value: "repo view",
+        description: "View a repository",
+    },
     // ------------------------------------------------------------------
     // brew
     // ------------------------------------------------------------------
-    Prior { command: "brew", item_type: "subcommand", item_value: "install",           description: "Install a formula or cask" },
-    Prior { command: "brew", item_type: "subcommand", item_value: "uninstall",         description: "Uninstall a formula or cask" },
-    Prior { command: "brew", item_type: "subcommand", item_value: "update",            description: "Update Homebrew itself" },
-    Prior { command: "brew", item_type: "subcommand", item_value: "upgrade",           description: "Upgrade installed formulae and casks" },
-    Prior { command: "brew", item_type: "subcommand", item_value: "list",              description: "List installed formulae" },
-    Prior { command: "brew", item_type: "subcommand", item_value: "info",              description: "Show information about a formula" },
-    Prior { command: "brew", item_type: "subcommand", item_value: "services list",     description: "List launchd-managed brew services" },
-    Prior { command: "brew", item_type: "subcommand", item_value: "services restart",  description: "Restart a brew-managed service" },
-
+    Prior {
+        command: "brew",
+        item_type: "subcommand",
+        item_value: "install",
+        description: "Install a formula or cask",
+    },
+    Prior {
+        command: "brew",
+        item_type: "subcommand",
+        item_value: "uninstall",
+        description: "Uninstall a formula or cask",
+    },
+    Prior {
+        command: "brew",
+        item_type: "subcommand",
+        item_value: "update",
+        description: "Update Homebrew itself",
+    },
+    Prior {
+        command: "brew",
+        item_type: "subcommand",
+        item_value: "upgrade",
+        description: "Upgrade installed formulae and casks",
+    },
+    Prior {
+        command: "brew",
+        item_type: "subcommand",
+        item_value: "list",
+        description: "List installed formulae",
+    },
+    Prior {
+        command: "brew",
+        item_type: "subcommand",
+        item_value: "info",
+        description: "Show information about a formula",
+    },
+    Prior {
+        command: "brew",
+        item_type: "subcommand",
+        item_value: "services list",
+        description: "List launchd-managed brew services",
+    },
+    Prior {
+        command: "brew",
+        item_type: "subcommand",
+        item_value: "services restart",
+        description: "Restart a brew-managed service",
+    },
     // ------------------------------------------------------------------
     // make
     // ------------------------------------------------------------------
-    Prior { command: "make", item_type: "subcommand", item_value: "build",   description: "Run the build target" },
-    Prior { command: "make", item_type: "subcommand", item_value: "test",    description: "Run the test target" },
-    Prior { command: "make", item_type: "subcommand", item_value: "install", description: "Run the install target" },
-    Prior { command: "make", item_type: "subcommand", item_value: "clean",   description: "Run the clean target" },
-
+    Prior {
+        command: "make",
+        item_type: "subcommand",
+        item_value: "build",
+        description: "Run the build target",
+    },
+    Prior {
+        command: "make",
+        item_type: "subcommand",
+        item_value: "test",
+        description: "Run the test target",
+    },
+    Prior {
+        command: "make",
+        item_type: "subcommand",
+        item_value: "install",
+        description: "Run the install target",
+    },
+    Prior {
+        command: "make",
+        item_type: "subcommand",
+        item_value: "clean",
+        description: "Run the clean target",
+    },
     // ------------------------------------------------------------------
     // python / python3
     // ------------------------------------------------------------------
-    Prior { command: "python",  item_type: "subcommand", item_value: "-m venv",         description: "Create a virtual environment" },
-    Prior { command: "python",  item_type: "subcommand", item_value: "-m pip install",  description: "Install a package via pip" },
-    Prior { command: "python",  item_type: "subcommand", item_value: "-m http.server",  description: "Serve the current directory over HTTP" },
-    Prior { command: "python3", item_type: "subcommand", item_value: "-m venv",         description: "Create a virtual environment" },
-    Prior { command: "python3", item_type: "subcommand", item_value: "-m pip install",  description: "Install a package via pip" },
-
+    Prior {
+        command: "python",
+        item_type: "subcommand",
+        item_value: "-m venv",
+        description: "Create a virtual environment",
+    },
+    Prior {
+        command: "python",
+        item_type: "subcommand",
+        item_value: "-m pip install",
+        description: "Install a package via pip",
+    },
+    Prior {
+        command: "python",
+        item_type: "subcommand",
+        item_value: "-m http.server",
+        description: "Serve the current directory over HTTP",
+    },
+    Prior {
+        command: "python3",
+        item_type: "subcommand",
+        item_value: "-m venv",
+        description: "Create a virtual environment",
+    },
+    Prior {
+        command: "python3",
+        item_type: "subcommand",
+        item_value: "-m pip install",
+        description: "Install a package via pip",
+    },
     // ------------------------------------------------------------------
     // pip
     // ------------------------------------------------------------------
-    Prior { command: "pip", item_type: "subcommand", item_value: "install",                  description: "Install a package" },
-    Prior { command: "pip", item_type: "subcommand", item_value: "install -e .",             description: "Install the current project in editable mode" },
-    Prior { command: "pip", item_type: "subcommand", item_value: "install -r requirements.txt", description: "Install packages from a requirements file" },
-    Prior { command: "pip", item_type: "subcommand", item_value: "freeze",                   description: "Output installed packages in requirements format" },
-    Prior { command: "pip", item_type: "subcommand", item_value: "list",                     description: "List installed packages" },
-    Prior { command: "pip", item_type: "subcommand", item_value: "uninstall",                description: "Uninstall a package" },
+    Prior {
+        command: "pip",
+        item_type: "subcommand",
+        item_value: "install",
+        description: "Install a package",
+    },
+    Prior {
+        command: "pip",
+        item_type: "subcommand",
+        item_value: "install -e .",
+        description: "Install the current project in editable mode",
+    },
+    Prior {
+        command: "pip",
+        item_type: "subcommand",
+        item_value: "install -r requirements.txt",
+        description: "Install packages from a requirements file",
+    },
+    Prior {
+        command: "pip",
+        item_type: "subcommand",
+        item_value: "freeze",
+        description: "Output installed packages in requirements format",
+    },
+    Prior {
+        command: "pip",
+        item_type: "subcommand",
+        item_value: "list",
+        description: "List installed packages",
+    },
+    Prior {
+        command: "pip",
+        item_type: "subcommand",
+        item_value: "uninstall",
+        description: "Uninstall a package",
+    },
 ];
 
 /// Number of bundled priors in the static corpus. Useful for printer output
@@ -237,7 +666,10 @@ pub fn seed_priors_into_docs_filtered<F: ToolFilter>(db: &AppDb, filter: &F) -> 
     let mut grouped: HashMap<&'static str, Vec<StoredDoc>> = HashMap::new();
     for p in PRIORS {
         if filter.has(p.command) {
-            grouped.entry(p.command).or_default().push(prior_to_stored_doc(p));
+            grouped
+                .entry(p.command)
+                .or_default()
+                .push(prior_to_stored_doc(p));
         }
     }
     let mut total = 0usize;
@@ -263,8 +695,16 @@ mod tests {
         for p in PRIORS {
             assert!(!p.command.is_empty(), "empty command in prior: {:?}", p);
             assert!(!p.item_type.is_empty(), "empty item_type in prior: {:?}", p);
-            assert!(!p.item_value.is_empty(), "empty item_value in prior: {:?}", p);
-            assert!(!p.description.is_empty(), "empty description in prior: {:?}", p);
+            assert!(
+                !p.item_value.is_empty(),
+                "empty item_value in prior: {:?}",
+                p
+            );
+            assert!(
+                !p.description.is_empty(),
+                "empty description in prior: {:?}",
+                p
+            );
             assert!(
                 p.item_type == "subcommand" || p.item_type == "option",
                 "unsupported item_type {:?} in prior: {:?}",
@@ -279,11 +719,7 @@ mod tests {
         let mut seen: HashSet<(&str, &str, &str)> = HashSet::new();
         for p in PRIORS {
             let key = (p.command, p.item_type, p.item_value);
-            assert!(
-                seen.insert(key),
-                "duplicate prior key: {:?}",
-                key
-            );
+            assert!(seen.insert(key), "duplicate prior key: {:?}", key);
         }
     }
 
@@ -330,8 +766,8 @@ mod tests {
 
     #[test]
     fn seed_priors_filtered_excludes_uninstalled() {
-        use std::collections::HashSet;
         use crate::tools::ToolDetection;
+        use std::collections::HashSet;
 
         // Detection with only "git" installed.
         let mut installed = HashSet::new();
@@ -339,8 +775,7 @@ mod tests {
         let detection = ToolDetection { installed };
 
         let db = AppDb::open(std::path::Path::new(":memory:")).expect("open in-memory db");
-        let seeded = seed_priors_into_docs_filtered(&db, &detection)
-            .expect("seed filtered priors");
+        let seeded = seed_priors_into_docs_filtered(&db, &detection).expect("seed filtered priors");
 
         // Only git priors should be seeded.
         let git_count = PRIORS.iter().filter(|p| p.command == "git").count();
@@ -352,10 +787,7 @@ mod tests {
                 continue;
             }
             let docs = db.docs_for_command(p.command).expect("docs_for_command");
-            let priors_rows: Vec<_> = docs
-                .iter()
-                .filter(|d| d.source == PRIORS_SOURCE)
-                .collect();
+            let priors_rows: Vec<_> = docs.iter().filter(|d| d.source == PRIORS_SOURCE).collect();
             assert!(
                 priors_rows.is_empty(),
                 "expected no priors rows for '{}', got {:?}",
@@ -370,8 +802,7 @@ mod tests {
         use crate::tools::AdmitAll;
 
         let db = AppDb::open(std::path::Path::new(":memory:")).expect("open in-memory db");
-        let seeded = seed_priors_into_docs_filtered(&db, &AdmitAll)
-            .expect("seed with AdmitAll");
+        let seeded = seed_priors_into_docs_filtered(&db, &AdmitAll).expect("seed with AdmitAll");
         assert_eq!(
             seeded,
             PRIORS.len(),

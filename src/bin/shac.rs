@@ -46,6 +46,57 @@ enum Commands {
     TrainModel(TrainModelArgs),
     Import(ImportArgs),
     ScanProjects(ScanProjectsArgs),
+    Tips(TipsArgs),
+    Locale(LocaleArgs),
+    Suggest(SuggestArgs),
+}
+
+#[derive(Debug, Args)]
+struct LocaleArgs {
+    #[command(subcommand)]
+    action: LocaleAction,
+}
+
+#[derive(Debug, Subcommand)]
+enum LocaleAction {
+    List,
+    Current,
+    Set {
+        #[arg(value_name = "LANG")]
+        lang: Option<String>,
+        #[arg(long)]
+        unset: bool,
+    },
+    DumpKeys {
+        #[arg(long)]
+        missing: Option<String>,
+    },
+}
+
+#[derive(Debug, Args)]
+struct TipsArgs {
+    #[command(subcommand)]
+    action: TipsAction,
+}
+
+#[derive(Debug, Subcommand)]
+enum TipsAction {
+    List {
+        #[arg(long)]
+        all: bool,
+        #[arg(long)]
+        muted: bool,
+    },
+    Mute {
+        id: String,
+    },
+    Unmute {
+        id: String,
+    },
+    Reset {
+        #[arg(long)]
+        hard: bool,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -248,6 +299,16 @@ struct TrainingDataArgs {
 }
 
 #[derive(Debug, Args)]
+struct SuggestArgs {
+    #[arg(long, default_value = ".")]
+    cwd: String,
+    #[arg(long)]
+    all: bool,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
 struct TrainModelArgs {
     #[arg(long)]
     output: String,
@@ -333,7 +394,166 @@ fn main() -> Result<()> {
         Commands::TrainModel(args) => train_model_file(&paths, args),
         Commands::Import(args) => import_action(&paths, args),
         Commands::ScanProjects(args) => scan_projects_action(&paths, args),
+        Commands::Tips(args) => run_tips(&paths, args),
+        Commands::Locale(args) => run_locale(&paths, args),
+        Commands::Suggest(args) => run_suggest(&paths, args),
     }
+}
+
+fn run_suggest(paths: &AppPaths, args: SuggestArgs) -> Result<()> {
+    let cwd = std::path::PathBuf::from(&args.cwd)
+        .canonicalize()
+        .unwrap_or_else(|_| std::path::PathBuf::from(&args.cwd));
+    let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/"));
+    let cfg = AppConfig::load(paths).unwrap_or_default();
+
+    let input = shac::suggest::SuggestInput {
+        cwd: &cwd,
+        home: &home,
+        config_dir: &paths.config_dir,
+        config: &cfg,
+        all: args.all,
+        accepted_sources_recent: std::collections::HashSet::new(),
+    };
+    let output = shac::suggest::run(&input)?;
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&output)?);
+    } else {
+        print!("{}", shac::suggest::render_text(&output));
+    }
+    Ok(())
+}
+
+fn run_locale(paths: &AppPaths, args: LocaleArgs) -> Result<()> {
+    use shac::i18n::{resolve_locale, Catalog};
+    match args.action {
+        LocaleAction::List => {
+            println!("en  (bundled)");
+            for lang in Catalog::user_locale_files(&paths.config_dir) {
+                println!("{lang}  (user)");
+            }
+            Ok(())
+        }
+        LocaleAction::Current => {
+            let cfg = AppConfig::load(paths)?;
+            let resolved = resolve_locale(
+                std::env::var("SHAC_LOCALE").ok(),
+                Some(cfg.ui.locale),
+                std::env::var("LC_MESSAGES").ok(),
+                std::env::var("LANG").ok(),
+            );
+            let source_label = match resolved.source {
+                shac::i18n::LocaleSource::Env => "SHAC_LOCALE env",
+                shac::i18n::LocaleSource::Config => "ui.locale config",
+                shac::i18n::LocaleSource::AutoLcMessages => "LC_MESSAGES env",
+                shac::i18n::LocaleSource::AutoLang => "LANG env",
+                shac::i18n::LocaleSource::Default => "default (en)",
+            };
+            println!("{} (source: {source_label})", resolved.lang);
+            Ok(())
+        }
+        LocaleAction::Set { lang, unset } => {
+            let mut cfg = AppConfig::load(paths)?;
+            if unset {
+                cfg.ui.locale = String::new();
+                cfg.save(paths)?;
+                println!("ui.locale unset (back to auto-detect)");
+            } else {
+                let lang = lang.context("locale required unless --unset")?;
+                cfg.ui.locale = lang.clone();
+                cfg.save(paths)?;
+                println!("ui.locale = {lang}");
+            }
+            Ok(())
+        }
+        LocaleAction::DumpKeys { missing } => {
+            // For --missing <target>, build the catalog around <target> so the
+            // user's <target>.toml is merged. Otherwise resolve the active
+            // locale (only matters for the no-missing path which lists en keys).
+            let cfg = AppConfig::load(paths)?;
+            let lang = if let Some(target) = &missing {
+                target.clone()
+            } else {
+                resolve_locale(
+                    std::env::var("SHAC_LOCALE").ok(),
+                    Some(cfg.ui.locale),
+                    std::env::var("LC_MESSAGES").ok(),
+                    std::env::var("LANG").ok(),
+                )
+                .lang
+            };
+            let catalog = Catalog::build(&paths.config_dir, &lang);
+            if let Some(target) = missing {
+                for k in catalog.missing_keys(&target) {
+                    println!("{k}");
+                }
+            } else {
+                for k in catalog.known_keys() {
+                    println!("{k}");
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+fn run_tips(paths: &AppPaths, args: TipsArgs) -> Result<()> {
+    let db = shac::db::AppDb::open(&paths.db_file)
+        .with_context(|| format!("open db at {:?}", paths.db_file))?;
+    let conn = db.connection();
+    match args.action {
+        TipsAction::List { all, muted } => {
+            let state = shac::tips::storage::load_all(conn)?;
+            let catalog = shac::tips::catalog();
+            for tip in catalog {
+                let s = state.get(tip.id);
+                let is_muted = s.map(|x| x.muted).unwrap_or(false);
+                let count = s.map(|x| x.shows_count).unwrap_or(0);
+                if muted && !is_muted {
+                    continue;
+                }
+                if !all && !muted && count == 0 && !is_muted {
+                    continue;
+                }
+                let status = if is_muted { "muted" } else { "active" };
+                println!(
+                    "{:30} {:11} shows={}/{}",
+                    tip.id, status, count, tip.max_shows
+                );
+            }
+            Ok(())
+        }
+        TipsAction::Mute { id } => {
+            let now = unix_now_secs();
+            shac::tips::storage::mute(conn, &id, now)?;
+            println!("muted: {id}");
+            Ok(())
+        }
+        TipsAction::Unmute { id } => {
+            shac::tips::storage::unmute(conn, &id)?;
+            println!("unmuted: {id}");
+            Ok(())
+        }
+        TipsAction::Reset { hard } => {
+            shac::tips::storage::reset(conn, hard)?;
+            println!(
+                "{}",
+                if hard {
+                    "tips state reset (hard)"
+                } else {
+                    "tips state reset (soft)"
+                }
+            );
+            Ok(())
+        }
+    }
+}
+
+fn unix_now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 fn index_action(paths: &AppPaths, action: IndexAction) -> Result<()> {
@@ -412,9 +632,15 @@ fn learning_status_check(paths: &AppPaths, config: &AppConfig) -> serde_json::Va
         .map(|s| s.accepted_clean_completions)
         .unwrap_or(0);
     let (ok, detail) = if config.features.ml_rerank {
-        (true, format!("personalized model active ({accepted} accepted completions)"))
+        (
+            true,
+            format!("personalized model active ({accepted} accepted completions)"),
+        )
     } else if accepted == 0 {
-        (false, "no accepted completions yet — press Tab a few times to start learning".to_string())
+        (
+            false,
+            "no accepted completions yet — press Tab a few times to start learning".to_string(),
+        )
     } else {
         let remaining = (50 - accepted).max(0);
         (false, format!("{accepted}/50 accepted completions — {remaining} more to activate personalized model"))
@@ -467,7 +693,10 @@ fn cold_start_checks(paths: &AppPaths) -> Vec<serde_json::Value> {
     let (ttfa_ok, ttfa_detail) = match stats.time_to_first_accept_seconds {
         Some(secs) if secs >= 0 => (true, format!("{secs}s")),
         Some(_) => (true, "negative — clock skew?".to_string()),
-        None => (false, "not yet — press Tab to accept a completion".to_string()),
+        None => (
+            false,
+            "not yet — press Tab to accept a completion".to_string(),
+        ),
     };
     checks.push(doctor_check("time_to_first_accept", ttfa_ok, ttfa_detail));
 
@@ -808,7 +1037,11 @@ fn shell_kind_to_import(shell: ShellKind) -> shac::import::ShellKind {
 /// plain colorless render and skip ANSI escape sequences.
 fn print_first_run_summary(summaries: &[shac::import::ImportSummary]) {
     let tty = std::io::stdout().is_terminal();
-    let check = if tty { "\x1b[32m\u{2713}\x1b[0m" } else { "\u{2713}" };
+    let check = if tty {
+        "\x1b[32m\u{2713}\x1b[0m"
+    } else {
+        "\u{2713}"
+    };
     let dim_open = if tty { "\x1b[2m" } else { "" };
     let dim_close = if tty { "\x1b[0m" } else { "" };
 
@@ -833,7 +1066,11 @@ fn print_first_run_summary(summaries: &[shac::import::ImportSummary]) {
 /// number of prior rows actually written (filtered to those CLIs).
 fn print_priors_seeded_line(n_detected: usize, seeded: usize) {
     let tty = std::io::stdout().is_terminal();
-    let check = if tty { "\x1b[32m\u{2713}\x1b[0m" } else { "\u{2713}" };
+    let check = if tty {
+        "\x1b[32m\u{2713}\x1b[0m"
+    } else {
+        "\u{2713}"
+    };
     let dim_open = if tty { "\x1b[2m" } else { "" };
     let dim_close = if tty { "\x1b[0m" } else { "" };
     let label = "Loaded command priors";
@@ -956,11 +1193,18 @@ where
 /// subcommands (one summary at a time, no first-run framing).
 fn print_import_summary(summaries: &[shac::import::ImportSummary]) {
     let tty = std::io::stdout().is_terminal();
-    let check = if tty { "\x1b[32m\u{2713}\x1b[0m" } else { "\u{2713}" };
+    let check = if tty {
+        "\x1b[32m\u{2713}\x1b[0m"
+    } else {
+        "\u{2713}"
+    };
     for s in summaries {
         println!(
             "{check} {}: {} inserted, {} dup, {} redacted ({}ms)",
-            s.source, s.inserted, s.skipped_dup, s.skipped_redacted,
+            s.source,
+            s.inserted,
+            s.skipped_dup,
+            s.skipped_redacted,
             s.elapsed.as_millis()
         );
     }
@@ -970,7 +1214,8 @@ fn import_action(paths: &AppPaths, args: ImportArgs) -> Result<()> {
     let db = shac::db::AppDb::open(&paths.db_file)?;
     match args.action {
         ImportAction::ZshHistory { path, dry_run } => {
-            let resolved = path.map(PathBuf::from)
+            let resolved = path
+                .map(PathBuf::from)
                 .or_else(shac::import::default_zsh_history_path)
                 .ok_or_else(|| anyhow::anyhow!("could not resolve zsh history path"))?;
             if dry_run {
@@ -982,7 +1227,8 @@ fn import_action(paths: &AppPaths, args: ImportArgs) -> Result<()> {
             print_import_summary(std::slice::from_ref(&summary));
         }
         ImportAction::Zoxide { path, dry_run } => {
-            let resolved = path.map(PathBuf::from)
+            let resolved = path
+                .map(PathBuf::from)
                 .or_else(shac::import::default_zoxide_path)
                 .ok_or_else(|| anyhow::anyhow!("could not resolve zoxide path"))?;
             if dry_run {
@@ -1061,12 +1307,12 @@ fn uninstall_rc_block(shell: ShellKind) -> Result<()> {
 fn managed_rc_block(shell: ShellKind, shell_file: &Path) -> String {
     let path = shell_escape(&shell_file.to_string_lossy());
     match shell {
-        ShellKind::Fish => format!(
-            "{SHAC_RC_BEGIN}\nif test -f {path}\n  source {path}\nend\n{SHAC_RC_END}\n"
-        ),
-        _ => format!(
-            "{SHAC_RC_BEGIN}\nif [ -f {path} ]; then\n  source {path}\nfi\n{SHAC_RC_END}\n"
-        ),
+        ShellKind::Fish => {
+            format!("{SHAC_RC_BEGIN}\nif test -f {path}\n  source {path}\nend\n{SHAC_RC_END}\n")
+        }
+        _ => {
+            format!("{SHAC_RC_BEGIN}\nif [ -f {path} ]; then\n  source {path}\nfi\n{SHAC_RC_END}\n")
+        }
     }
 }
 
@@ -1251,6 +1497,17 @@ fn print_completion_response(response: serde_json::Value, format: &str) -> Resul
                 sanitize_shell_field(description)
             );
         }
+        if let Some(tip) = response.get("tip").and_then(|v| v.as_object()) {
+            let id = tip.get("id").and_then(|v| v.as_str()).unwrap_or("");
+            let text = tip.get("text").and_then(|v| v.as_str()).unwrap_or("");
+            if !id.is_empty() && !text.is_empty() {
+                println!(
+                    "__shac_tip\t{}\t{}",
+                    sanitize_shell_field(id),
+                    sanitize_shell_field(text)
+                );
+            }
+        }
     } else {
         let items = response
             .get("items")
@@ -1267,12 +1524,24 @@ fn print_completion_response(response: serde_json::Value, format: &str) -> Resul
 }
 
 fn completion_request(args: &CompletionArgs) -> CompletionRequest {
+    let mut env = std::collections::HashMap::new();
+    for key in [
+        "SHAC_NO_TIPS",
+        "SHAC_LOCALE",
+        "SHAC_TIPS_DEBUG",
+        "LC_MESSAGES",
+        "LANG",
+    ] {
+        if let Ok(value) = std::env::var(key) {
+            env.insert(key.to_string(), value);
+        }
+    }
     CompletionRequest {
         shell: args.shell.clone(),
         line: args.line.clone(),
         cursor: args.cursor,
         cwd: canonicalize_lossy(&args.cwd),
-        env: std::env::vars().collect(),
+        env,
         session: current_session_info(),
         history_hint: shac::protocol::HistoryHint {
             prev_command: args.prev_command.clone(),
@@ -1705,8 +1974,10 @@ mod first_run_ux_tests {
     fn first_run_line_handles_zoxide_and_project_scan() {
         let zox = ImportSummary {
             source: "zoxide",
-            seen: 156, inserted: 156,
-            skipped_dup: 0, skipped_redacted: 0,
+            seen: 156,
+            inserted: 156,
+            skipped_dup: 0,
+            skipped_redacted: 0,
             elapsed: Duration::from_millis(100),
         };
         let (label, detail) = first_run_line(&zox);
@@ -1715,8 +1986,10 @@ mod first_run_ux_tests {
 
         let scan = ImportSummary {
             source: "project_scan",
-            seen: 23, inserted: 23,
-            skipped_dup: 0, skipped_redacted: 0,
+            seen: 23,
+            inserted: 23,
+            skipped_dup: 0,
+            skipped_redacted: 0,
             elapsed: Duration::from_millis(600),
         };
         let (label, detail) = first_run_line(&scan);

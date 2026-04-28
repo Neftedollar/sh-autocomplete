@@ -92,38 +92,59 @@ fn doctor_surfaces_cold_start_telemetry_checks() {
 
     // No install, no imports — but `doctor` should still produce the three
     // cold-start telemetry checks (PLAN §7.12) so the output is uniform.
-    support::run_ok(&env, ["install", "--shell", "zsh", "--edit-rc", "--no-import"]);
+    support::run_ok(
+        &env,
+        ["install", "--shell", "zsh", "--edit-rc", "--no-import"],
+    );
 
     let doctor: Value =
         serde_json::from_str(&support::run_ok(&env, ["doctor", "--json"])).expect("doctor json");
     let checks = doctor.as_array().expect("doctor checks array");
-    let names: Vec<&str> = checks
-        .iter()
-        .filter_map(|c| c["name"].as_str())
-        .collect();
+    let names: Vec<&str> = checks.iter().filter_map(|c| c["name"].as_str()).collect();
 
-    assert!(names.contains(&"cold_start_paths"), "missing cold_start_paths check: {names:?}");
-    assert!(names.contains(&"cold_start_history"), "missing cold_start_history check: {names:?}");
-    assert!(names.contains(&"time_to_first_accept"), "missing time_to_first_accept check: {names:?}");
+    assert!(
+        names.contains(&"cold_start_paths"),
+        "missing cold_start_paths check: {names:?}"
+    );
+    assert!(
+        names.contains(&"cold_start_history"),
+        "missing cold_start_history check: {names:?}"
+    );
+    assert!(
+        names.contains(&"time_to_first_accept"),
+        "missing time_to_first_accept check: {names:?}"
+    );
 
     // With --no-import + no imports recorded, all three should be `fail`
     // (zero rows / zero history / no accept yet) but the detail strings
     // must be informative, not panicky.
     let by_name = |name: &str| -> &Value {
-        checks.iter().find(|c| c["name"].as_str() == Some(name)).expect(name)
+        checks
+            .iter()
+            .find(|c| c["name"].as_str() == Some(name))
+            .expect(name)
     };
 
     let paths_check = by_name("cold_start_paths");
     assert_eq!(paths_check["ok"].as_bool(), Some(false));
-    assert!(paths_check["detail"].as_str().unwrap_or("").contains("0 entries"));
+    assert!(paths_check["detail"]
+        .as_str()
+        .unwrap_or("")
+        .contains("0 entries"));
 
     let history_check = by_name("cold_start_history");
     assert_eq!(history_check["ok"].as_bool(), Some(false));
     let history_detail = history_check["detail"].as_str().unwrap_or("");
     assert!(history_detail.contains("0 imported events"));
-    assert!(history_detail.contains("%"), "history detail should include coverage percent: {history_detail}");
+    assert!(
+        history_detail.contains("%"),
+        "history detail should include coverage percent: {history_detail}"
+    );
 
     let ttfa_check = by_name("time_to_first_accept");
     assert_eq!(ttfa_check["ok"].as_bool(), Some(false));
-    assert!(ttfa_check["detail"].as_str().unwrap_or("").contains("press Tab"));
+    assert!(ttfa_check["detail"]
+        .as_str()
+        .unwrap_or("")
+        .contains("press Tab"));
 }

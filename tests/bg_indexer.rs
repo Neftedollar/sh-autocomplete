@@ -88,7 +88,9 @@ fn bg_indexer_populates_commands_table() {
     let stub_name = "shac-bg-test-stub";
     let stub_path = stub_dir.join(stub_name);
     fs::write(&stub_path, "#!/bin/sh\necho stub\n").expect("write stub binary");
-    let mut perms = fs::metadata(&stub_path).expect("stub metadata").permissions();
+    let mut perms = fs::metadata(&stub_path)
+        .expect("stub metadata")
+        .permissions();
     perms.set_mode(0o755);
     fs::set_permissions(&stub_path, perms).expect("chmod stub binary");
 
@@ -114,11 +116,16 @@ fn bg_indexer_populates_commands_table() {
         cmd.env("PATH", &stub_path_env);
         cmd.args([
             "complete",
-            "--shell", "zsh",
-            "--line", stub_prefix,
-            "--cursor", &stub_prefix.len().to_string(),
-            "--cwd", env.root.to_string_lossy().as_ref(),
-            "--format", "json",
+            "--shell",
+            "zsh",
+            "--line",
+            stub_prefix,
+            "--cursor",
+            &stub_prefix.len().to_string(),
+            "--cwd",
+            env.root.to_string_lossy().as_ref(),
+            "--format",
+            "json",
         ]);
         if let Ok(out) = cmd.output() {
             if out.status.success() {

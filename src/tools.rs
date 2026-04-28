@@ -81,13 +81,11 @@ impl ToolFilter for AdmitAll {
 // ---------------------------------------------------------------------------
 static KNOWN_CLIS: &[&str] = &[
     // PRIORS commands
-    "git", "npm", "pnpm", "yarn", "cargo", "docker", "kubectl", "gh", "brew",
-    "make", "python", "python3", "pip",
-    // PROFILES commands (beyond PRIORS)
-    "cd", "pushd", "popd", "ssh", "scp", "mosh", "rsync", "just", "task",
-    "code", "subl", "idea", "nvim", "vim", "vi", "dotnet", "pytest", "bash",
-    "sh", "zsh", "which", "type", "man", "help", "tmux", "aws",
-    // Universal shells / tools worth checking
+    "git", "npm", "pnpm", "yarn", "cargo", "docker", "kubectl", "gh", "brew", "make", "python",
+    "python3", "pip", // PROFILES commands (beyond PRIORS)
+    "cd", "pushd", "popd", "ssh", "scp", "mosh", "rsync", "just", "task", "code", "subl", "idea",
+    "nvim", "vim", "vi", "dotnet", "pytest", "bash", "sh", "zsh", "which", "type", "man", "help",
+    "tmux", "aws", // Universal shells / tools worth checking
     "rustc", "rustup", "nvm", "ruby", "gem",
 ];
 
@@ -160,9 +158,7 @@ pub fn detect_tools_with_env(home: Option<&Path>, path_env: Option<&str>) -> Too
     }
 
     // /Applications/Visual Studio Code.app/ (macOS) or `code` already on PATH
-    if Path::new("/Applications/Visual Studio Code.app").is_dir()
-        || installed.contains("code")
-    {
+    if Path::new("/Applications/Visual Studio Code.app").is_dir() || installed.contains("code") {
         installed.insert("code".to_string());
     }
 
@@ -258,8 +254,8 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        let dir = std::env::temp_dir()
-            .join(format!("shac-tools-test-{tag}-{}-{ts}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("shac-tools-test-{tag}-{}-{ts}", std::process::id()));
         fs::create_dir_all(&dir).expect("create temp dir");
         dir
     }
