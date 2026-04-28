@@ -122,6 +122,37 @@ shac doctor         # surfaces any indexer errors
 
 Set `SHAC_BG_DISABLED=1` to suppress the background thread (useful in tests or on low-resource machines).
 
+## Discoverability
+
+shac surfaces its capabilities at the moments they apply. When you press Tab in
+a context where a feature is available (git repo + `git checkout`, `package.json`
++ `npm run`, `~/.ssh/config` + `ssh `, etc.), the completion menu shows a footer
+hint:
+
+```
+shac 1/12
+> git checkout main
+  git checkout dev
+  ...
+
+  💡 branches of this repo are pulled automatically
+```
+
+Run `shac suggest` for a context-aware list of features applicable to the current
+directory. Run `shac suggest --all` for the full catalog.
+
+Tips auto-mute after a few showings. To silence them entirely:
+
+```
+shac config set ui.show_tips false
+# or per-shell:
+export SHAC_NO_TIPS=1
+```
+
+Translations live at `locales/<lang>.toml` (bundled English by default) with a
+user-override path at `~/.config/shac/locales/<lang>.toml`. See
+`shac locale dump-keys --missing <lang>` to find untranslated keys.
+
 ## zsh menu UI
 
 The owned `zsh` menu can be tuned from config:
