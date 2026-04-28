@@ -150,7 +150,10 @@ pub struct Engine {
     paths: AppPaths,
     ml_model: Option<MlModel>,
     tips_runtime: crate::tips::Runtime,
-    catalog_cache: std::sync::OnceLock<crate::i18n::Catalog>,
+    /// Per-locale catalog cache. Built lazily on first request for each lang
+    /// (bundled `en` + user override at `<config_dir>/locales/<lang>.toml`).
+    /// Bounded by number of distinct locales seen in the daemon's lifetime.
+    catalog_cache: std::sync::Mutex<std::collections::HashMap<String, crate::i18n::Catalog>>,
 }
 
 impl Engine {
@@ -171,7 +174,7 @@ impl Engine {
             paths: paths.clone(),
             ml_model,
             tips_runtime: crate::tips::Runtime::default(),
-            catalog_cache: std::sync::OnceLock::new(),
+            catalog_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
         })
     }
 
@@ -373,17 +376,6 @@ pub fn maybe_auto_train(paths: &AppPaths) -> Result<bool> {
 
 impl Engine {
     fn translator_for(&self, request: &CompletionRequest) -> crate::i18n::Translator {
-        let catalog = self.catalog_cache.get_or_init(|| {
-            // The catalog is locale-agnostic enough for v0.5.0: only en is bundled.
-            // Future work: rebuild when user override mtime changes.
-            let resolved = crate::i18n::resolve_locale(
-                std::env::var("SHAC_LOCALE").ok(),
-                Some(self.config.ui.locale.clone()),
-                std::env::var("LC_MESSAGES").ok(),
-                std::env::var("LANG").ok(),
-            );
-            crate::i18n::Catalog::build(&self.paths.config_dir, &resolved.lang)
-        });
         let resolved = crate::i18n::resolve_locale(
             request.env.get("SHAC_LOCALE").cloned(),
             Some(self.config.ui.locale.clone()),
@@ -398,7 +390,19 @@ impl Engine {
                 .cloned()
                 .or_else(|| std::env::var("LANG").ok()),
         );
-        crate::i18n::Translator::new(resolved.lang, catalog.clone())
+        // Build (or fetch from cache) a catalog for this exact locale so
+        // user overrides at <config_dir>/locales/<lang>.toml are picked up.
+        // Future work: invalidate when override file mtime changes.
+        let catalog = {
+            let mut cache = self.catalog_cache.lock().unwrap_or_else(|e| e.into_inner());
+            cache
+                .entry(resolved.lang.clone())
+                .or_insert_with(|| {
+                    crate::i18n::Catalog::build(&self.paths.config_dir, &resolved.lang)
+                })
+                .clone()
+        };
+        crate::i18n::Translator::new(resolved.lang, catalog)
     }
 
     fn maybe_pick_tip(
