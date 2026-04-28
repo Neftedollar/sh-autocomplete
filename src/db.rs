@@ -212,6 +212,15 @@ impl AppDb {
             CREATE INDEX IF NOT EXISTS idx_paths_index_rank ON paths_index(rank DESC);
             CREATE INDEX IF NOT EXISTS idx_paths_index_last_visit ON paths_index(last_visit DESC);
 
+            CREATE TABLE IF NOT EXISTS tips_state (
+                tip_id          TEXT PRIMARY KEY,
+                shows_count     INTEGER NOT NULL DEFAULT 0,
+                last_shown_at   INTEGER,
+                muted           INTEGER NOT NULL DEFAULT 0,
+                muted_at        INTEGER,
+                first_shown_at  INTEGER
+            );
+
             CREATE TABLE IF NOT EXISTS index_targets (
                 id INTEGER PRIMARY KEY,
                 target_type TEXT NOT NULL,
