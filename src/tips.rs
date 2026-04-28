@@ -92,7 +92,7 @@ pub mod storage {
             Ok((
                 r.get::<_, String>(0)?,
                 TipState {
-                    shows_count: r.get::<_, i64>(1)? as u32,
+                    shows_count: r.get::<_, i64>(1)?.try_into().unwrap_or(0),
                     last_shown_at: r.get(2)?,
                     first_shown_at: r.get(3)?,
                     muted: r.get::<_, i64>(4)? != 0,
@@ -114,7 +114,8 @@ pub mod storage {
              VALUES (?1, 1, ?2, ?2)
              ON CONFLICT(tip_id) DO UPDATE SET
                  shows_count = shows_count + 1,
-                 last_shown_at = excluded.last_shown_at",
+                 last_shown_at = excluded.last_shown_at,
+                 first_shown_at = COALESCE(tips_state.first_shown_at, excluded.first_shown_at)",
             params![tip_id, now],
         ).context("upsert record_show")?;
         Ok(())

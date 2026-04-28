@@ -126,6 +126,17 @@ fn reset_clears_counts_but_preserves_mutes() {
 }
 
 #[test]
+fn first_shown_at_set_when_mute_precedes_record_show() {
+    let conn = test_db();
+    storage::mute(&conn, "x", 100).unwrap();
+    storage::record_show(&conn, "x", 500).unwrap();
+    let state = storage::load_all(&conn).unwrap();
+    let entry = state.get("x").expect("entry");
+    assert_eq!(entry.first_shown_at, Some(500), "first_shown_at must be set on first show even if a row already existed");
+    assert_eq!(entry.shows_count, 1);
+}
+
+#[test]
 fn reset_hard_clears_everything() {
     let conn = test_db();
     storage::record_show(&conn, "a", 1).unwrap();
