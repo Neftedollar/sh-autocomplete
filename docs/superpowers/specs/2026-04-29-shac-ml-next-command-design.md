@@ -472,6 +472,7 @@ shac ml reset-personalization              # clear ml_residual table
 - Cross-platform deterministic builds (currently maintainer pipeline assumes M1)
 - Window function: extend context beyond 8 commands when user has long shell session
 - Per-project model fine-tuning (one residual per project_root vs current cwd_bucket)
+- **Opt-in anonymized telemetry → next-gen base model.** Explicit one-command opt-in (`shac ml contribute --enable`), collects scrubbed sequences (same scrubbing rules as §"Path scrubbing", run client-side before upload), uploads to a maintainer-controlled endpoint, and feeds the next round of synthetic+real training data for the shipped model. Requires: (1) endpoint + storage infra, (2) double-scrub audit (client + server), (3) clear privacy policy doc, (4) per-OS bucketing preserved, (5) k-anonymity threshold before any sequence enters training set, (6) easy `--disable` and "delete my contributions" flow. Out of scope for v0.6.0 — design separately once we have organic install base to make the data meaningful.
 
 ## Decision log
 
