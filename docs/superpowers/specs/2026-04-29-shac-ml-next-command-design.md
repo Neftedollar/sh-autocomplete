@@ -16,7 +16,7 @@ We want a small neural network that predicts the next command given a context wi
 2. Ship as opt-in feature in v0.6.0 (`features.ml_seq_rerank=false` by default; `true` to enable).
 3. No Python at any stage — training, inference, data preparation. Pure-Rust workspace.
 4. Preserve privacy: bundled model contains no personal paths or identifiers; on-device personalization (residual) never leaves the user's machine.
-5. Keep production binary lean: bundled ONNX models ≤5MB combined, daemon RAM growth ≤50MB at load.
+5. Keep production binary lean: bundled `.bpk` models ≤5MB combined, daemon RAM growth ≤50MB at load.
 
 **Success metric:** after dogfooding for 2 weeks, Roman reports observable improvement in Tab acceptance rate (subjective) and top-3 accuracy on a held-out slice (chronological last 20% of his real shell history, never used in training) is ≥5pp above the **current scorer baseline** (existing 12-feature engine running on the same held-out, with `features.ml_seq_rerank=false`).
 
@@ -31,18 +31,18 @@ We want a small neural network that predicts the next command given a context wi
 
 ## Architecture overview
 
-Two completely separate code paths, coupled only by the bundled ONNX artifact:
+Two completely separate code paths, coupled only by the bundled `.bpk` weights and the shared model architecture (`shac_ml_train::model`):
 
 **Maintainer pipeline (offline, run by repo maintainer before release):**
 1. Generate synthetic training data via local Qwen 0.5B
 2. Scrub PII from real history corpus
 3. Distillation pass: query Qwen as teacher, save soft targets
 4. Train tiny student model with mixed (hard + soft) loss using `burn`
-5. Export ONNX, commit to repo
+5. Save trained weights as `shac-ml-{os}.bpk` (burn-native burnpack format), commit to repo
 6. Repeat per OS (darwin, linux)
 
 **Production runtime (in shipped daemon):**
-1. Bundled ONNX is loaded via `tract` at daemon start
+1. Bundled `.bpk` weights are loaded via `burn` (NdArray backend, pure-Rust CPU) at daemon start
 2. On each `/complete` request, build context features, run forward pass, get distribution over vocab
 3. For each candidate from existing scorer, look up its first-token probability in the NN distribution → `ml_seq_score` feature
 4. Blend `ml_seq_score` with the 12 existing features via the existing `RankingWeights` system
@@ -60,18 +60,18 @@ Two completely separate code paths, coupled only by the bundled ONNX artifact:
    │  scrubbed + synthetic ──▶ distill (Qwen teacher) ─▶ distill-    │
    │                                                     {os}.jsonl  │
    │                                                                 │
-   │  distill-{os} ──▶ train (burn) ──▶ shac-ml-{os}.onnx (committed)│
+   │  distill-{os} ──▶ train (burn) ──▶ shac-ml-{os}.bpk (committed) │
    │                                                                 │
    └─────────────────────────────────────────────────────────────────┘
                                      │
-                                     │ git push, ONNX bundled in shac binary
+                                     │ git push, .bpk bundled in shac binary
                                      ▼
                     PRODUCTION (in shipped daemon, sub-5ms hot path)
    ┌─────────────────────────────────────────────────────────────────┐
    │                                                                 │
    │  Tab pressed ──▶ engine.complete(req) ──▶ collect_candidates    │
    │                                                                 │
-   │                          ┌─ tract.run(model, features) ──▶ NN   │
+   │                          ┌─ burn.forward(model, features) ─▶ NN │
    │                          │   distribution over 2k vocab          │
    │                          ▼                                       │
    │  for each candidate:                                             │
@@ -97,7 +97,8 @@ shac/
 │   ├── ml/                     NEW: production ml inference module
 │   │   ├── mod.rs
 │   │   ├── feature_extractor.rs  build context features from CompletionRequest
-│   │   ├── inference.rs          tract-based ONNX inference + caching
+│   │   ├── model.rs              burn Module mirroring training crate's architecture
+│   │   ├── inference.rs          burn NdArray-backed forward pass + caching
 │   │   └── residual.rs           online residual personalization
 │   ├── engine.rs               MODIFIED: integrate ml_seq_score
 │   ├── db.rs                   MODIFIED: ml_residual table
@@ -106,16 +107,18 @@ shac/
 │   └── ...
 ├── crates/
 │   └── shac-ml-train/          NEW: maintainer-only crate
-│       ├── Cargo.toml          deps: burn, mistralrs, ndarray, anyhow
+│       ├── Cargo.toml          deps: burn (with autodiff), mistralrs, ndarray, anyhow
 │       └── src/
 │           ├── bin/
 │           │   ├── gen_synthetic.rs
 │           │   ├── scrub.rs
 │           │   ├── distill.rs
-│           │   └── train.rs
+│           │   ├── train.rs
+│           │   └── eval.rs
 │           ├── personas.rs
 │           ├── tokenizer.rs
-│           ├── model.rs        student model definition (burn)
+│           ├── model.rs        student model definition (burn) — re-exported by main shac runtime
+│           ├── data.rs         JSONL reading + batching
 │           └── lib.rs
 ├── ml/                         data + artifacts (committed to repo)
 │   ├── data/
@@ -127,8 +130,8 @@ shac/
 │   │   ├── distill-darwin.jsonl
 │   │   └── distill-linux.jsonl
 │   ├── models/
-│   │   ├── shac-ml-darwin.onnx     ~2MB, included in binary
-│   │   ├── shac-ml-linux.onnx      ~2MB, included in binary
+│   │   ├── shac-ml-darwin.bpk      ~2MB burnpack, included in binary
+│   │   ├── shac-ml-linux.bpk       ~2MB burnpack, included in binary
 │   │   ├── vocab.json              shared 2k vocab + special tokens
 │   │   └── feature-spec.json       feature schema (cwd buckets, etc.)
 │   └── README.md               training & rebuild instructions
@@ -228,24 +231,26 @@ sessions_to_generate = 200
   - Sentinels: `<UNK>`, `<EOS>`, `<PAD>`, `<BOS>`
   - Common flags as a single token-id each: `--help`, `--version`, `-h`, `-v`, `-r`, `-rf`, `-la`, `-i`, `-f`, `-y`, `-n`, `-m`, `-c`, `-p`, `-d`, `-e`, `--dry-run`, `--force`, `--no-cache`
   - The full list of fixed special tokens is enumerated in `crates/shac-ml-train/src/tokenizer.rs::SPECIAL_TOKENS` and version-pinned alongside the model
-- Save as `ml/models/vocab.json`, shipped alongside ONNX
+- Save as `ml/models/vocab.json`, shipped alongside `.bpk`
 
 ## Component: Tiny student model (`train`)
 
-**Goal:** train a small sequence model (~500k params) on distilled data, export ONNX.
+**Goal:** train a small sequence model (~580k params) on distilled data, save weights as burnpack `.bpk`.
 
 **Architecture decision:** v1 uses a small decoder-only Transformer ("mini-GPT"), not LSTM:
 - 4 layers, 4 heads, hidden dim 64, intermediate dim 128
 - Vocab embedding 2000 × 64 = 128k params
 - Each transformer block ~80k params × 4 = 320k
 - Output projection 64 × 2000 = 128k
-- Total: ~580k params, ~2.3MB FP16 ONNX
+- Total: ~580k params, ~2.3MB on disk (FP32 weights, burnpack format)
 - Context length 16 tokens (recent commands tokenized + cwd_bucket + os flag)
 
 Rationale over LSTM:
-- ONNX export from `burn` for transformers is more stable than for stateful RNNs
-- tract has optimized matmul kernels — transformer is mostly matmul → fast inference
+- Burn's `nn::transformer::TransformerEncoder` is well-tested for stateless attention; RNN cells in burn are less mature
+- NdArray backend has optimized matmul (via matrixmultiply crate) — transformer is mostly matmul → fast CPU inference
 - Modern architecture, future-proof
+
+**Module location:** the burn `Module` defining this architecture lives in `crates/shac-ml-train/src/model.rs` and is re-exported as a dependency of the main `shac` crate via `[dependencies] shac-ml-train = { path = "crates/shac-ml-train", default-features = false, features = ["model-only"] }`. The `model-only` feature gates out training-only deps (mistralrs, autodiff backend) so the runtime crate stays small.
 
 **Inputs (per training example):**
 - `tokens: [u32; 16]` — flattened (cwd_bucket, os_flag, last_8_commands_tokens, prefix_token)
@@ -270,56 +275,80 @@ T = 4.0    (temperature, sharpens/smooths soft distributions per Hinton)
 
 **Compute budget:** ~50k examples × 10 epochs / 64 batch ≈ 8000 steps. ~10-15 min on M1 CPU per OS.
 
-**ONNX export:** `burn-import-onnx` produces `shac-ml-{os}.onnx`. Validate roundtrip: load via `tract`, run on 10 test inputs, assert outputs match burn's outputs to ε=1e-4.
+**Weight export:** `burn::record::NamedMpkBytesRecorder` (via `BurnpackStore`) writes the trained `Module` to `shac-ml-{os}.bpk`. No cross-framework conversion. Validate roundtrip: re-load the saved bytes via `BurnpackStore::from_bytes`, run on 10 test inputs, assert outputs match the in-memory model to ε=1e-6 (lossless).
 
 **Output artifacts (committed):**
-- `ml/models/shac-ml-darwin.onnx`
-- `ml/models/shac-ml-linux.onnx`
+- `ml/models/shac-ml-darwin.bpk`
+- `ml/models/shac-ml-linux.bpk`
 - `ml/models/vocab.json`
-- `ml/models/feature-spec.json` (input schema versioning)
+- `ml/models/feature-spec.json` (input schema + model architecture version pinning)
 
 ## Component: Production inference (`src/ml/inference.rs`)
 
+**Backend:** `burn::backend::NdArray<f32>` — pure-Rust CPU. No autodiff needed for inference, so `NdArray` (not `Autodiff<NdArray>`) keeps the dependency surface minimal.
+
 **Loaded once at daemon start:**
 ```rust
+use burn::backend::NdArray;
+use burn::module::Module;
+use burn_store::BurnpackStore;
+use shac_ml_train::model::{StudentModel, StudentModelConfig};
+
+type B = NdArray<f32>;
+
 pub struct MlInference {
-    model: tract_onnx::prelude::SimplePlan<...>,  // tract compiled graph
-    vocab: Vocab,                                   // token <-> id
-    feature_spec: FeatureSpec,                      // OS-aware feature layout
+    model: StudentModel<B>,
+    vocab: Vocab,                  // token <-> id
+    feature_spec: FeatureSpec,     // OS-aware feature layout
+    device: <B as burn::tensor::backend::Backend>::Device,
 }
 
 impl MlInference {
     pub fn load() -> Result<Self> {
-        let bytes = if cfg!(target_os = "macos") {
-            include_bytes!("../../ml/models/shac-ml-darwin.onnx")
+        static MODEL_BYTES: &[u8] = if cfg!(target_os = "macos") {
+            include_bytes!("../../ml/models/shac-ml-darwin.bpk")
         } else if cfg!(target_os = "linux") {
-            include_bytes!("../../ml/models/shac-ml-linux.onnx")
+            include_bytes!("../../ml/models/shac-ml-linux.bpk")
         } else {
-            return Err(...);  // unsupported OS
+            // Unsupported OS — caller must handle the None case and disable feature
+            &[]
         };
-        // tract compile pipeline
-        ...
+        if MODEL_BYTES.is_empty() {
+            anyhow::bail!("ml model not bundled for this target_os");
+        }
+        let device = Default::default();
+        let mut model = StudentModelConfig::default().init::<B>(&device);
+        let mut store = BurnpackStore::from_static(MODEL_BYTES);
+        model.load_from(&mut store).context("load .bpk weights")?;
+        let vocab = Vocab::from_embedded()?;
+        let feature_spec = FeatureSpec::from_embedded()?;
+        Ok(Self { model, vocab, feature_spec, device })
     }
 }
 ```
 
 **Per-request:**
 ```rust
+use burn::tensor::{Tensor, TensorData};
+
 pub fn distribution(&self, ctx: &Context) -> Result<Vec<f32>> {
-    let features = build_features(ctx, &self.vocab);  // [u32; 16]
-    let input = tract_ndarray::Array1::from_iter(features).into_shape(...);
-    let output = self.model.run(tvec!(input.into()))?;
-    let logits: &[f32] = output[0].to_array_view::<f32>()?.as_slice().unwrap();
-    let probs = softmax(logits);
-    Ok(probs.to_vec())  // length 2000
+    let features: [u32; 16] = build_features(ctx, &self.vocab, &self.feature_spec);
+    let input = Tensor::<B, 1, burn::tensor::Int>::from_data(
+        TensorData::new(features.to_vec(), [16]),
+        &self.device,
+    ).reshape([1, 16]);                           // batch dim
+    let logits = self.model.forward(input);        // [1, vocab_size]
+    let probs = burn::tensor::activation::softmax(logits, 1);
+    let data: TensorData = probs.into_data();
+    Ok(data.to_vec::<f32>().unwrap())             // length vocab_size
 }
 ```
 
-**Latency target:** p99 ≤ 5ms on M1 CPU. tract's compiler optimizes for static input shapes — we pin shapes to avoid recompilation.
+**Latency target:** p99 ≤ 5ms on M1 CPU. NdArray backend uses `matrixmultiply` (BLAS-equivalent micro-kernel) for matmul; static shapes throughout.
 
-**Caching:** model loaded once at daemon start, reused for every request. No per-request compilation.
+**Caching:** `MlInference` instance built once at daemon start, reused for every request. The model is `Send + Sync` after build, sits behind `Arc<MlInference>`.
 
-**Memory:** model takes ~5MB resident (FP16 weights + activations). Negligible.
+**Memory:** ~5MB resident (FP32 weights + per-request activation tensors that drop after the call). Negligible.
 
 ## Component: ML score blending in engine (`src/engine.rs`)
 
@@ -437,7 +466,7 @@ shac ml reset-personalization              # clear ml_residual table
 - `tests/ml_blend.rs`: with `ranking.ml_seq_score=0`, output should match ML-disabled run; with weight=1, output should be ML-dominant
 
 ### Maintainer pipeline tests
-- `crates/shac-ml-train/tests/pipeline_smoke.rs`: end-to-end run of `gen-synthetic` (with mock Qwen) → `scrub` → `train` → produced ONNX loads via tract roundtrip without error
+- `crates/shac-ml-train/tests/pipeline_smoke.rs`: end-to-end run of `gen-synthetic` (with mock Qwen) → `scrub` → `train` → produced `.bpk` round-trips through `BurnpackStore::from_bytes` and matches in-memory model outputs to ε=1e-6
 
 ### Manual evaluation (before release)
 - `cargo run -p shac-ml-train --bin eval --input ml/data/heldout-real.jsonl` prints top-1/3/5 accuracy on real held-out shell history
@@ -456,8 +485,9 @@ shac ml reset-personalization              # clear ml_residual table
 | risk | mitigation |
 |---|---|
 | Tiny model degrades quality vs current scorer | Opt-in default (`false`); `eval --baseline` gate in CI before release; honest CHANGELOG note |
-| `burn` API breakage between versions | Pin exact version `burn = "=0.13.x"`; avoid bleeding-edge features; document upgrade procedure |
-| ONNX export incompatibility with `tract` | Roundtrip test in maintainer pipeline (export, load, compare outputs) is mandatory before commit |
+| `burn` API breakage between versions | Pin exact version `burn = "=0.21.x"`; avoid bleeding-edge features; document upgrade procedure |
+| `.bpk` format breakage between burn versions | Roundtrip test in maintainer pipeline (save, reload, compare outputs to ε=1e-6) is mandatory before commit; same burn version pin applied in both crates |
+| Burn runtime dep grows shac binary | Use `default-features = false` + only `ndarray` backend; expect ~3-5MB binary growth, accepted |
 | PII leak in bundled vocab | Mandatory `scrub` step + red-list test; manual vocab inspection before each release |
 | Personalization grows unbounded on disk | Cap residual table at 100k rows; LRU-evict by `updated_at` if exceeded |
 | Residual makes top suggestions unstable | `lr=0.05` is conservative; `disable_personalization=true` escape hatch; weight in `ranking.ml_seq_score` is tunable |
@@ -480,8 +510,9 @@ shac ml reset-personalization              # clear ml_residual table
 |---|---|
 | Use `burn` for training, not Python+PyTorch | Pure-Rust pipeline requirement (Roman's hard constraint) |
 | Use `mistralrs` for Qwen inference | Pure-Rust, supports Qwen, mature enough as of 2026 Q2 |
-| Tiny model architecture: mini-Transformer not LSTM | tract optimization, ONNX export stability, future-proof |
-| Two ONNX models (darwin/linux) instead of one with OS feature | Cleaner mental model, easier to reason about quality per OS, tiny model handles routing poorly |
+| Tiny model architecture: mini-Transformer not LSTM | NdArray matmul performance, mature `nn::transformer` building blocks in burn, future-proof |
+| Burn end-to-end (drop tract/ONNX) | `burn` does not have first-class ONNX export; the `.bpk` + `BurnpackStore` path is officially supported and zero-copy via `include_bytes!`; avoids hand-written ONNX serializer |
+| Two `.bpk` models (darwin/linux) instead of one with OS feature | Cleaner mental model, easier to reason about quality per OS, tiny model handles routing poorly |
 | Distillation via Qwen teacher | +3-5pp accuracy without increasing student size; standard technique |
 | Residual personalization, not full fine-tuning | Pure-Rust, online, deterministic, no catastrophic forgetting |
 | Synthetic data via local Qwen, not Haiku API | No external API dependency, hermetic pipeline, no per-build cost |
