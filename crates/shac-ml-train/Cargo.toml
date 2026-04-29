@@ -1,0 +1,58 @@
+[package]
+name = "shac-ml-train"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Maintainer pipeline for shac's ML next-command predictor — generates synthetic data, distills Qwen, trains the student, exports .bpk weights"
+publish = false
+
+[features]
+# Default = full training pipeline (incl. autodiff + mistralrs).
+# `model-only` = just the model + tokenizer + types, used by the shac runtime crate.
+default = ["full"]
+full = ["dep:mistralrs", "dep:burn-autodiff", "dep:burn-train"]
+model-only = []
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "1.1"
+regex = "1"
+ndarray = "0.16"
+
+burn = { version = "=0.21.0-pre.4", default-features = false, features = ["std", "ndarray"] }
+burn-store = { version = "=0.21.0-pre.4", default-features = false, features = ["burnpack"] }
+
+# optional, only enabled by `full`
+burn-autodiff = { version = "=0.21.0-pre.4", optional = true, default-features = false }
+burn-train = { version = "=0.21.0-pre.4", optional = true, default-features = false }
+mistralrs = { version = "0.8", optional = true, default-features = false }
+
+[dev-dependencies]
+tempfile = "3"
+
+[[bin]]
+name = "shac-ml-gen-synthetic"
+path = "src/bin/gen_synthetic.rs"
+required-features = ["full"]
+
+[[bin]]
+name = "shac-ml-scrub"
+path = "src/bin/scrub.rs"
+
+[[bin]]
+name = "shac-ml-distill"
+path = "src/bin/distill.rs"
+required-features = ["full"]
+
+[[bin]]
+name = "shac-ml-train"
+path = "src/bin/train.rs"
+required-features = ["full"]
+
+[[bin]]
+name = "shac-ml-eval"
+path = "src/bin/eval.rs"
+required-features = ["full"]
