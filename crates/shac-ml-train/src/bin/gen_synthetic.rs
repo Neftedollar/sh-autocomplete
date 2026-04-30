@@ -176,5 +176,5 @@ fn is_plausible_command(cmd: &str) -> bool {
         && first
             .chars()
             .next()
-            .map_or(false, |c| c.is_ascii_alphanumeric() || c == '_' || c == '/')
+            .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_' || c == '/')
 }
