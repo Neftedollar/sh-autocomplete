@@ -52,3 +52,41 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           files: dist/${{ matrix.asset_name }}.tar.gz
+
+  update-homebrew:
+    name: Update Homebrew tap
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Compute sha256 of source tarball
+        id: sha256
+        run: |
+          URL="https://github.com/Neftedollar/sh-autocomplete/archive/refs/tags/${{ github.ref_name }}.tar.gz"
+          SHA=$(curl -sL "$URL" | sha256sum | cut -d' ' -f1)
+          echo "value=$SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout homebrew-shac tap
+        uses: actions/checkout@v6
+        with:
+          repository: Neftedollar/homebrew-shac
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: homebrew-shac
+
+      - name: Patch formula
+        run: |
+          set -euo pipefail
+          VERSION="${{ github.ref_name }}"
+          SHA="${{ steps.sha256.outputs.value }}"
+          FORMULA="homebrew-shac/Formula/shac.rb"
+          sed -i "s|url \".*\"|url \"https://github.com/Neftedollar/sh-autocomplete/archive/refs/tags/${VERSION}.tar.gz\"|" "$FORMULA"
+          sed -i "s|sha256 \".*\"|sha256 \"${SHA}\"|" "$FORMULA"
+          echo "=== patched formula ===" && cat "$FORMULA"
+
+      - name: Commit and push
+        run: |
+          cd homebrew-shac
+          git config user.email "ci@shac"
+          git config user.name "shac-release-bot"
+          git add Formula/shac.rb
+          git diff --staged --quiet || git commit -m "chore: bump shac to ${{ github.ref_name }}"
+          git push
