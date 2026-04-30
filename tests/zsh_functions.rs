@@ -263,7 +263,7 @@ _shac_daemon_version="0.5.1"
 _shac_pending_tip_text=""
 _shac_check_version_mismatch
 assert_contains "$_shac_pending_tip_text" "brew services restart shac" "stale daemon shows restart command"
-assert_contains "$_shac_pending_tip_text" "0.5.2" "stale daemon warning includes client version"
+assert_contains "$_shac_pending_tip_text" "still running" "stale daemon warning says still running"
 assert_eq "$_shac_version_warned" "1" "version_warned flag set after mismatch"
 
 # Client outdated (daemon newer): expect "brew upgrade shac"
@@ -273,6 +273,7 @@ _shac_daemon_version="0.5.2"
 _shac_pending_tip_text=""
 _shac_check_version_mismatch
 assert_contains "$_shac_pending_tip_text" "brew upgrade shac" "outdated client shows upgrade command"
+assert_contains "$_shac_pending_tip_text" "is newer" "outdated client warning says is newer"
 
 # Same version: no warning
 _shac_version_warned=0

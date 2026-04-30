@@ -90,9 +90,9 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
     [[ "$_shac_client_version" == "$_shac_daemon_version" ]] && return 0
     _shac_version_warned=1
     if _shac_version_gt "$_shac_client_version" "$_shac_daemon_version"; then
-      _shac_pending_tip_text="shac ${_shac_client_version} / shacd ${_shac_daemon_version} — daemon stale: brew services restart shac"
+      _shac_pending_tip_text="shac v${_shac_client_version} but shacd v${_shac_daemon_version} still running — brew services restart shac"
     else
-      _shac_pending_tip_text="shac ${_shac_client_version} / shacd ${_shac_daemon_version} — client outdated: brew upgrade shac"
+      _shac_pending_tip_text="shac v${_shac_client_version} but shacd v${_shac_daemon_version} is newer — brew upgrade shac"
     fi
   }
 
