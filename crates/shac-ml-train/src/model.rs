@@ -45,6 +45,10 @@ pub struct StudentModelConfig {
 }
 
 impl Default for StudentModelConfig {
+    // NOTE: kept in sync with the #[config(default = …)] attributes above.
+    // burn's `Config` derive generates a `new()` constructor but NOT
+    // `Default`, so we provide one explicitly. If you change a default
+    // attribute, update this impl too.
     fn default() -> Self {
         Self {
             vocab_size: 2000,
