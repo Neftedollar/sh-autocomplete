@@ -23,7 +23,7 @@ regex = "1"
 ndarray = "0.16"
 
 burn = { version = "=0.21.0-pre.4", default-features = false, features = ["std", "ndarray"] }
-burn-store = { version = "=0.21.0-pre.4", default-features = false, features = ["burnpack"] }
+burn-store = { version = "=0.21.0-pre.4", default-features = false, features = ["std", "burnpack"] }
 
 # optional, only enabled by `full`
 burn-autodiff = { version = "=0.21.0-pre.4", optional = true, default-features = false }
