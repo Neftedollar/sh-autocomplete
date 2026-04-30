@@ -10,7 +10,7 @@ publish = false
 # Default = full training pipeline (incl. autodiff + mistralrs).
 # `model-only` = just the model + tokenizer + types, used by the shac runtime crate.
 default = ["full"]
-full = ["dep:mistralrs", "dep:burn-autodiff", "dep:burn-train"]
+full = ["dep:mistralrs", "dep:burn-autodiff", "dep:burn-train", "dep:tokio"]
 model-only = []
 
 [dependencies]
@@ -32,6 +32,7 @@ burn-train = { version = "=0.21.0-pre.4", optional = true, default-features = fa
 # check` works on Linux CI without the Metal toolchain. T6 (Qwen wrapper) re-
 # adds it gated behind a maintainer-only build target. See pipeline plan T1.
 mistralrs = { version = "0.8", optional = true, default-features = false }
+tokio = { version = "1", optional = true, features = ["rt-multi-thread"] }
 
 [dev-dependencies]
 tempfile = "3"

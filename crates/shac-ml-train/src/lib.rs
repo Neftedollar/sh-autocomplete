@@ -7,7 +7,9 @@
 pub mod data;
 #[cfg(feature = "full")]
 pub mod personas;
-#[cfg(feature = "full")]
+// `qwen` is intentionally NOT gated: the trait, GenerationConfig, and MockQwen
+// must be visible without `full` so that pipeline smoke tests (T13) can use
+// MockQwen. Only the `Qwen` struct itself is gated inside the module.
 pub mod qwen;
 #[cfg(feature = "full")]
 pub mod scrub;
