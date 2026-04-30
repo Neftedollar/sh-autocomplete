@@ -1,6 +1,6 @@
 [package]
 name = "shac"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2021"
 description = "Shell autocomplete engine for bash and zsh"
 license = "MIT"
