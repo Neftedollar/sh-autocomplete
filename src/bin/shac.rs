@@ -215,6 +215,7 @@ enum IndexAction {
 enum DaemonAction {
     Start,
     Stop,
+    Restart,
     Status,
 }
 
@@ -1399,6 +1400,23 @@ fn daemon_action(paths: &AppPaths, action: DaemonAction) -> Result<()> {
             wait_for_shutdown(paths, Duration::from_secs(2));
             cleanup_stale_daemon_state(paths);
             println!("stopped");
+            Ok(())
+        }
+        DaemonAction::Restart => {
+            // Prefer brew services so launchd keeps auto-restart on login.
+            // Fall back to manual stop+start for non-brew installs.
+            let via_brew = Command::new("brew")
+                .args(["services", "restart", "shac"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if !via_brew {
+                daemon_action(paths, DaemonAction::Stop)?;
+                daemon_action(paths, DaemonAction::Start)?;
+            }
+            println!("restarted");
             Ok(())
         }
         DaemonAction::Status => {

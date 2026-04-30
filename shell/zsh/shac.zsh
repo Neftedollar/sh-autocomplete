@@ -862,6 +862,10 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
     _shac_update_inline
   }
 
+  function shac-update() {
+    shac daemon restart && exec ${SHELL}
+  }
+
   function _shac_record_precmd() {
     if [[ -z "$_shac_last_buffer" || "$_shac_last_buffer" == "$_shac_last_recorded" ]]; then
       return
