@@ -35,6 +35,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use serde_json;
 
 use burn::backend::NdArray;
 use burn::module::AutodiffModule;
@@ -294,6 +295,26 @@ fn main() -> Result<()> {
         .save_into(&mut store)
         .map_err(|e| anyhow::anyhow!("save .bpk: {e:?}"))?;
     eprintln!("wrote weights to {}", args.output.display());
+
+    // Emit feature-spec.json next to the .bpk so the runtime crate can
+    // verify model architecture compatibility at load time.
+    let feature_spec_path = args.output.with_file_name("feature-spec.json");
+    let spec = serde_json::json!({
+        "version": 1,
+        "vocab_size": cfg.vocab_size,
+        "context_len": cfg.context_len,
+        "cwd_buckets": 8,
+        "model_arch": {
+            "kind": "mini-transformer",
+            "n_layers": cfg.n_layers,
+            "n_heads": cfg.n_heads,
+            "hidden_dim": cfg.hidden_dim,
+            "intermediate_dim": cfg.intermediate_dim,
+        }
+    });
+    std::fs::write(&feature_spec_path, serde_json::to_string_pretty(&spec)?)
+        .with_context(|| format!("write {}", feature_spec_path.display()))?;
+    eprintln!("wrote feature spec to {}", feature_spec_path.display());
 
     Ok(())
 }
