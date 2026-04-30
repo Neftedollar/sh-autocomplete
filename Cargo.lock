@@ -610,7 +610,7 @@ dependencies = [
 
 [[package]]
 name = "shac"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "anyhow",
  "blake3",
