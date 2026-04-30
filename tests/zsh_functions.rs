@@ -199,6 +199,48 @@ assert_not_contains "$POSTDISPLAY" $'\e[36m' "non-path_jump kind is not tinted"
     );
 }
 
+#[test]
+fn zsh_menu_type_and_backspace_keep_selected_buffer() {
+    if !support::command_available("zsh") {
+        eprintln!("skipping zsh function tests: zsh is unavailable");
+        return;
+    }
+
+    run_zsh(
+        r#"
+# Set up a menu with "cd Do" typed, "Documents" selected (already applied to BUFFER).
+function setup_menu() {
+  BUFFER="cd Documents"
+  CURSOR=13
+  _shac_menu_open=1
+  _shac_menu_selected_index=1
+  _shac_menu_original_buffer="cd Do"
+  _shac_menu_original_cursor=5
+  _shac_menu_item_keys=("cd Documents")
+  _shac_menu_insert_texts=("Documents")
+  _shac_menu_displays=("Documents")
+  _shac_menu_kinds=("directory")
+  _shac_menu_sources=("path")
+  _shac_menu_descriptions=("")
+}
+
+# Typing "/" while menu open: commit_selected_item keeps the selected text.
+# (_shac_self_insert_widget calls _shac_commit_selected_item never before inserting)
+setup_menu
+_shac_commit_selected_item never
+assert_eq "$BUFFER" "cd Documents" "commit_selected_item never keeps selected buffer"
+assert_eq "$_shac_menu_open" "0" "menu closed after commit"
+
+# Backspace while menu open: note_manual_edit should NOT restore original buffer.
+# Before the fix, close_menu 1 reverted BUFFER to "cd Do". Now close_menu 0 keeps it.
+setup_menu
+_shac_note_manual_edit
+assert_eq "$BUFFER" "cd Documents" "note_manual_edit keeps selected buffer, not original"
+assert_eq "$_shac_menu_open" "0" "menu closed after note_manual_edit"
+"#,
+    );
+}
+
 fn run_zsh(body: &str) {
     let script_path = std::env::current_dir()
         .expect("current dir")

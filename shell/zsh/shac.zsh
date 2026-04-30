@@ -680,7 +680,7 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
   function _shac_note_manual_edit() {
     _shac_clear_inline
     if (( _shac_menu_open )); then
-      _shac_close_menu 1
+      _shac_close_menu 0
     fi
     _shac_mark_typed_manual
   }
@@ -688,7 +688,8 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
   function _shac_self_insert_widget() {
     local before_buffer="$BUFFER"
     if (( _shac_menu_open )); then
-      _shac_close_menu 1
+      _shac_commit_selected_item never
+      before_buffer="$BUFFER"
     fi
     _shac_clear_inline
     zle _shac_orig_self_insert -- "$@"
