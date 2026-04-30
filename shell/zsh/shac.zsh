@@ -42,6 +42,9 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
   typeset -g _shac_inline_request_id=""
   typeset -g _shac_pending_tip_id=""
   typeset -g _shac_pending_tip_text=""
+  typeset -g _shac_client_version=""
+  typeset -g _shac_daemon_version=""
+  typeset -gi _shac_version_warned=0
 
   if command -v shac >/dev/null 2>&1; then
     eval "$(shac shell-env --shell zsh 2>/dev/null)"
@@ -68,6 +71,29 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
     _shac_menu_descriptions=()
     _shac_pending_tip_id=""
     _shac_pending_tip_text=""
+  }
+
+  function _shac_version_gt() {
+    local -a av=("${(s:.:)1}") bv=("${(s:.:)2}")
+    local i
+    for i in 1 2 3; do
+      local a="${av[$i]:-0}" b="${bv[$i]:-0}"
+      (( a > b )) && return 0
+      (( a < b )) && return 1
+    done
+    return 1
+  }
+
+  function _shac_check_version_mismatch() {
+    (( _shac_version_warned )) && return 0
+    [[ -z "$_shac_client_version" || -z "$_shac_daemon_version" ]] && return 0
+    [[ "$_shac_client_version" == "$_shac_daemon_version" ]] && return 0
+    _shac_version_warned=1
+    if _shac_version_gt "$_shac_client_version" "$_shac_daemon_version"; then
+      _shac_pending_tip_text="shac ${_shac_client_version} / shacd ${_shac_daemon_version} — daemon stale: brew services restart shac"
+    else
+      _shac_pending_tip_text="shac ${_shac_client_version} / shacd ${_shac_daemon_version} — client outdated: brew upgrade shac"
+    fi
   }
 
   function _shac_set_input_provenance() {
@@ -532,6 +558,10 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
           _shac_pending_tip_id="${tip_fields[2]:-}"
           _shac_pending_tip_text="${tip_fields[3]:-}"
         fi
+      elif [[ "$line" == __shac_daemon_version$'\t'* ]]; then
+        local -a dv_fields
+        dv_fields=("${(ps:\t:)line}")
+        _shac_daemon_version="${dv_fields[2]:-}"
       else
         local -a fields
         fields=("${(ps:\t:)line}")
@@ -610,6 +640,8 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
       return $?
     fi
 
+    _shac_check_version_mismatch
+
     local total="${#_shac_menu_item_keys[@]}"
     if (( total == 0 )); then
       # Even with no candidates, we may have a tip to surface (notably the
@@ -625,6 +657,7 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
       local original_buffer="$BUFFER"
       local original_cursor="$CURSOR"
       _shac_apply_selected_item 1 "$original_buffer" "$original_cursor"
+      _shac_render_tip_only
       if zle; then
         zle -R
       fi

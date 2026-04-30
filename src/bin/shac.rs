@@ -1508,6 +1508,9 @@ fn print_completion_response(response: serde_json::Value, format: &str) -> Resul
                 );
             }
         }
+        if let Some(dv) = response.get("daemon_version").and_then(|v| v.as_str()) {
+            println!("__shac_daemon_version\t{}", sanitize_shell_field(dv));
+        }
     } else {
         let items = response
             .get("items")
@@ -1651,6 +1654,10 @@ fn shell_env(paths: &AppPaths, args: ShellEnvArgs) -> Result<()> {
             println!(
                 "typeset -gi _shac_ui_inline_zsh={}",
                 if config.features.inline_zsh { 1 } else { 0 }
+            );
+            println!(
+                "typeset -g _shac_client_version={}",
+                shell_escape(env!("CARGO_PKG_VERSION"))
             );
         }
         ShellKind::Bash => {}

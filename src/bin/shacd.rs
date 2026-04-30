@@ -151,9 +151,12 @@ fn handle_client(engine: &Engine, mut stream: UnixStream) -> Result<()> {
         .unwrap_or("complete");
 
     let payload = match action {
-        "complete" => serde_json::to_vec(
-            &engine.complete(serde_json::from_value(request["payload"].clone())?)?,
-        )?,
+        "complete" => {
+            let mut resp =
+                serde_json::to_value(&engine.complete(serde_json::from_value(request["payload"].clone())?)?)?;
+            resp["daemon_version"] = serde_json::json!(env!("CARGO_PKG_VERSION"));
+            serde_json::to_vec(&resp)?
+        }
         "explain" => serde_json::to_vec(
             &engine.explain(serde_json::from_value(request["payload"].clone())?)?,
         )?,

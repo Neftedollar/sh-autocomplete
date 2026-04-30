@@ -241,6 +241,59 @@ assert_eq "$_shac_menu_open" "0" "menu closed after note_manual_edit"
     );
 }
 
+#[test]
+fn zsh_version_mismatch_warning() {
+    if !support::command_available("zsh") {
+        eprintln!("skipping zsh function tests: zsh is unavailable");
+        return;
+    }
+
+    run_zsh(
+        r#"
+# _shac_version_gt: basic ordering
+_shac_version_gt "0.5.2" "0.5.1" && assert_eq "yes" "yes" "0.5.2 > 0.5.1" || { print -ru2 "FAIL: 0.5.2 should be > 0.5.1"; exit 1; }
+_shac_version_gt "0.5.1" "0.5.2" && { print -ru2 "FAIL: 0.5.1 should NOT be > 0.5.2"; exit 1; } || true
+_shac_version_gt "1.0.0" "0.9.9" && assert_eq "yes" "yes" "1.0.0 > 0.9.9" || { print -ru2 "FAIL: 1.0.0 should be > 0.9.9"; exit 1; }
+_shac_version_gt "0.5.1" "0.5.1" && { print -ru2 "FAIL: equal versions should not be gt"; exit 1; } || true
+
+# Daemon stale (client newer): expect "brew services restart shac"
+_shac_version_warned=0
+_shac_client_version="0.5.2"
+_shac_daemon_version="0.5.1"
+_shac_pending_tip_text=""
+_shac_check_version_mismatch
+assert_contains "$_shac_pending_tip_text" "brew services restart shac" "stale daemon shows restart command"
+assert_contains "$_shac_pending_tip_text" "0.5.2" "stale daemon warning includes client version"
+assert_eq "$_shac_version_warned" "1" "version_warned flag set after mismatch"
+
+# Client outdated (daemon newer): expect "brew upgrade shac"
+_shac_version_warned=0
+_shac_client_version="0.5.1"
+_shac_daemon_version="0.5.2"
+_shac_pending_tip_text=""
+_shac_check_version_mismatch
+assert_contains "$_shac_pending_tip_text" "brew upgrade shac" "outdated client shows upgrade command"
+
+# Same version: no warning
+_shac_version_warned=0
+_shac_client_version="0.5.2"
+_shac_daemon_version="0.5.2"
+_shac_pending_tip_text=""
+_shac_check_version_mismatch
+assert_eq "$_shac_pending_tip_text" "" "no warning when versions match"
+assert_eq "$_shac_version_warned" "0" "version_warned not set when versions match"
+
+# Already warned: tip not overwritten
+_shac_version_warned=1
+_shac_client_version="0.5.2"
+_shac_daemon_version="0.5.1"
+_shac_pending_tip_text="already set"
+_shac_check_version_mismatch
+assert_eq "$_shac_pending_tip_text" "already set" "already warned: tip not overwritten"
+"#,
+    );
+}
+
 fn run_zsh(body: &str) {
     let script_path = std::env::current_dir()
         .expect("current dir")
