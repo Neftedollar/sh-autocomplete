@@ -29,8 +29,10 @@ burn-store = { version = "=0.21.0-pre.4", default-features = false, features = [
 burn-autodiff = { version = "=0.21.0-pre.4", optional = true, default-features = false }
 burn-train = { version = "=0.21.0-pre.4", optional = true, default-features = false }
 # NOTE: features = ["metal"] is intentionally NOT enabled here so that `cargo
-# check` works on Linux CI without the Metal toolchain. T6 (Qwen wrapper) re-
-# adds it gated behind a maintainer-only build target. See pipeline plan T1.
+# check` works on Linux CI without the Metal toolchain. CPU inference is
+# functional but ~6× slower on M1. Re-enable Metal locally before any
+# real training run (e.g., a maintainer-only build profile or a follow-up
+# task that introduces a Cargo target_os conditional). See pipeline plan T1.
 mistralrs = { version = "0.8", optional = true, default-features = false }
 tokio = { version = "1", optional = true, features = ["rt-multi-thread"] }
 

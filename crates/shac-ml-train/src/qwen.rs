@@ -120,10 +120,13 @@ mod full_impl {
     use std::sync::Arc;
     use tokio::runtime::Runtime;
 
-    /// Hugging Face model repo to load. Qwen3-0.6B is the smallest Qwen3
-    /// variant and loads quickly for synthetic data generation and distillation.
-    /// Adjust to `Qwen/Qwen2.5-0.5B-Instruct` if preferred.
-    const MODEL_ID: &str = "Qwen/Qwen3-0.6B";
+    /// Hugging Face model repo to load. We use the instruction-tuned 0.5B
+    /// Qwen 2.5 variant: it has a chat template that respects system/user
+    /// roles, which `generate()` relies on. Qwen3-0.6B base does NOT engage
+    /// the chat template and returns raw continuations from the system prompt
+    /// — switching to it requires explicit prompt engineering, so we stay on
+    /// the well-trodden Qwen2.5-0.5B-Instruct path for v0.6.0.
+    const MODEL_ID: &str = "Qwen/Qwen2.5-0.5B-Instruct";
 
     /// Real Qwen model backed by mistralrs 0.8.
     ///
@@ -154,13 +157,13 @@ mod full_impl {
                 .await
                 .map_err(|e| anyhow!("Failed to load Qwen model: {e}"))?;
 
-            // Capture (or create) the current tokio runtime for the blocking
-            // methods. `Runtime::new()` here would create a *second* runtime
-            // nested inside the outer one; instead we get the current handle
-            // and build a new single-threaded runtime for blocking dispatch.
-            //
-            // NOTE: trait methods are synchronous, so they must block the
-            // calling thread. We store a dedicated `Runtime` for that purpose.
+            // Build a dedicated multi-thread runtime for the sync trait
+            // methods. `block_on` on this runtime is safe even if `Qwen::load`
+            // was awaited on a *different* tokio runtime, because `block_on`
+            // only panics when called from within the same runtime it's
+            // dispatching to. Do NOT switch to `Handle::current().block_on(...)`:
+            // that would panic when sync trait methods are called from inside
+            // an async context on the caller's runtime.
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()
