@@ -47,6 +47,7 @@ required-features = ["full"]
 [[bin]]
 name = "shac-ml-scrub"
 path = "src/bin/scrub.rs"
+required-features = ["full"]
 
 [[bin]]
 name = "shac-ml-distill"
