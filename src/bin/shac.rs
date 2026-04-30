@@ -64,38 +64,87 @@ fn build_app() -> ClapCmd {
         .arg_required_else_help(true)
         // ── Setup ────────────────────────────────────────────────────────────
         .next_help_heading("Setup")
-        .subcommand(InstallArgs::augment_args(ClapCmd::new("install").about("Add shac integration to your shell rc file")))
-        .subcommand(InstallArgs::augment_args(ClapCmd::new("uninstall").about("Remove shac integration from your shell rc file")))
-        .subcommand(DaemonArgs::augment_args(ClapCmd::new("daemon").about("Manage the background daemon (start / stop / restart / status)")))
+        .subcommand(InstallArgs::augment_args(
+            ClapCmd::new("install").about("Add shac integration to your shell rc file"),
+        ))
+        .subcommand(InstallArgs::augment_args(
+            ClapCmd::new("uninstall").about("Remove shac integration from your shell rc file"),
+        ))
+        .subcommand(DaemonArgs::augment_args(ClapCmd::new("daemon").about(
+            "Manage the background daemon (start / stop / restart / status)",
+        )))
         // ── Index ────────────────────────────────────────────────────────────
         .next_help_heading("Index")
-        .subcommand(ImportArgs::augment_args(ClapCmd::new("import").about("Import command history from zsh history or zoxide")))
-        .subcommand(ScanProjectsArgs::augment_args(ClapCmd::new("scan-projects").about("Scan directories and index project paths for path completions")))
-        .subcommand(ReindexArgs::augment_args(ClapCmd::new("reindex").about("Re-scan PATH commands and rebuild documentation index")))
-        .subcommand(IndexArgs::augment_args(ClapCmd::new("index").about("Add a specific command or directory path to the index")))
+        .subcommand(ImportArgs::augment_args(
+            ClapCmd::new("import").about("Import command history from zsh history or zoxide"),
+        ))
+        .subcommand(ScanProjectsArgs::augment_args(
+            ClapCmd::new("scan-projects")
+                .about("Scan directories and index project paths for path completions"),
+        ))
+        .subcommand(ReindexArgs::augment_args(
+            ClapCmd::new("reindex").about("Re-scan PATH commands and rebuild documentation index"),
+        ))
+        .subcommand(IndexArgs::augment_args(
+            ClapCmd::new("index").about("Add a specific command or directory path to the index"),
+        ))
         .subcommand(ClapCmd::new("invalidate-caches").about("Clear all cached completion results"))
         // ── Diagnostics ──────────────────────────────────────────────────────
         .next_help_heading("Diagnostics")
-        .subcommand(DoctorArgs::augment_args(ClapCmd::new("doctor").about("Check that the daemon, shell integration, and index are healthy")))
-        .subcommand(CompletionArgs::augment_args(ClapCmd::new("explain").about("Explain why candidates ranked the way they did for a query")))
-        .subcommand(ClapCmd::new("stats").about("Show usage statistics (completions accepted, model status, etc.)"))
-        .subcommand(RecentEventsArgs::augment_args(ClapCmd::new("recent-events").about("Show recent completion and acceptance events")))
-        .subcommand(DebugArgs::augment_args(ClapCmd::new("debug").about("Low-level debug tools (show raw completion results)")))
+        .subcommand(DoctorArgs::augment_args(ClapCmd::new("doctor").about(
+            "Check that the daemon, shell integration, and index are healthy",
+        )))
+        .subcommand(CompletionArgs::augment_args(ClapCmd::new("explain").about(
+            "Explain why candidates ranked the way they did for a query",
+        )))
+        .subcommand(
+            ClapCmd::new("stats")
+                .about("Show usage statistics (completions accepted, model status, etc.)"),
+        )
+        .subcommand(RecentEventsArgs::augment_args(
+            ClapCmd::new("recent-events").about("Show recent completion and acceptance events"),
+        ))
+        .subcommand(DebugArgs::augment_args(
+            ClapCmd::new("debug").about("Low-level debug tools (show raw completion results)"),
+        ))
         // ── Personalization ───────────────────────────────────────────────────
         .next_help_heading("Personalization")
-        .subcommand(TrainModelArgs::augment_args(ClapCmd::new("train-model").about("Train (or retrain) the personalization ranking model")))
-        .subcommand(ClapCmd::new("reset-personalization").about("Clear all learned preferences and start personalization from scratch"))
-        .subcommand(TrainingDataArgs::augment_args(ClapCmd::new("export-training-data").about("Export labelled completion data for ML model training")))
+        .subcommand(TrainModelArgs::augment_args(
+            ClapCmd::new("train-model")
+                .about("Train (or retrain) the personalization ranking model"),
+        ))
+        .subcommand(
+            ClapCmd::new("reset-personalization")
+                .about("Clear all learned preferences and start personalization from scratch"),
+        )
+        .subcommand(TrainingDataArgs::augment_args(
+            ClapCmd::new("export-training-data")
+                .about("Export labelled completion data for ML model training"),
+        ))
         // ── Settings ─────────────────────────────────────────────────────────
         .next_help_heading("Settings")
-        .subcommand(ConfigArgs::augment_args(ClapCmd::new("config").about("View or edit configuration settings")))
-        .subcommand(LocaleArgs::augment_args(ClapCmd::new("locale").about("View or change the UI language / locale")))
-        .subcommand(TipsArgs::augment_args(ClapCmd::new("tips").about("Manage inline usage tips (list / mute / unmute)")))
+        .subcommand(ConfigArgs::augment_args(
+            ClapCmd::new("config").about("View or edit configuration settings"),
+        ))
+        .subcommand(LocaleArgs::augment_args(
+            ClapCmd::new("locale").about("View or change the UI language / locale"),
+        ))
+        .subcommand(TipsArgs::augment_args(
+            ClapCmd::new("tips").about("Manage inline usage tips (list / mute / unmute)"),
+        ))
         // ── Internal (shell scripts only) ─────────────────────────────────────
-        .subcommand(CompletionArgs::augment_args(ClapCmd::new("complete").hide(true)))
-        .subcommand(RecordArgs::augment_args(ClapCmd::new("record-command").hide(true)))
-        .subcommand(ShellEnvArgs::augment_args(ClapCmd::new("shell-env").hide(true)))
-        .subcommand(SuggestArgs::augment_args(ClapCmd::new("suggest").hide(true)))
+        .subcommand(CompletionArgs::augment_args(
+            ClapCmd::new("complete").hide(true),
+        ))
+        .subcommand(RecordArgs::augment_args(
+            ClapCmd::new("record-command").hide(true),
+        ))
+        .subcommand(ShellEnvArgs::augment_args(
+            ClapCmd::new("shell-env").hide(true),
+        ))
+        .subcommand(SuggestArgs::augment_args(
+            ClapCmd::new("suggest").hide(true),
+        ))
         .subcommand(ClapCmd::new("migration-status").hide(true))
 }
 
@@ -375,11 +424,28 @@ fn main() -> Result<()> {
     paths.ensure()?;
 
     match matches.subcommand() {
-        Some(("install", sub))    => install(&paths, InstallArgs::from_arg_matches(sub).unwrap_or_else(|e| e.exit())),
-        Some(("uninstall", sub))  => { let a = InstallArgs::from_arg_matches(sub).unwrap_or_else(|e| e.exit()); uninstall(&paths, a.shell, a.edit_rc) }
-        Some(("daemon", sub))     => daemon_action(&paths, DaemonArgs::from_arg_matches(sub).unwrap_or_else(|e| e.exit()).action),
-        Some(("import", sub))     => import_action(&paths, ImportArgs::from_arg_matches(sub).unwrap_or_else(|e| e.exit())),
-        Some(("scan-projects", sub)) => scan_projects_action(&paths, ScanProjectsArgs::from_arg_matches(sub).unwrap_or_else(|e| e.exit())),
+        Some(("install", sub)) => install(
+            &paths,
+            InstallArgs::from_arg_matches(sub).unwrap_or_else(|e| e.exit()),
+        ),
+        Some(("uninstall", sub)) => {
+            let a = InstallArgs::from_arg_matches(sub).unwrap_or_else(|e| e.exit());
+            uninstall(&paths, a.shell, a.edit_rc)
+        }
+        Some(("daemon", sub)) => daemon_action(
+            &paths,
+            DaemonArgs::from_arg_matches(sub)
+                .unwrap_or_else(|e| e.exit())
+                .action,
+        ),
+        Some(("import", sub)) => import_action(
+            &paths,
+            ImportArgs::from_arg_matches(sub).unwrap_or_else(|e| e.exit()),
+        ),
+        Some(("scan-projects", sub)) => scan_projects_action(
+            &paths,
+            ScanProjectsArgs::from_arg_matches(sub).unwrap_or_else(|e| e.exit()),
+        ),
         Some(("reindex", sub)) => {
             let a = ReindexArgs::from_arg_matches(sub).unwrap_or_else(|e| e.exit());
             ensure_daemon(&paths)?;
@@ -391,7 +457,12 @@ fn main() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&value)?);
             Ok(())
         }
-        Some(("index", sub))      => index_action(&paths, IndexArgs::from_arg_matches(sub).unwrap_or_else(|e| e.exit()).action),
+        Some(("index", sub)) => index_action(
+            &paths,
+            IndexArgs::from_arg_matches(sub)
+                .unwrap_or_else(|e| e.exit())
+                .action,
+        ),
         Some(("invalidate-caches", _)) => {
             ensure_daemon(&paths)?;
             let resp = send_request(&paths, "invalidate-caches", serde_json::json!({}))?;
@@ -401,23 +472,57 @@ fn main() -> Result<()> {
             println!("caches invalidated");
             Ok(())
         }
-        Some(("doctor", sub))        => doctor(&paths, DoctorArgs::from_arg_matches(sub).unwrap_or_else(|e| e.exit())),
-        Some(("explain", sub))       => explain(&paths, CompletionArgs::from_arg_matches(sub).unwrap_or_else(|e| e.exit())),
+        Some(("doctor", sub)) => doctor(
+            &paths,
+            DoctorArgs::from_arg_matches(sub).unwrap_or_else(|e| e.exit()),
+        ),
+        Some(("explain", sub)) => explain(
+            &paths,
+            CompletionArgs::from_arg_matches(sub).unwrap_or_else(|e| e.exit()),
+        ),
         Some(("stats", _)) => {
             ensure_daemon(&paths)?;
             let value = send_request(&paths, "stats", serde_json::json!({}))?;
             println!("{}", serde_json::to_string_pretty(&value)?);
             Ok(())
         }
-        Some(("recent-events", sub)) => recent_events(&paths, RecentEventsArgs::from_arg_matches(sub).unwrap_or_else(|e| e.exit())),
-        Some(("debug", sub))         => debug_action(&paths, DebugArgs::from_arg_matches(sub).unwrap_or_else(|e| e.exit()).action),
-        Some(("train-model", sub))   => train_model_file(&paths, TrainModelArgs::from_arg_matches(sub).unwrap_or_else(|e| e.exit())),
+        Some(("recent-events", sub)) => recent_events(
+            &paths,
+            RecentEventsArgs::from_arg_matches(sub).unwrap_or_else(|e| e.exit()),
+        ),
+        Some(("debug", sub)) => debug_action(
+            &paths,
+            DebugArgs::from_arg_matches(sub)
+                .unwrap_or_else(|e| e.exit())
+                .action,
+        ),
+        Some(("train-model", sub)) => train_model_file(
+            &paths,
+            TrainModelArgs::from_arg_matches(sub).unwrap_or_else(|e| e.exit()),
+        ),
         Some(("reset-personalization", _)) => reset_personalization(&paths),
-        Some(("export-training-data", sub)) => export_training_data(&paths, TrainingDataArgs::from_arg_matches(sub).unwrap_or_else(|e| e.exit())),
-        Some(("config", sub))        => config_action(&paths, ConfigArgs::from_arg_matches(sub).unwrap_or_else(|e| e.exit()).action),
-        Some(("locale", sub))        => run_locale(&paths, LocaleArgs::from_arg_matches(sub).unwrap_or_else(|e| e.exit())),
-        Some(("tips", sub))          => run_tips(&paths, TipsArgs::from_arg_matches(sub).unwrap_or_else(|e| e.exit())),
-        Some(("complete", sub))      => complete(&paths, CompletionArgs::from_arg_matches(sub).unwrap_or_else(|e| e.exit())),
+        Some(("export-training-data", sub)) => export_training_data(
+            &paths,
+            TrainingDataArgs::from_arg_matches(sub).unwrap_or_else(|e| e.exit()),
+        ),
+        Some(("config", sub)) => config_action(
+            &paths,
+            ConfigArgs::from_arg_matches(sub)
+                .unwrap_or_else(|e| e.exit())
+                .action,
+        ),
+        Some(("locale", sub)) => run_locale(
+            &paths,
+            LocaleArgs::from_arg_matches(sub).unwrap_or_else(|e| e.exit()),
+        ),
+        Some(("tips", sub)) => run_tips(
+            &paths,
+            TipsArgs::from_arg_matches(sub).unwrap_or_else(|e| e.exit()),
+        ),
+        Some(("complete", sub)) => complete(
+            &paths,
+            CompletionArgs::from_arg_matches(sub).unwrap_or_else(|e| e.exit()),
+        ),
         Some(("record-command", sub)) => {
             ensure_daemon(&paths)?;
             let a = RecordArgs::from_arg_matches(sub).unwrap_or_else(|e| e.exit());
@@ -442,10 +547,20 @@ fn main() -> Result<()> {
             )?;
             Ok(())
         }
-        Some(("shell-env", sub))      => shell_env(&paths, ShellEnvArgs::from_arg_matches(sub).unwrap_or_else(|e| e.exit())),
-        Some(("suggest", sub))        => run_suggest(&paths, SuggestArgs::from_arg_matches(sub).unwrap_or_else(|e| e.exit())),
+        Some(("shell-env", sub)) => shell_env(
+            &paths,
+            ShellEnvArgs::from_arg_matches(sub).unwrap_or_else(|e| e.exit()),
+        ),
+        Some(("suggest", sub)) => run_suggest(
+            &paths,
+            SuggestArgs::from_arg_matches(sub).unwrap_or_else(|e| e.exit()),
+        ),
         Some(("migration-status", _)) => migration_status(&paths),
-        _ => { build_app().print_help()?; println!(); Ok(()) }
+        _ => {
+            build_app().print_help()?;
+            println!();
+            Ok(())
+        }
     }
 }
 
