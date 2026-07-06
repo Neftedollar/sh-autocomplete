@@ -1619,24 +1619,58 @@ fn resolve_cd_target(target: &str) -> Option<String> {
 }
 
 /// If `command` is a `cd <path>`, return the resolved absolute target.
+///
+/// A quoted argument (single or double quotes) is taken whole up to its
+/// matching closing quote -- embedded spaces included -- rather than being
+/// cut at the first whitespace. An unquoted argument still stops at the
+/// first unescaped whitespace (so `cd /a/b c` is still two words), but a
+/// backslash-escaped space is treated as part of the path.
 fn extract_cd_target(command: &str) -> Option<String> {
     let trimmed = command.trim();
     let rest = trimmed.strip_prefix("cd ")?;
-    // Strip surrounding quotes if any (single, double).
     let arg = rest.trim();
-    let unquoted = if (arg.starts_with('"') && arg.ends_with('"') && arg.len() >= 2)
-        || (arg.starts_with('\'') && arg.ends_with('\'') && arg.len() >= 2)
-    {
-        &arg[1..arg.len() - 1]
-    } else {
-        arg
-    };
-    // Take only the first token (don't try to interpret flags).
-    let first = unquoted.split_whitespace().next().unwrap_or(unquoted);
-    if first.is_empty() {
+    if arg.is_empty() {
         return None;
     }
-    resolve_cd_target(first)
+    let mut chars = arg.chars();
+    let target = match chars.next()? {
+        quote @ ('"' | '\'') => {
+            // Take everything up to the matching closing quote as the
+            // literal path. An unterminated quote falls back to "the rest
+            // of the argument" rather than silently truncating.
+            let body = chars.as_str();
+            match body.find(quote) {
+                Some(end) => body[..end].to_string(),
+                None => body.to_string(),
+            }
+        }
+        _ => {
+            let mut result = String::new();
+            let mut it = arg.chars().peekable();
+            while let Some(c) = it.next() {
+                if c == '\\' {
+                    if let Some(&next) = it.peek() {
+                        if next.is_whitespace() {
+                            result.push(next);
+                            it.next();
+                            continue;
+                        }
+                    }
+                    result.push(c);
+                    continue;
+                }
+                if c.is_whitespace() {
+                    break;
+                }
+                result.push(c);
+            }
+            result
+        }
+    };
+    if target.is_empty() {
+        return None;
+    }
+    resolve_cd_target(&target)
 }
 
 fn sanitize_trust(value: Option<&str>) -> Option<String> {
@@ -2286,6 +2320,49 @@ mod tests {
         assert_eq!(extract_cd_target("cd ./relative"), None);
         assert_eq!(extract_cd_target("cd $VAR"), None);
         assert_eq!(extract_cd_target("git cd /tmp"), None);
+        assert_eq!(extract_cd_target("cd"), None);
+    }
+
+    /// C3: a quoted `cd` argument containing spaces must be indexed as the
+    /// full path, not truncated at the first space inside the quotes.
+    #[test]
+    fn extract_cd_target_quoted_path_with_spaces_keeps_full_path() {
+        assert_eq!(
+            extract_cd_target("cd \"/Users/roman/My Drive\""),
+            Some("/Users/roman/My Drive".to_string())
+        );
+        assert_eq!(
+            extract_cd_target("cd '/Users/roman/My Drive'"),
+            Some("/Users/roman/My Drive".to_string())
+        );
+    }
+
+    /// An unquoted argument with a backslash-escaped space is also a single
+    /// path, not two words.
+    #[test]
+    fn extract_cd_target_escaped_space_keeps_full_path() {
+        assert_eq!(
+            extract_cd_target("cd /Users/roman/My\\ Drive"),
+            Some("/Users/roman/My Drive".to_string())
+        );
+    }
+
+    /// An unquoted single path is unchanged, and an unquoted argument
+    /// followed by an unrelated second word is still cut at the first
+    /// (unescaped) space -- `cd /a/b c` really is two words.
+    #[test]
+    fn extract_cd_target_unquoted_path_unchanged() {
+        assert_eq!(
+            extract_cd_target("cd /tmp/foo"),
+            Some("/tmp/foo".to_string())
+        );
+        assert_eq!(extract_cd_target("cd /a/b c"), Some("/a/b".to_string()));
+    }
+
+    /// `cd -` and bare `cd` (no arg) behave the same as before the fix.
+    #[test]
+    fn extract_cd_target_cd_dash_and_bare_cd_unchanged() {
+        assert_eq!(extract_cd_target("cd -"), None);
         assert_eq!(extract_cd_target("cd"), None);
     }
 }

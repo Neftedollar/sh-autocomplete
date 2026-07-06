@@ -148,6 +148,18 @@ impl Default for Redactor {
 // Zsh history parser
 // ---------------------------------------------------------------------------
 
+/// Regex for zsh's extended-history format: `: <ts>:<elapsed>;<cmd>`.
+///
+/// Uses DOTALL (`(?s)`) so `(.*)` spans embedded newlines from a
+/// backslash-continuation entry that `read_history_lines` has already
+/// joined into one logical, possibly multiline, command. `^`/`$` stay
+/// anchored to the whole haystack rather than per physical line --
+/// MULTILINE mode is intentionally NOT enabled, since that would make `$`
+/// match at the first embedded newline instead of the end of the entry.
+fn extended_history_regex() -> Regex {
+    Regex::new(r"(?s)^: (\d+):\d+;(.*)$").expect("extended-history regex compiles")
+}
+
 /// Parses one logical zsh-history command from a raw line.
 ///
 /// Returns `(timestamp, command)`. Timestamp falls back to `0` when the
@@ -170,10 +182,83 @@ fn parse_history_line(line: &str, extended_re: &Regex) -> Option<(i64, String)> 
     }
 }
 
-/// Strip zsh's metafication byte (0x83) and return a UTF-8 string.
+/// Un-metafy zsh's history byte stream and return a UTF-8 string.
+///
+/// zsh metafies any byte needing escaping as two bytes: `0x83` (Meta)
+/// followed by `byte ^ 0x20`. Merely dropping the `0x83` marker (the
+/// previous implementation) leaves the XOR'd successor byte uncorrected,
+/// corrupting every metafied byte -- in practice, every non-ASCII character
+/// in the history file. A trailing lone `0x83` (malformed/truncated input)
+/// has no successor to XOR and is dropped rather than panicking.
 fn decode_zsh_bytes(bytes: &[u8]) -> String {
-    let cleaned: Vec<u8> = bytes.iter().copied().filter(|b| *b != 0x83).collect();
+    let mut cleaned: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut iter = bytes.iter().copied();
+    while let Some(b) = iter.next() {
+        if b == 0x83 {
+            match iter.next() {
+                // A genuine metafy pair never un-metafies to a newline
+                // (0x0a would come from XOR'ing 0x2a = '*', which zsh never
+                // metafies), so a mid-stream 0x83 immediately followed by a
+                // newline is a stray marker on corrupt/non-zsh input. Drop
+                // the 0x83 but keep the newline as-is rather than consuming
+                // it as the pair's second byte, which would silently merge
+                // two history entries into one.
+                Some(0x0a) => cleaned.push(0x0a),
+                Some(next) => cleaned.push(next ^ 0x20),
+                None => break, // trailing lone Meta marker: drop it
+            }
+        } else {
+            cleaned.push(b);
+        }
+    }
     String::from_utf8_lossy(&cleaned).into_owned()
+}
+
+/// Extract the first shell "word" out of a `cd` argument, honoring quotes
+/// and backslash-escaped spaces so a target containing spaces (e.g.
+/// `cd "/tmp/My Drive"`) is captured whole instead of being cut at the
+/// first space. A quoted argument (single or double) runs up to its
+/// matching closing quote; an unquoted argument stops at the first
+/// unescaped whitespace but folds a backslash-escaped space into the word.
+///
+/// Duplicated (rather than shared) from `db.rs::extract_cd_target`'s
+/// quote/escape handling: that function parses the live `record_history`
+/// path, this one parses raw history-file text during import, and `db.rs`
+/// is out of scope for this change.
+fn extract_cd_arg_token(arg: &str) -> String {
+    let mut chars = arg.chars();
+    match chars.next() {
+        Some(quote @ ('"' | '\'')) => {
+            let body = chars.as_str();
+            match body.find(quote) {
+                Some(end) => body[..end].to_string(),
+                None => body.to_string(),
+            }
+        }
+        Some(_) => {
+            let mut result = String::new();
+            let mut it = arg.chars().peekable();
+            while let Some(c) = it.next() {
+                if c == '\\' {
+                    if let Some(&next) = it.peek() {
+                        if next.is_whitespace() {
+                            result.push(next);
+                            it.next();
+                            continue;
+                        }
+                    }
+                    result.push(c);
+                    continue;
+                }
+                if c.is_whitespace() {
+                    break;
+                }
+                result.push(c);
+            }
+            result
+        }
+        None => String::new(),
+    }
 }
 
 /// Pull the cd target out of a `cd <arg>` line. Honors `~`, `~/...`, `$HOME`,
@@ -193,7 +278,7 @@ fn parse_cd_command(cmd: &str) -> Option<Option<String>> {
         // `cd` with no args -> $HOME
         return dirs::home_dir().map(|h| Some(h.to_string_lossy().into_owned()));
     }
-    let first = arg.split_whitespace().next().unwrap_or("");
+    let first = extract_cd_arg_token(arg);
     if first == "-" {
         return Some(None);
     }
@@ -216,7 +301,7 @@ fn parse_cd_command(cmd: &str) -> Option<Option<String>> {
         return Some(Some(format!("{home}/{rest}")));
     }
     if first.starts_with('/') {
-        return Some(Some(first.to_string()));
+        return Some(Some(first));
     }
     // Relative path: skip.
     None
@@ -287,7 +372,7 @@ pub fn import_zsh_history(db: &AppDb, path: &Path, redactor: &Redactor) -> Resul
         return Ok(summary);
     }
 
-    let extended_re = Regex::new(r"^: (\d+):\d+;(.*)$").expect("extended-history regex compiles");
+    let extended_re = extended_history_regex();
     let lines = read_history_lines(path)?;
 
     let mut last_cd_target: Option<String> = None;
@@ -417,8 +502,24 @@ fn read_f64_le<R: Read>(r: &mut R) -> std::io::Result<f64> {
     Ok(f64::from_le_bytes(buf))
 }
 
+/// Zoxide entries are filesystem paths; anything near this size means the
+/// u64 length header came from a corrupt/truncated db.zo, not a real path.
+/// Bounding the allocation on this before trusting the header keeps a bogus
+/// length from blowing up the allocator (and aborting the whole
+/// `shac import`) before `read_exact` ever gets a chance to fail cleanly.
+const MAX_ZOXIDE_STRING_LEN: usize = 1 << 20; // 1 MiB
+
 fn read_bincode_string<R: Read>(r: &mut R) -> std::io::Result<String> {
     let len = read_u64_le(r)? as usize;
+    if len > MAX_ZOXIDE_STRING_LEN {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "zoxide entry length {len} exceeds sane max ({MAX_ZOXIDE_STRING_LEN}); \
+                 likely a corrupt/truncated db.zo"
+            ),
+        ));
+    }
     let mut buf = vec![0u8; len];
     r.read_exact(&mut buf)?;
     Ok(String::from_utf8_lossy(&buf).into_owned())
@@ -707,7 +808,7 @@ mod tests {
 
     #[test]
     fn parses_extended_history_format() {
-        let re = Regex::new(r"^: (\d+):\d+;(.*)$").unwrap();
+        let re = extended_history_regex();
         let parsed = parse_history_line(": 1700000000:0;git status", &re).unwrap();
         assert_eq!(parsed.0, 1_700_000_000);
         assert_eq!(parsed.1, "git status");
@@ -715,10 +816,64 @@ mod tests {
 
     #[test]
     fn parses_plain_history_format() {
-        let re = Regex::new(r"^: (\d+):\d+;(.*)$").unwrap();
+        let re = extended_history_regex();
         let parsed = parse_history_line("ls -al", &re).unwrap();
         assert_eq!(parsed.0, 0);
         assert_eq!(parsed.1, "ls -al");
+    }
+
+    // -- C1: zsh metafication decode -----------------------------------------
+
+    #[test]
+    fn decode_zsh_bytes_unmetafies_cyrillic() {
+        // zsh metafies a byte `c` needing escape as `0x83, c ^ 0x20`. The
+        // Cyrillic capital Pe (U+041F, "П") is UTF-8 [0xd0, 0x9f]; zsh
+        // metafies the second byte (0x9f, high bit set) as 0x83, 0xbf
+        // (0x9f ^ 0x20 == 0xbf). The previous implementation only dropped
+        // the 0x83 marker and left 0xbf in place, corrupting the byte.
+        let raw = [0xd0u8, 0x83, 0xbf];
+        assert_eq!(decode_zsh_bytes(&raw), "\u{041F}");
+    }
+
+    #[test]
+    fn decode_zsh_bytes_unmetafies_emoji() {
+        // U+1F600 (😀) is UTF-8 [0xf0, 0x9f, 0x98, 0x80]; every byte has the
+        // high bit set, so zsh metafies all four: byte ^ 0x20 gives
+        // [0xd0, 0xbf, 0xb8, 0xa0], each preceded by 0x83.
+        let raw = [0x83, 0xd0, 0x83, 0xbf, 0x83, 0xb8, 0x83, 0xa0];
+        assert_eq!(decode_zsh_bytes(&raw), "\u{1F600}");
+    }
+
+    #[test]
+    fn decode_zsh_bytes_unmetafies_en_dash() {
+        // U+2013 (–) is UTF-8 [0xe2, 0x80, 0x93]; metafied as
+        // [0xc2, 0xa0, 0xb3] (each byte ^ 0x20), each preceded by 0x83.
+        let raw = [0x83, 0xc2, 0x83, 0xa0, 0x83, 0xb3];
+        assert_eq!(decode_zsh_bytes(&raw), "\u{2013}");
+    }
+
+    #[test]
+    fn decode_zsh_bytes_drops_trailing_lone_meta_marker() {
+        // A malformed/truncated stream ending in a lone 0x83 (no successor
+        // byte to XOR) must be dropped, not panic.
+        let raw = [b'a', 0x83];
+        assert_eq!(decode_zsh_bytes(&raw), "a");
+    }
+
+    #[test]
+    fn decode_zsh_bytes_stray_meta_before_newline_keeps_newline() {
+        // A genuine metafy pair never un-metafies to a newline (0x0a would
+        // come from XOR'ing 0x2a = '*', which zsh never metafies), so a
+        // mid-stream 0x83 immediately followed by 0x0a is a stray marker on
+        // corrupt/non-zsh input. The 0x83 must be dropped but the newline
+        // preserved -- not consumed as the pair's second byte, which would
+        // silently merge two history entries into one.
+        let raw = [b'A', 0x83, b'\n', b'B'];
+        assert_eq!(decode_zsh_bytes(&raw), "A\nB");
+        // The real metafication path (0x83 + a genuine metafied byte) must
+        // be unaffected by this special case.
+        let raw = [0xd0u8, 0x83, 0xbf];
+        assert_eq!(decode_zsh_bytes(&raw), "\u{041F}");
     }
 
     #[test]
@@ -764,6 +919,53 @@ mod tests {
     fn cd_relative_skipped() {
         assert!(parse_cd_command("cd ../foo").is_none());
         assert!(parse_cd_command("cd subdir").is_none());
+    }
+
+    /// M1: a quoted or backslash-escaped `cd` target containing spaces must
+    /// be captured whole during import, not truncated at the first space
+    /// (which previously fell through to "relative path: skip" and indexed
+    /// nothing at all, since the truncated token didn't start with '/').
+    #[test]
+    fn cd_quoted_and_escaped_targets_keep_full_path() {
+        assert_eq!(
+            parse_cd_command("cd \"/tmp/My Drive\""),
+            Some(Some("/tmp/My Drive".to_string()))
+        );
+        assert_eq!(
+            parse_cd_command("cd '/tmp/My Drive'"),
+            Some(Some("/tmp/My Drive".to_string()))
+        );
+        assert_eq!(
+            parse_cd_command("cd /tmp/My\\ Drive"),
+            Some(Some("/tmp/My Drive".to_string()))
+        );
+    }
+
+    #[test]
+    fn cd_unquoted_path_unchanged() {
+        assert_eq!(
+            parse_cd_command("cd /tmp/foo"),
+            Some(Some("/tmp/foo".to_string()))
+        );
+    }
+
+    #[test]
+    fn cd_dash_and_bare_cd_unchanged() {
+        assert_eq!(parse_cd_command("cd -"), Some(None));
+        let home = dirs::home_dir().map(|h| Some(h.to_string_lossy().into_owned()));
+        assert_eq!(parse_cd_command("cd"), home);
+    }
+
+    #[test]
+    fn cd_home_var_still_honored() {
+        let home = std::env::var("HOME")
+            .ok()
+            .or_else(|| dirs::home_dir().map(|h| h.to_string_lossy().into_owned()))
+            .unwrap();
+        assert_eq!(
+            parse_cd_command("cd $HOME/x"),
+            Some(Some(format!("{home}/x")))
+        );
     }
 
     #[test]
@@ -950,6 +1152,95 @@ mod tests {
             total, 5,
             "history_events table must contain 5 rows, got {total}"
         );
+    }
+
+    /// C2: a zsh extended-history entry spanning multiple physical lines via
+    /// a trailing-backslash continuation. `read_history_lines` joins the
+    /// physical lines into one logical entry with embedded `\n`s, so the
+    /// extended-history regex's `(.*)` must be able to cross those newlines
+    /// (DOTALL) or the whole entry falls into the plain-format branch and
+    /// gets stored verbatim, metadata prefix included.
+    #[test]
+    fn parses_multiline_extended_history_entry() {
+        let (dir, db) = open_test_db();
+        let contents: &[u8] = b": 1700000000:0;for i in 1 2 3; do \\\n  echo $i\\\ndone\n";
+        let history = write_history_file(dir.path(), contents);
+        let red = Redactor::new();
+        import_zsh_history(&db, &history, &red).expect("import must succeed");
+
+        let events = db.recent_events(10).expect("recent_events");
+        assert_eq!(
+            events.len(),
+            1,
+            "expected exactly one history row, got {events:?}"
+        );
+        let cmd = &events[0].command;
+        assert!(
+            !cmd.contains(": 1700000000:"),
+            "extended-history metadata prefix leaked into stored command: {cmd:?}"
+        );
+        assert_eq!(cmd, "for i in 1 2 3; do \n  echo $i\ndone");
+    }
+
+    /// A normal single-line extended-history entry must still parse
+    /// identically after the multiline fix (DOTALL doesn't change `^`/`$`
+    /// anchoring semantics).
+    #[test]
+    fn single_line_extended_history_entry_unaffected_by_multiline_fix() {
+        let (dir, db) = open_test_db();
+        let history = write_history_file(dir.path(), b": 1700000000:0;echo hi\n");
+        let red = Redactor::new();
+        import_zsh_history(&db, &history, &red).expect("import must succeed");
+        let events = db.recent_events(10).expect("recent_events");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].command, "echo hi");
+        assert_eq!(events[0].ts, 1_700_000_000);
+    }
+
+    // -- C4: zoxide length-guard ----------------------------------------------
+
+    #[test]
+    fn read_bincode_string_rejects_implausible_length_without_aborting() {
+        // A corrupt/truncated db.zo can carry an unvalidated u64 length
+        // header; if it's huge, a naive `vec![0u8; len]` allocation aborts
+        // the process before `read_exact` ever gets a chance to fail
+        // cleanly. No payload bytes follow the (implausible) length.
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(&u64::MAX.to_le_bytes());
+        let mut cursor = std::io::Cursor::new(buf);
+        let result = read_bincode_string(&mut cursor);
+        assert!(
+            result.is_err(),
+            "implausible length must be rejected with Err, not allocated"
+        );
+    }
+
+    #[test]
+    fn read_bincode_string_rejects_truncated_payload_gracefully() {
+        // Length header claims 100 bytes but only 3 are actually present.
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(&100u64.to_le_bytes());
+        buf.extend_from_slice(b"abc");
+        let mut cursor = std::io::Cursor::new(buf);
+        let result = read_bincode_string(&mut cursor);
+        assert!(
+            result.is_err(),
+            "truncated payload must return Err, not panic"
+        );
+    }
+
+    #[test]
+    fn zoxide_import_survives_corrupt_length_header() {
+        let (dir, db) = open_test_db();
+        let zo_path = dir.path().join("db.zo");
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(&3u32.to_le_bytes()); // version 3
+        buf.extend_from_slice(&1u64.to_le_bytes()); // count = 1
+                                                    // Corrupt entry: implausible length header, no payload behind it.
+        buf.extend_from_slice(&u64::MAX.to_le_bytes());
+        std::fs::write(&zo_path, &buf).unwrap();
+        let summary = import_zoxide(&db, &zo_path).expect("import_zoxide must not panic/abort");
+        assert_eq!(summary.inserted, 0);
     }
 }
 
