@@ -43,6 +43,13 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
   typeset -g _shac_inline_request_id=""
   typeset -g _shac_pending_tip_id=""
   typeset -g _shac_pending_tip_text=""
+  # Declared defensively so the first _shac_clear_highlights filter (below)
+  # always sees a real array: zle owns region_highlight and normally declares
+  # it, but nothing guarantees zle has touched it yet at source time (e.g. in
+  # the non-interactive test harness), and filtering an unset parameter with
+  # ${(@)region_highlight:#...} yields a bogus single empty-string element.
+  typeset -ga region_highlight
+  typeset -ga _shac_region_highlights=()
 
   if command -v shac >/dev/null 2>&1; then
     eval "$(shac shell-env --shell zsh 2>/dev/null)"
@@ -129,7 +136,31 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
     return 1
   }
 
+  function _shac_clear_highlights() {
+    # Remove exactly the region_highlight entries we previously added
+    # (matched by their literal "start end style" string), leaving any
+    # entries another zle consumer (e.g. a syntax highlighter) may have
+    # added untouched. ${array:#pattern} always does glob-pattern matching,
+    # so a tracked entry whose style contains glob metacharacters (*, [, ...)
+    # could mismatch; ${array[(Ie)value]} instead does a literal (non-glob)
+    # index lookup, so filter by rebuilding region_highlight from that.
+    local entry
+    local -a keep=()
+    for entry in "${region_highlight[@]}"; do
+      (( ${_shac_region_highlights[(Ie)$entry]} )) || keep+=("$entry")
+    done
+    region_highlight=("${keep[@]}")
+    _shac_region_highlights=()
+  }
+
+  function _shac_add_highlight() {
+    local entry="$1 $2 $3"
+    region_highlight+=("$entry")
+    _shac_region_highlights+=("$entry")
+  }
+
   function _shac_clear_menu_display() {
+    _shac_clear_highlights
     POSTDISPLAY=""
     if zle; then
       zle -R -c
@@ -144,6 +175,7 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
       _shac_inline_item_key=""
       _shac_inline_request_id=""
       if ! (( _shac_menu_open )); then
+        _shac_clear_highlights
         POSTDISPLAY=""
         if zle; then
           zle -R -c
@@ -155,7 +187,13 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
   function _shac_show_inline() {
     local suffix="$1"
     [[ -z "$suffix" ]] && return
-    POSTDISPLAY=$'\e[2m\e[38;5;240m'"$suffix"$'\e[0m'
+    # POSTDISPLAY is rendered literally by zle -- embedding raw ANSI here
+    # shows as caret-notation garbage (^[[2m...) instead of dim text. Style
+    # the region via region_highlight instead, spanning the ghost-text
+    # region that starts right after the visible buffer.
+    _shac_clear_highlights
+    POSTDISPLAY="$suffix"
+    _shac_add_highlight "${#BUFFER}" "$(( ${#BUFFER} + ${#POSTDISPLAY} ))" "fg=244"
     if zle; then
       zle -R
     fi
@@ -443,6 +481,11 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
     local detail="${_shac_ui_menu_detail:-compact}"
     local -a parts
 
+    # REPLY2 signals whether the caller should tint REPLY via region_highlight.
+    # REPLY itself is always plain text -- POSTDISPLAY is rendered literally
+    # by zle, so raw ANSI here would show as caret-notation garbage.
+    REPLY2=0
+
     if [[ "$detail" == "minimal" ]]; then
       REPLY=""
       return
@@ -459,15 +502,13 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
     if (( ${#parts[@]} == 0 )); then
       REPLY=""
     else
-      local raw="[${(j:/:)parts}]"
+      REPLY="[${(j:/:)parts}]"
       # Cosmetic tint: path_jump candidates (hybrid-cd, frecent global
       # paths) render with a cyan label so they're distinguishable from
-      # local cwd children at a glance. SHAC_NO_COLOR=1 disables ANSI
-      # output; default is on for interactive shells.
+      # local cwd children at a glance. SHAC_NO_COLOR=1 disables the tint;
+      # default is on for interactive shells.
       if [[ "$kind" == "path_jump" && -z "${SHAC_NO_COLOR:-}" ]]; then
-        REPLY=$'\e[36m'"$raw"$'\e[0m'
-      else
-        REPLY="$raw"
+        REPLY2=1
       fi
     fi
   }
@@ -483,6 +524,7 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
       _shac_clear_menu_display
       return
     fi
+    _shac_clear_highlights
 
     local limit="${_shac_ui_max_items:-8}"
     if (( limit <= 0 )); then
@@ -506,6 +548,14 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
     lines+=("shac ${_shac_menu_selected_index}/${total}")
 
     local i marker display kind source description line label
+    local -i tint_arrow tint_label arrow_offset label_offset
+    # Running offset (0-based chars within the eventual POSTDISPLAY string)
+    # where the line about to be built will start. POSTDISPLAY begins with a
+    # leading "\n" (position 0), so the header line above starts at 1; this
+    # tracks where each subsequent item line starts so path_jump tints can be
+    # expressed as region_highlight spans rather than embedded ANSI (zle
+    # renders POSTDISPLAY literally).
+    local -i line_offset=$(( 1 + ${#lines[1]} + 1 ))
     for (( i = start; i <= end; i++ )); do
       marker=" "
       if (( i == _shac_menu_selected_index )); then
@@ -515,17 +565,20 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
       kind="${_shac_menu_kinds[$i]}"
       source="${_shac_menu_sources[$i]}"
       description="${_shac_menu_descriptions[$i]}"
-      # Cosmetic tint: replace the leading arrow on path_jump items with a
-      # cyan-tinted arrow so frecent global paths are distinguishable from
-      # local cwd children at a glance. Idempotent — only the arrow glyph
-      # is colorized, the rest of the display string is unchanged.
-      if [[ "$kind" == "path_jump" && -z "${SHAC_NO_COLOR:-}" && "$display" == $'→ '* ]]; then
-        display=$'\e[36m→\e[0m'"${display#$'→'}"
-      fi
       line="${marker} ${display}"
+      # Cosmetic tint: path_jump candidates (hybrid-cd, frecent global paths)
+      # render with a cyan arrow so they're distinguishable from local cwd
+      # children at a glance. Idempotent — only the arrow glyph is tinted.
+      tint_arrow=0
+      if [[ "$kind" == "path_jump" && -z "${SHAC_NO_COLOR:-}" && "$display" == $'→ '* ]]; then
+        tint_arrow=1
+        arrow_offset=$(( line_offset + ${#marker} + 1 ))
+      fi
       _shac_render_metadata_label "$kind" "$source"
       label="$REPLY"
+      tint_label=$REPLY2
       if [[ -n "$label" ]]; then
+        label_offset=$(( line_offset + ${#line} + 1 ))
         line="${line} ${label}"
       fi
       if [[ -n "$description" ]] && _shac_should_show_description; then
@@ -538,6 +591,9 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
         fi
       fi
       lines+=("$line")
+      (( tint_arrow )) && _shac_add_highlight "$(( ${#BUFFER} + arrow_offset ))" "$(( ${#BUFFER} + arrow_offset + 1 ))" "fg=6"
+      (( tint_label )) && _shac_add_highlight "$(( ${#BUFFER} + label_offset ))" "$(( ${#BUFFER} + label_offset + ${#label} ))" "fg=6"
+      line_offset=$(( line_offset + ${#line} + 1 ))
     done
 
     if [[ -n "$_shac_pending_tip_text" && -z "${SHAC_NO_TIPS:-}" ]]; then
@@ -558,6 +614,7 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
   function _shac_render_tip_only() {
     [[ -z "$_shac_pending_tip_text" ]] && return 0
     [[ -n "${SHAC_NO_TIPS:-}" ]] && return 0
+    _shac_clear_highlights
     local bullet="💡"
     if [[ -n "${SHAC_NO_COLOR:-}" ]]; then
       bullet="tip:"

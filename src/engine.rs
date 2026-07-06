@@ -1404,31 +1404,38 @@ impl Engine {
         let (dir, prefix) = split_path_token(token, cwd);
         let insertion_prefix = path_insertion_prefix(token);
         let dir_string = dir.to_string_lossy().to_string();
+        // Sub-second precision: truncating to whole seconds (`as_secs`)
+        // makes a file created in the same wall-clock second as the cached
+        // snapshot invisible until the directory mtime ticks over to the
+        // next second. Nanoseconds since epoch still fit comfortably in i64.
         let mtime = dir
             .metadata()
             .ok()
             .and_then(|meta| meta.modified().ok())
             .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|duration| duration.as_secs() as i64)
+            .map(|duration| duration.as_nanos() as i64)
             .unwrap_or_default();
 
+        // Join/split on NUL, not '\n': filenames may legally contain a
+        // newline, which would otherwise split one entry into phantom
+        // fragments on a cache-hit read. NUL cannot appear in a filename.
         let entries = if let Some((cached_mtime, entries)) = self.db.get_dir_cache(&dir_string)? {
             if cached_mtime == mtime {
                 entries
-                    .split('\n')
+                    .split('\0')
                     .filter(|item| !item.is_empty())
                     .map(ToOwned::to_owned)
                     .collect::<Vec<_>>()
             } else {
                 let entries = read_dir_entries(&dir)?;
                 self.db
-                    .upsert_dir_cache(&dir_string, mtime, &entries.join("\n"))?;
+                    .upsert_dir_cache(&dir_string, mtime, &entries.join("\0"))?;
                 entries
             }
         } else {
             let entries = read_dir_entries(&dir)?;
             self.db
-                .upsert_dir_cache(&dir_string, mtime, &entries.join("\n"))?;
+                .upsert_dir_cache(&dir_string, mtime, &entries.join("\0"))?;
             entries
         };
 
@@ -1656,8 +1663,11 @@ fn push_candidate(
     seen: &mut HashSet<String>,
     candidate: Candidate,
 ) {
-    let key = format!("{}::{}", candidate.kind, candidate.insert_text);
-    if seen.insert(key) {
+    // Dedup by insert_text alone: the same insertion arriving from two
+    // sources under different kinds (e.g. a path from the path cache and the
+    // same path from history) must render as one menu row, not one per kind.
+    // Candidates are pushed in priority order, so the first occurrence wins.
+    if seen.insert(candidate.insert_text.clone()) {
         candidates.push(candidate);
     }
 }
@@ -3126,6 +3136,44 @@ mod tests {
     }
 
     #[test]
+    fn push_candidate_dedups_by_insert_text_regardless_of_kind() {
+        // Two candidates with identical insert_text but different kinds (e.g.
+        // a path from the path cache and the same string from history) must
+        // collapse to a single menu row — the first (highest-priority, since
+        // candidates are pushed in priority order) occurrence wins.
+        let mut candidates = Vec::new();
+        let mut seen = HashSet::new();
+        push_candidate(
+            &mut candidates,
+            &mut seen,
+            Candidate {
+                insert_text: "src/".to_string(),
+                display: "src/".to_string(),
+                kind: "path".to_string(),
+                source: "path".to_string(),
+                description: None,
+            },
+        );
+        push_candidate(
+            &mut candidates,
+            &mut seen,
+            Candidate {
+                insert_text: "src/".to_string(),
+                display: "src/".to_string(),
+                kind: "history".to_string(),
+                source: "history".to_string(),
+                description: None,
+            },
+        );
+        assert_eq!(
+            candidates.len(),
+            1,
+            "identical insert_text from different kinds must not duplicate"
+        );
+        assert_eq!(candidates[0].kind, "path", "first-pushed occurrence wins");
+    }
+
+    #[test]
     fn display_strips_control_bytes_from_filename() {
         // a filename containing an ESC must not carry it into `display`.
         let cleaned = super::sanitize_display("na\u{1b}[31mme");
@@ -4391,5 +4439,96 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&big);
+    }
+
+    #[test]
+    fn dir_cache_roundtrips_filename_containing_newline() {
+        // Regression: dir cache entries used to be joined with '\n' on write
+        // and split on '\n' on read, so a filename containing an embedded
+        // newline was silently split into phantom entries on a cache-hit
+        // read. Filenames cannot contain NUL, so join/split on NUL instead.
+        use std::fs;
+        let (engine, _dir) = test_engine("dir-cache-newline");
+        let target = unique_tmp("shac-dir-cache-newline");
+        let weird_name = "weird\nname.txt";
+        fs::write(target.join(weird_name), b"").expect("create file with embedded newline");
+
+        // First call: cache miss, populates the dir cache from disk.
+        let mut first = Vec::new();
+        let mut seen = HashSet::new();
+        engine
+            .collect_path_candidates("", &target.to_string_lossy(), false, &mut first, &mut seen)
+            .expect("collect path candidates (cache miss)");
+
+        // Second call with unchanged dir mtime: cache hit — must read back
+        // the same single entry, not two phantom fragments split on the
+        // embedded newline.
+        let mut second = Vec::new();
+        let mut seen2 = HashSet::new();
+        engine
+            .collect_path_candidates(
+                "",
+                &target.to_string_lossy(),
+                false,
+                &mut second,
+                &mut seen2,
+            )
+            .expect("collect path candidates (cache hit)");
+
+        assert_eq!(
+            second.len(),
+            1,
+            "expected exactly one candidate for one file, got: {:?}",
+            second.iter().map(|c| &c.insert_text).collect::<Vec<_>>()
+        );
+        assert_eq!(second[0].insert_text, weird_name);
+
+        let _ = fs::remove_dir_all(&target);
+    }
+
+    #[test]
+    fn dir_cache_freshness_detects_same_second_modification() {
+        // Regression: cache freshness used to compare directory mtime
+        // truncated to whole seconds (`as_secs`), so a file created in the
+        // same wall-clock second as the cached snapshot stayed invisible
+        // until the directory's mtime ticked over to the next second.
+        // Compare with sub-second (nanosecond) precision instead.
+        use std::fs;
+        let (engine, _dir) = test_engine("dir-cache-mtime");
+        let target = unique_tmp("shac-dir-cache-mtime");
+        fs::write(target.join("a.txt"), b"").expect("create a.txt");
+
+        // Populate the cache from the initial listing (cache miss).
+        let mut first = Vec::new();
+        let mut seen = HashSet::new();
+        engine
+            .collect_path_candidates("", &target.to_string_lossy(), false, &mut first, &mut seen)
+            .expect("collect path candidates (cache miss)");
+        assert!(first.iter().any(|c| c.insert_text == "a.txt"));
+
+        // Add a second file immediately after — on any modern filesystem
+        // this bumps the directory's sub-second mtime even when the
+        // whole-second value (the old, buggy comparison key) is unchanged.
+        fs::write(target.join("b.txt"), b"").expect("create b.txt");
+
+        let mut second = Vec::new();
+        let mut seen2 = HashSet::new();
+        engine
+            .collect_path_candidates(
+                "",
+                &target.to_string_lossy(),
+                false,
+                &mut second,
+                &mut seen2,
+            )
+            .expect("collect path candidates (should detect new file)");
+
+        assert!(
+            second.iter().any(|c| c.insert_text == "b.txt"),
+            "expected b.txt to be visible immediately after creation, got: {:?}",
+            second.iter().map(|c| &c.insert_text).collect::<Vec<_>>()
+        );
+
+        let _ = fs::remove_dir_all(&target);
     }
 }
