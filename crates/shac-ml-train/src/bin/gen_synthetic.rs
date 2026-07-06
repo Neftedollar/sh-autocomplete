@@ -41,7 +41,7 @@ async fn main() -> Result<()> {
         let mut events: Vec<SyntheticEvent> = Vec::new();
         for persona in persona_list {
             for session_idx in 0..persona.sessions_to_generate {
-                let session = generate_session(&qwen, persona, session_idx)?;
+                let session = generate_session(&qwen, persona, session_idx).await?;
                 if args.dry_run {
                     for ev in session.iter().take(10) {
                         println!("[dry] {} | {} | {}", ev.persona_id, ev.cwd, ev.command);
@@ -92,8 +92,8 @@ fn group_by_os<'a>(
     out
 }
 
-fn generate_session(
-    qwen: &dyn QwenLike,
+async fn generate_session(
+    qwen: &impl QwenLike,
     persona: &Persona,
     session_idx: usize,
 ) -> Result<Vec<SyntheticEvent>> {
@@ -112,6 +112,7 @@ fn generate_session(
     );
     let raw = qwen
         .generate(&system, &user, &GenerationConfig::default())
+        .await
         .with_context(|| format!("generate session {} for {}", session_idx, persona.id))?;
 
     let mut events = Vec::new();
@@ -124,6 +125,7 @@ fn generate_session(
         events.push(SyntheticEvent {
             schema_version: SCHEMA_VERSION,
             persona_id: persona.id.clone(),
+            session_id: session_idx as u32,
             os: persona.os.clone(),
             cwd: persona.cwd_pattern.clone(),
             command: cmd.clone(),

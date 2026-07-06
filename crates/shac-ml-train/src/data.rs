@@ -22,11 +22,17 @@ pub const SCHEMA_VERSION: u32 = 1;
 pub struct SyntheticEvent {
     pub schema_version: u32,
     pub persona_id: String,
-    pub os: String,                 // "darwin" | "linux"
-    pub cwd: String,                // already-scrubbed path template
+    // Disambiguates independent sessions generated for the same persona;
+    // (persona_id, session_id) is the session-boundary key downstream in
+    // distill. `serde(default)` so pre-session-id JSONL still parses (all
+    // events land in session 0, i.e. one big session — regenerate to fix).
+    #[serde(default)]
+    pub session_id: u32,
+    pub os: String,  // "darwin" | "linux"
+    pub cwd: String, // already-scrubbed path template
     pub command: String,
     pub prev_command: Option<String>,
-    pub ts_offset_secs: i64,        // synthetic monotonic clock within session
+    pub ts_offset_secs: i64, // synthetic monotonic clock within session
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -34,8 +40,8 @@ pub struct DistilledExample {
     pub schema_version: u32,
     pub os: String,
     pub cwd_bucket: u8,
-    pub context_tokens: Vec<u32>,   // length = context_len, padded with <PAD>
-    pub hard_label: u32,            // ground-truth next-token id
+    pub context_tokens: Vec<u32>, // length = context_len, padded with <PAD>
+    pub hard_label: u32,          // ground-truth next-token id
     pub soft_targets_top: Vec<(u32, f32)>, // top-k from teacher; rest = uniform residual
 }
 
@@ -44,7 +50,8 @@ pub fn read_jsonl<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Vec<T>> {
     let reader = BufReader::new(file);
     let mut out = Vec::new();
     for (lineno, line) in reader.lines().enumerate() {
-        let line = line.with_context(|| format!("read line {} of {}", lineno + 1, path.display()))?;
+        let line =
+            line.with_context(|| format!("read line {} of {}", lineno + 1, path.display()))?;
         if line.trim().is_empty() {
             continue;
         }

@@ -13,7 +13,9 @@
 
 use burn::config::Config;
 use burn::module::Module;
-use burn::nn::transformer::{TransformerEncoder, TransformerEncoderConfig, TransformerEncoderInput};
+use burn::nn::transformer::{
+    TransformerEncoder, TransformerEncoderConfig, TransformerEncoderInput,
+};
 use burn::nn::{Embedding, EmbeddingConfig, LayerNorm, LayerNormConfig, Linear, LinearConfig};
 use burn::tensor::backend::Backend;
 use burn::tensor::{Int, Tensor};
@@ -58,6 +60,25 @@ impl Default for StudentModelConfig {
             hidden_dim: 64,
             intermediate_dim: 128,
             dropout: 0.1,
+        }
+    }
+}
+
+impl StudentModelConfig {
+    /// Config with `vocab_size` taken from an actual loaded [`Vocab`] (or any
+    /// other authoritative count), all other fields at their defaults.
+    ///
+    /// `train`/`eval` must never hardcode `vocab_size` independently of the
+    /// vocab file used to build the dataset: a stale default here silently
+    /// mismatches the real vocab (`one_hot` panics mid-training, or soft/hard
+    /// labels beyond the configured size are dropped/misjudged).
+    ///
+    /// (Named `for_vocab_size`, not `with_vocab_size` — the `Config` derive
+    /// above already generates a builder-style `with_vocab_size(self, ...)`.)
+    pub fn for_vocab_size(vocab_size: usize) -> Self {
+        Self {
+            vocab_size,
+            ..Self::default()
         }
     }
 }
@@ -132,9 +153,7 @@ impl<B: Backend> StudentModel<B> {
         let hidden = token_embed + pos_embed;
 
         // Transformer encoder: [batch, ctx_len, hidden_dim] → same shape
-        let encoded = self
-            .encoder
-            .forward(TransformerEncoderInput::new(hidden));
+        let encoded = self.encoder.forward(TransformerEncoderInput::new(hidden));
 
         // Extract last position: [batch, 1, hidden_dim]
         // burn 0.21.0-pre.4: Param::val() needed to get tensor from Embedding.weight

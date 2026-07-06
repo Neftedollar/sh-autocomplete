@@ -9,6 +9,7 @@
 //!   model loaded from Hugging Face.
 
 use anyhow::Result;
+use std::future::Future;
 
 // ---------------------------------------------------------------------------
 // Public always-on types
@@ -37,11 +38,17 @@ impl Default for GenerationConfig {
 
 /// Trait implemented by both the real [`Qwen`] model and [`MockQwen`].
 ///
-/// Methods are synchronous so callers don't need an async runtime. The real
-/// implementation wraps async mistralrs calls with a dedicated tokio runtime.
+/// Methods are async — the real implementation awaits mistralrs calls
+/// directly on the caller's tokio runtime. Callers must run inside a tokio
+/// context (e.g. `#[tokio::main]`).
 pub trait QwenLike: Send + Sync {
     /// Generate a completion given a system and user prompt.
-    fn generate(&self, system: &str, user: &str, cfg: &GenerationConfig) -> Result<String>;
+    fn generate(
+        &self,
+        system: &str,
+        user: &str,
+        cfg: &GenerationConfig,
+    ) -> impl Future<Output = Result<String>> + Send;
 
     /// Return the top-`top_k` next-token distribution for `prompt`.
     ///
@@ -60,7 +67,11 @@ pub trait QwenLike: Send + Sync {
     ///
     /// This gives exact probabilities from the model's softmax, not a
     /// sampling approximation.
-    fn next_token_distribution(&self, prompt: &str, top_k: usize) -> Result<Vec<(String, f32)>>;
+    fn next_token_distribution(
+        &self,
+        prompt: &str,
+        top_k: usize,
+    ) -> impl Future<Output = Result<Vec<(String, f32)>>> + Send;
 }
 
 // ---------------------------------------------------------------------------
@@ -92,11 +103,16 @@ impl Default for MockQwen {
 }
 
 impl QwenLike for MockQwen {
-    fn generate(&self, _system: &str, _user: &str, _cfg: &GenerationConfig) -> Result<String> {
+    async fn generate(
+        &self,
+        _system: &str,
+        _user: &str,
+        _cfg: &GenerationConfig,
+    ) -> Result<String> {
         Ok(self.canned_completion.clone())
     }
 
-    fn next_token_distribution(
+    async fn next_token_distribution(
         &self,
         _prompt: &str,
         _top_k: usize,
@@ -117,8 +133,6 @@ mod full_impl {
     use mistralrs::{
         IsqBits, ModelBuilder, RequestBuilder, SamplingParams, TextMessageRole, TextMessages,
     };
-    use std::sync::Arc;
-    use tokio::runtime::Runtime;
 
     /// Hugging Face model repo to load. We use the instruction-tuned 0.5B
     /// Qwen 2.5 variant: it has a chat template that respects system/user
@@ -141,7 +155,6 @@ mod full_impl {
     /// `exp()`. No sampling approximation is involved.
     pub struct Qwen {
         model: mistralrs::Model,
-        rt: Arc<Runtime>,
     }
 
     impl Qwen {
@@ -157,42 +170,32 @@ mod full_impl {
                 .await
                 .map_err(|e| anyhow!("Failed to load Qwen model: {e}"))?;
 
-            // Build a dedicated multi-thread runtime for the sync trait
-            // methods. `block_on` on this runtime is safe even if `Qwen::load`
-            // was awaited on a *different* tokio runtime, because `block_on`
-            // only panics when called from within the same runtime it's
-            // dispatching to. Do NOT switch to `Handle::current().block_on(...)`:
-            // that would panic when sync trait methods are called from inside
-            // an async context on the caller's runtime.
-            let rt = tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-                .map_err(|e| anyhow!("Failed to build runtime: {e}"))?;
-
-            Ok(Self {
-                model,
-                rt: Arc::new(rt),
-            })
+            Ok(Self { model })
         }
     }
 
     impl QwenLike for Qwen {
-        fn generate(&self, system: &str, user: &str, cfg: &GenerationConfig) -> Result<String> {
+        async fn generate(
+            &self,
+            system: &str,
+            user: &str,
+            cfg: &GenerationConfig,
+        ) -> Result<String> {
             let messages = TextMessages::new()
                 .add_message(TextMessageRole::System, system)
                 .add_message(TextMessageRole::User, user);
 
-            let request = RequestBuilder::from(messages)
-                .set_sampling(SamplingParams {
-                    temperature: Some(cfg.temperature as f64),
-                    top_p: Some(cfg.top_p as f64),
-                    max_len: Some(cfg.max_tokens),
-                    ..SamplingParams::neutral()
-                });
+            let request = RequestBuilder::from(messages).set_sampling(SamplingParams {
+                temperature: Some(cfg.temperature as f64),
+                top_p: Some(cfg.top_p as f64),
+                max_len: Some(cfg.max_tokens),
+                ..SamplingParams::neutral()
+            });
 
             let response = self
-                .rt
-                .block_on(self.model.send_chat_request(request))
+                .model
+                .send_chat_request(request)
+                .await
                 .map_err(|e| anyhow!("Inference error: {e}"))?;
 
             response
@@ -203,15 +206,14 @@ mod full_impl {
                 .ok_or_else(|| anyhow!("Model returned no content"))
         }
 
-        fn next_token_distribution(
+        async fn next_token_distribution(
             &self,
             prompt: &str,
             top_k: usize,
         ) -> Result<Vec<(String, f32)>> {
             // Use a plain user message with no system prompt; the prompt is
             // treated as the full context whose next token distribution we want.
-            let messages = TextMessages::new()
-                .add_message(TextMessageRole::User, prompt);
+            let messages = TextMessages::new().add_message(TextMessageRole::User, prompt);
 
             let request = RequestBuilder::from(messages)
                 // Request exactly 1 token so we capture the first-token distribution.
@@ -225,8 +227,9 @@ mod full_impl {
                 .return_logprobs(true);
 
             let response = self
-                .rt
-                .block_on(self.model.send_chat_request(request))
+                .model
+                .send_chat_request(request)
+                .await
                 .map_err(|e| anyhow!("Inference error: {e}"))?;
 
             let choice = response

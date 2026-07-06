@@ -97,6 +97,31 @@ pub fn default_zoxide_path() -> Option<PathBuf> {
 // Redaction
 // ---------------------------------------------------------------------------
 
+/// Secret-shape patterns — the single source of truth for two consumers:
+/// history import (`Redactor`) drops whole matching commands, and the
+/// shac-ml-train scrubber replaces each match with `<TOKEN>`. Because of the
+/// second consumer, every pattern must cover the FULL secret token, not just
+/// a distinguishing prefix.
+pub const SECRET_PATTERNS: &[&str] = &[
+    r"\bAKIA[0-9A-Z]{16}\b",
+    r"\bASIA[0-9A-Z]{16}\b",
+    r"\bxox[abprs]-[A-Za-z0-9-]{10,}\b",
+    // JWT: the payload/signature tails are optional, so detection is
+    // equivalent to the historical `eyJ…\.eyJ` prefix check while
+    // replacement consumes the whole token.
+    r"\beyJ[A-Za-z0-9_-]{20,}\.eyJ[A-Za-z0-9_-]*(?:\.[A-Za-z0-9_-]+)?",
+    r"\bgithub_pat_[A-Za-z0-9_]{82}\b",
+    // GitHub fine-grained token family: ghp_ (PAT), gho_ (OAuth), ghu_/ghs_
+    // (app user/server), ghr_ (refresh, longer than 36) — hence `{36,}`.
+    r"\bgh[oprsu]_[A-Za-z0-9]{36,}\b",
+    r"\bglpat-[A-Za-z0-9_-]{20,}\b",
+    r"\bnpm_[A-Za-z0-9]{36,}\b",
+    r"\bsk-[A-Za-z0-9]{32,}\b",
+    // `[^\s@]` (not `[^@]`) so a replacement match cannot greedily span
+    // whitespace to a later '@' in the same command line.
+    r"postgres(?:ql)?://[^\s@]+@",
+];
+
 /// Redactor compiles a single `RegexSet` for fast secret detection.
 pub struct Redactor {
     set: RegexSet,
@@ -104,17 +129,7 @@ pub struct Redactor {
 
 impl Redactor {
     pub fn new() -> Self {
-        let patterns = [
-            r"\bAKIA[0-9A-Z]{16}\b",
-            r"\bASIA[0-9A-Z]{16}\b",
-            r"\bxox[abprs]-[A-Za-z0-9-]{10,}\b",
-            r"\beyJ[A-Za-z0-9_-]{20,}\.eyJ",
-            r"\bgithub_pat_[A-Za-z0-9_]{82}\b",
-            r"\bghp_[A-Za-z0-9]{36}\b",
-            r"\bsk-[A-Za-z0-9]{32,}\b",
-            r"postgres(?:ql)?://[^@]+@",
-        ];
-        let set = RegexSet::new(patterns).expect("redaction patterns must compile");
+        let set = RegexSet::new(SECRET_PATTERNS).expect("redaction patterns must compile");
         Self { set }
     }
 
@@ -756,6 +771,21 @@ mod tests {
         let red = Redactor::new();
         assert!(red.matches("aws s3 ls AKIA1234567890ABCDEF"));
         assert!(!red.matches("ls /tmp"));
+    }
+
+    #[test]
+    fn redactor_detection_contract_over_shared_patterns() {
+        let red = Redactor::new();
+        // Detection must keep matching every shared secret shape…
+        assert!(red.matches("export K=ASIA1234567890ABCDEF"));
+        assert!(red.matches("psql postgres://roman:hunter2@localhost:5432/db"));
+        assert!(red.matches("slack --token xoxb-123456789012-abcdef"));
+        // Truncated JWT (no signature): the tail additions are optional, so
+        // the historical `eyJ…\.eyJ` prefix detection is preserved.
+        assert!(red.matches("curl -H 'Auth: eyJhbGciOiJIUzI1NiIsInR5cCJ9.eyJ'"));
+        // …and keep NOT matching benign commands.
+        assert!(!red.matches("docker run -p 8080:80 nginx"));
+        assert!(!red.matches("git log --since 12:30"));
     }
 
     #[test]

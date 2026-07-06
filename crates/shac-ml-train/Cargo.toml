@@ -9,11 +9,21 @@ publish = false
 [features]
 # Default = full training pipeline (incl. autodiff + mistralrs).
 # `model-only` = just the model + tokenizer + types, used by the shac runtime crate.
+# `scrub` = privacy-critical scrub module/bin/tests plus the data/personas
+# JSONL-and-TOML plumbing they and the pipeline-smoke test need — none of it
+# touches mistralrs/burn-autodiff, so CI can compile+test it without the
+# ~9.6 GB teacher stack. `full` includes `scrub`, so local default builds are
+# unaffected.
 default = ["full"]
-full = ["dep:mistralrs", "dep:burn-autodiff", "dep:burn-train", "dep:tokio"]
+full = ["scrub", "dep:mistralrs", "dep:burn-autodiff", "dep:burn-train", "dep:tokio"]
 model-only = []
+scrub = ["dep:shac"]
 
 [dependencies]
+# Root crate: single source of truth for secret patterns (import::SECRET_PATTERNS).
+# Optional + gated behind `scrub` (pulled in by `full` too) so `model-only`
+# (consumed by the shac runtime) cannot introduce a package dependency cycle.
+shac = { path = "../..", optional = true }
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
 serde = { version = "1.0", features = ["derive"] }
@@ -47,7 +57,7 @@ required-features = ["full"]
 [[bin]]
 name = "shac-ml-scrub"
 path = "src/bin/scrub.rs"
-required-features = ["full"]
+required-features = ["scrub"]
 
 [[bin]]
 name = "shac-ml-distill"
@@ -62,4 +72,28 @@ required-features = ["full"]
 [[bin]]
 name = "shac-ml-eval"
 path = "src/bin/eval.rs"
+required-features = ["full"]
+
+# Autodiscovered test targets get explicit `required-features` here so a
+# lightweight `--no-default-features --features "model-only scrub"` build
+# skips whatever it can't satisfy instead of hitting a hard compile error
+# (e.g. `train_eval_cli` shells out to the full-only train/eval binaries).
+[[test]]
+name = "scrub_redlist"
+path = "tests/scrub_redlist.rs"
+required-features = ["scrub"]
+
+[[test]]
+name = "personas_load"
+path = "tests/personas_load.rs"
+required-features = ["scrub"]
+
+[[test]]
+name = "pipeline_smoke"
+path = "tests/pipeline_smoke.rs"
+required-features = ["scrub"]
+
+[[test]]
+name = "train_eval_cli"
+path = "tests/train_eval_cli.rs"
 required-features = ["full"]

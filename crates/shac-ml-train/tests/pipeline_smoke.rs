@@ -26,6 +26,7 @@ fn end_to_end_roundtrip() {
         SyntheticEvent {
             schema_version: SCHEMA_VERSION,
             persona_id: "rust-test".into(),
+            session_id: 0,
             os: "darwin".into(),
             cwd: "/Users/roman/dev/shac".into(),
             command: "cargo test".into(),
@@ -35,6 +36,7 @@ fn end_to_end_roundtrip() {
         SyntheticEvent {
             schema_version: SCHEMA_VERSION,
             persona_id: "rust-test".into(),
+            session_id: 0,
             os: "darwin".into(),
             cwd: "/Users/roman/dev/shac".into(),
             command: "git status".into(),
@@ -106,7 +108,9 @@ fn end_to_end_roundtrip() {
     model.save_into(&mut store).unwrap();
 
     // File must exist and be non-empty.
-    let meta = bpk_path.metadata().expect("bpk file should exist after save");
+    let meta = bpk_path
+        .metadata()
+        .expect("bpk file should exist after save");
     assert!(meta.len() > 0, "saved .bpk file must not be empty");
 
     // ------------------------------------------------------------------ //
@@ -114,10 +118,8 @@ fn end_to_end_roundtrip() {
     // ------------------------------------------------------------------ //
     let input_data: Vec<i64> = ctx_vec.iter().map(|&x| x as i64).collect();
 
-    let input1: Tensor<B, 2, Int> = Tensor::from_data(
-        TensorData::new(input_data.clone(), [1, ctx_len]),
-        &device,
-    );
+    let input1: Tensor<B, 2, Int> =
+        Tensor::from_data(TensorData::new(input_data.clone(), [1, ctx_len]), &device);
     let logits1 = model.forward(input1);
 
     // Shape check: [1, vocab.size()]
@@ -139,10 +141,8 @@ fn end_to_end_roundtrip() {
     let mut store2 = BurnpackStore::from_file(&bpk_path).auto_extension(false);
     model_reloaded.load_from(&mut store2).unwrap();
 
-    let input2: Tensor<B, 2, Int> = Tensor::from_data(
-        TensorData::new(input_data, [1, ctx_len]),
-        &device,
-    );
+    let input2: Tensor<B, 2, Int> =
+        Tensor::from_data(TensorData::new(input_data, [1, ctx_len]), &device);
     let logits2 = model_reloaded.forward(input2);
     let flat2: Vec<f32> = logits2.into_data().to_vec().unwrap();
 
