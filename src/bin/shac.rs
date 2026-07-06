@@ -10,11 +10,14 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use shac::config::{AppConfig, AppPaths};
+use shac::context;
 use shac::engine::Engine;
 use shac::indexer;
 use shac::ml::{train_model, TrainOptions};
 use shac::protocol::{CompletionRequest, ExplainResponse, RecordCommandRequest, SessionInfo};
-use shac::shell::{BASH_COMPLETION, FISH_COMPLETION, ZSH_COMPLETION};
+use shac::quote::{quote_token, TokenContext};
+use shac::shell::{Shell, BASH_COMPLETION, FISH_COMPLETION, ZSH_COMPLETION};
+use shac::wire::encode_field;
 
 #[derive(Debug, Parser)]
 #[command(version, about = "Shell autocomplete engine CLI")]
@@ -1411,36 +1414,120 @@ fn daemon_action(paths: &AppPaths, action: DaemonAction) -> Result<()> {
 }
 
 fn complete(paths: &AppPaths, args: CompletionArgs) -> Result<()> {
+    let shell = Shell::parse(Some(&args.shell));
+    let (base_ctx, typed_home_user) = active_token_base_context(&args);
     if shac_disabled(paths)? {
-        print_completion_response(disabled_completion_response(), &args.format)?;
+        print_completion_response(
+            disabled_completion_response(),
+            shell,
+            base_ctx,
+            typed_home_user.as_deref(),
+            &args.format,
+        )?;
         return Ok(());
     }
     ensure_daemon(paths)?;
     let request = completion_request(&args);
     let response = send_request(paths, "complete", serde_json::to_value(request)?)?;
-    print_completion_response(response, &args.format)
+    print_completion_response(
+        response,
+        shell,
+        base_ctx,
+        typed_home_user.as_deref(),
+        &args.format,
+    )
 }
 
-fn print_completion_response(response: serde_json::Value, format: &str) -> Result<()> {
+/// The shared `TokenContext` fields that come from the CLI-supplied line
+/// itself rather than any individual candidate: the unterminated quote char
+/// of the active token (§4.3) and whether the active token as the user
+/// *actually typed it* already begins with a home-reference prefix (the
+/// other half of F3/F4 — see [`tilde_user_part`] and [`item_token_context`]).
+/// Recomputed here (rather than round-tripped through the daemon response)
+/// because the daemon only ever tells us a candidate's `kind`, not the raw
+/// line the user typed.
+fn active_token_base_context(args: &CompletionArgs) -> (TokenContext, Option<String>) {
+    let cwd = canonicalize_lossy(&args.cwd);
+    let parsed = context::parse(&args.line, args.cursor, Path::new(&cwd));
+    let base = TokenContext {
+        open_quote: parsed.open_quote,
+        ..TokenContext::default()
+    };
+    (base, tilde_user_part(&parsed.active_token))
+}
+
+/// The "user part" of a home-reference prefix -- WHICH home a leading
+/// `~`/`$HOME` denotes: `Some("")` for the current user's own home (`~`,
+/// `~/...`, `$HOME`, `$HOME/...`), `Some("<name>")` for `~name`/`~name/...`,
+/// and `None` when the token is not a home reference. Two home references
+/// target the same directory iff their user parts are equal -- the comparison
+/// `item_token_context` uses so a raw fs candidate keeps a bare tilde only when
+/// it continues the SAME home the user typed, never a different `~otheruser`
+/// the collector introduced (an attacker-planted `~root` dir must not hijack
+/// `cd ~<Tab>`).
+fn tilde_user_part(token: &str) -> Option<String> {
+    if let Some(rest) = token.strip_prefix("$HOME") {
+        return (rest.is_empty() || rest.starts_with('/')).then(String::new);
+    }
+    token
+        .strip_prefix('~')
+        .map(|rest| rest.chars().take_while(|c| *c != '/').collect())
+}
+
+/// The daemon `kind` values that only ever come from home-shortened
+/// `insert_text` (built via `shorten_with_home` in engine.rs), never from a
+/// raw filesystem entry. Used by [`item_token_context`] to derive signal (a)
+/// of `TokenContext::home_ref` (F3/F4).
+const HOME_SHORTENED_KINDS: &[&str] = &["path_jump", "workspace"];
+
+/// Build the per-item `TokenContext` from the shared base context (see
+/// [`active_token_base_context`]) plus the item's own `kind`. Split out from
+/// `print_completion_response` (which is I/O — println! — and awkward to
+/// assert against) so the wiring is unit-testable on its own.
+fn item_token_context(
+    ctx: &TokenContext,
+    typed_home_user: Option<&str>,
+    item: &serde_json::Value,
+) -> TokenContext {
+    let kind = item
+        .get("kind")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default();
+    // A candidate whose `kind` is a literal flag (e.g. python's `-V`) must
+    // stay a bare flag: the leading-dash guard in `quote_token` is only for
+    // path-like values that happen to start with `-` (spec §4.2), never for
+    // a candidate that IS a flag.
+    let is_option = kind == "option";
+    // F3/F4/F5 + bare-tilde hole: a candidate keeps a bare home prefix only when
+    // (a) the daemon assigned a home-shortened kind (path_jump/workspace, always
+    // the user's OWN home, unforgeable by a filename), or (b) the candidate's
+    // home reference denotes the SAME home target the user actually typed
+    // (equal user parts). Comparing user parts -- not a coarse "typed some
+    // tilde" bool -- stops a bare typed `~` from licensing a different
+    // `~otheruser` the fs collector introduced.
+    let candidate_home_user = item
+        .get("insert_text")
+        .and_then(|value| value.as_str())
+        .and_then(tilde_user_part);
+    let home_ref = HOME_SHORTENED_KINDS.contains(&kind)
+        || (typed_home_user.is_some() && candidate_home_user.as_deref() == typed_home_user);
+    TokenContext {
+        is_option,
+        home_ref,
+        ..ctx.clone()
+    }
+}
+
+fn print_completion_response(
+    response: serde_json::Value,
+    shell: Shell,
+    ctx: TokenContext,
+    typed_home_user: Option<&str>,
+    format: &str,
+) -> Result<()> {
     if format == "json" {
         println!("{}", serde_json::to_string_pretty(&response)?);
-    } else if format == "shell-metadata" {
-        if let Some(request_id) = response.get("request_id").and_then(|value| value.as_i64()) {
-            println!("__shac_request_id\t{request_id}");
-        } else {
-            println!("__shac_request_id\t");
-        }
-        let items = response
-            .get("items")
-            .and_then(|value| value.as_array())
-            .cloned()
-            .unwrap_or_default();
-        for item in items {
-            if let Some(display) = item.get("display").and_then(|value| value.as_str()) {
-                println!("{display}");
-            }
-        }
-    } else if format == "shell-tsv-v2" {
+    } else if format == "shell-tsv-v3" {
         let request_id = response
             .get("request_id")
             .and_then(|value| value.as_i64())
@@ -1457,8 +1544,8 @@ fn print_completion_response(response: serde_json::Value, format: &str) -> Resul
             .unwrap_or_default();
         println!(
             "__shac_request_id\t{}\t{}\t{}",
-            sanitize_shell_field(&request_id),
-            sanitize_shell_field(mode),
+            encode_field(&request_id),
+            encode_field(mode),
             items.len()
         );
         for item in items {
@@ -1487,25 +1574,23 @@ fn print_completion_response(response: serde_json::Value, format: &str) -> Resul
                 .and_then(|value| value.get("description"))
                 .and_then(|value| value.as_str())
                 .unwrap_or_default();
+            let item_ctx = item_token_context(&ctx, typed_home_user, &item);
+            let quoted_insert = quote_token(shell, &item_ctx, insert_text);
             println!(
                 "{}\t{}\t{}\t{}\t{}\t{}",
-                sanitize_shell_field(item_key),
-                sanitize_shell_field(insert_text),
-                sanitize_shell_field(display),
-                sanitize_shell_field(kind),
-                sanitize_shell_field(source),
-                sanitize_shell_field(description)
+                encode_field(item_key),
+                encode_field(&quoted_insert),
+                encode_field(display),
+                encode_field(kind),
+                encode_field(source),
+                encode_field(description)
             );
         }
         if let Some(tip) = response.get("tip").and_then(|v| v.as_object()) {
             let id = tip.get("id").and_then(|v| v.as_str()).unwrap_or("");
             let text = tip.get("text").and_then(|v| v.as_str()).unwrap_or("");
             if !id.is_empty() && !text.is_empty() {
-                println!(
-                    "__shac_tip\t{}\t{}",
-                    sanitize_shell_field(id),
-                    sanitize_shell_field(text)
-                );
+                println!("__shac_tip\t{}\t{}", encode_field(id), encode_field(text));
             }
         }
     } else {
@@ -1557,18 +1642,6 @@ fn disabled_completion_response() -> serde_json::Value {
         "mode": "replace_token",
         "fallback": true
     })
-}
-
-fn sanitize_shell_field(value: &str) -> String {
-    value
-        .chars()
-        .map(|ch| match ch {
-            '\t' | '\n' | '\r' => ' ',
-            _ => ch,
-        })
-        .collect::<String>()
-        .trim()
-        .to_string()
 }
 
 fn explain(paths: &AppPaths, args: CompletionArgs) -> Result<()> {
@@ -2059,5 +2132,168 @@ mod first_run_ux_tests {
             msg.contains(".zshrc") || msg.contains("write"),
             "error should mention the rc file or write failure, got: {msg}"
         );
+    }
+}
+
+#[cfg(test)]
+mod completion_response_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn item_token_context_marks_home_ref_for_home_shortened_kinds() {
+        // F3/F4: the shac.rs wiring must derive home_ref from the trusted
+        // `kind` field (never from insert_text content) — a path_jump or
+        // workspace candidate opts a bare tilde in, regardless of whether
+        // the user typed a home reference at all.
+        let ctx = TokenContext::default();
+        assert!(item_token_context(&ctx, None, &json!({"kind": "path_jump"})).home_ref);
+        assert!(item_token_context(&ctx, None, &json!({"kind": "workspace"})).home_ref);
+    }
+
+    #[test]
+    fn item_token_context_defaults_home_ref_false_for_raw_fs_and_other_kinds() {
+        // A raw filesystem entry (kind == "path") — even one literally named
+        // `~evil` — must not be treated as a home reference when the user
+        // typed no tilde at all (typed_home_user None, e.g. active token ""
+        // or "-r"), or it would tilde-expand on insertion instead of
+        // inserting literally.
+        let ctx = TokenContext::default();
+        assert!(
+            !item_token_context(&ctx, None, &json!({"kind": "path", "insert_text": "~evil"}))
+                .home_ref
+        );
+        assert!(!item_token_context(&ctx, None, &json!({"kind": "command"})).home_ref);
+        assert!(!item_token_context(&ctx, None, &json!({})).home_ref);
+    }
+
+    #[test]
+    fn item_token_context_ors_typed_home_prefix_into_home_ref() {
+        // The fs collector returns `kind == "path"` (not a HOME_SHORTENED_KINDS
+        // member) for `cd ~/Doc<Tab>`, echoing the user's own `~/` prefix
+        // back in `insert_text` ("~/Documents/"). `typed_home_user` carries
+        // the "user typed a home prefix" signal computed once by
+        // `active_token_base_context`; item_token_context must recognize
+        // that the candidate continues the SAME home (equal user parts,
+        // both `Some("")`) and set home_ref true rather than letting `kind`
+        // alone decide.
+        let ctx = TokenContext::default();
+        let item = json!({"kind": "path", "insert_text": "~/Documents/"});
+        assert!(item_token_context(&ctx, Some(""), &item).home_ref);
+    }
+
+    #[test]
+    fn tilde_user_part_parses_home_reference_user_parts() {
+        assert_eq!(tilde_user_part("~"), Some(String::new()));
+        assert_eq!(tilde_user_part("~/"), Some(String::new()));
+        assert_eq!(tilde_user_part("~/D"), Some(String::new()));
+        assert_eq!(tilde_user_part("~root/"), Some("root".to_string()));
+        assert_eq!(tilde_user_part("~alice"), Some("alice".to_string()));
+        assert_eq!(tilde_user_part("$HOME"), Some(String::new()));
+        assert_eq!(tilde_user_part("$HOME/x"), Some(String::new()));
+
+        // Not a home reference at all.
+        assert_eq!(tilde_user_part("$HOMEx"), None);
+        assert_eq!(tilde_user_part("My"), None);
+        assert_eq!(tilde_user_part("-r"), None);
+    }
+
+    #[test]
+    fn active_token_base_context_derives_home_ref_from_typed_line() {
+        // The wiring function itself: `cd ~/D<Tab>` types a home prefix, so
+        // the shared base context must carry the typed home user (the
+        // current user's OWN home, `Some("")`) even before any candidate's
+        // `kind` is known.
+        let with_tilde = CompletionArgs {
+            shell: "zsh".to_string(),
+            line: "cd ~/D".to_string(),
+            cursor: 6,
+            cwd: "/".to_string(),
+            prev_command: None,
+            history_commands: Vec::new(),
+            format: "shell-tsv-v3".to_string(),
+        };
+        assert_eq!(
+            active_token_base_context(&with_tilde).1,
+            Some(String::new())
+        );
+
+        let without_tilde = CompletionArgs {
+            line: "cd -r".to_string(),
+            cursor: 5,
+            ..with_tilde
+        };
+        assert_eq!(active_token_base_context(&without_tilde).1, None);
+    }
+
+    #[test]
+    fn cd_tilde_completion_insert_stays_bare_end_to_end() {
+        // Reproduces the BLOCKER end to end: given the fs collector's real
+        // output shape for `cd ~/D<Tab>` (kind "path", insert_text echoing
+        // the typed `~/` prefix), the formatter's full chain —
+        // active_token_base_context -> item_token_context -> quote_token —
+        // must leave the `~/` bare rather than escaping it to `\~/`.
+        let args = CompletionArgs {
+            shell: "zsh".to_string(),
+            line: "cd ~/D".to_string(),
+            cursor: 6,
+            cwd: "/".to_string(),
+            prev_command: None,
+            history_commands: Vec::new(),
+            format: "shell-tsv-v3".to_string(),
+        };
+        let (base_ctx, typed_home_user) = active_token_base_context(&args);
+        let item = json!({"kind": "path", "insert_text": "~/Documents/"});
+        let item_ctx = item_token_context(&base_ctx, typed_home_user.as_deref(), &item);
+        let quoted = quote_token(Shell::Zsh, &item_ctx, "~/Documents/");
+        assert_eq!(quoted, "~/Documents/");
+    }
+
+    #[test]
+    fn bare_tilde_typed_does_not_bare_a_different_user_home() {
+        // THE BUG this closes: an attacker-planted directory literally
+        // named `~root` returned by the raw fs collector must not keep a
+        // bare tilde just because the user typed a bare `~` (their OWN
+        // home) — that would let `cd ~<Tab>` insert an unescaped `~root/`,
+        // which the shell expands to a DIFFERENT user's home (/var/root)
+        // instead of the local `./~root` directory the fs entry denotes.
+        let ctx = TokenContext::default();
+        let evil = json!({"kind": "path", "insert_text": "~root/"});
+        assert!(!item_token_context(&ctx, Some(""), &evil).home_ref);
+
+        // The legitimate case `cd ~<Tab>` exists to serve — the fs
+        // collector's own home listing — must still keep its bare tilde.
+        let legit = json!({"kind": "path", "insert_text": "~/Documents/"});
+        assert!(item_token_context(&ctx, Some(""), &legit).home_ref);
+    }
+
+    #[test]
+    fn explicit_other_user_home_is_honored() {
+        // When the user explicitly types `~root<Tab>` themselves, a raw fs
+        // candidate continuing that SAME home (`~root/x`) is a genuine home
+        // reference and keeps its bare tilde.
+        let ctx = TokenContext::default();
+        let item = json!({"kind": "path", "insert_text": "~root/x"});
+        assert!(item_token_context(&ctx, Some("root"), &item).home_ref);
+    }
+
+    #[test]
+    fn item_token_context_marks_option_kind() {
+        let ctx = TokenContext::default();
+        let option_item = json!({"kind": "option"});
+        assert!(item_token_context(&ctx, None, &option_item).is_option);
+
+        let path_item = json!({"kind": "path"});
+        assert!(!item_token_context(&ctx, None, &path_item).is_option);
+    }
+
+    #[test]
+    fn item_token_context_preserves_shared_open_quote() {
+        let ctx = TokenContext {
+            open_quote: Some('"'),
+            ..Default::default()
+        };
+        let item = json!({"kind": "path"});
+        assert_eq!(item_token_context(&ctx, None, &item).open_quote, Some('"'));
     }
 }

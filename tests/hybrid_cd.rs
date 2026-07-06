@@ -47,11 +47,11 @@ fn cd_with_seeded_path_jump_returns_global_path() {
             "--cwd",
             cwd.to_str().expect("utf8 cwd"),
             "--format",
-            "shell-tsv-v2",
+            "shell-tsv-v3",
         ],
     );
 
-    // shell-tsv-v2 layout per data row: item_key, insert_text, display, kind, source, description.
+    // shell-tsv-v3 layout per data row: item_key, insert_text, display, kind, source, description.
     let mut found_path_jump = false;
     for line in output.lines() {
         let fields: Vec<&str> = line.split('\t').collect();

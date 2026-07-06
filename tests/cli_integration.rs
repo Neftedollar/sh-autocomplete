@@ -27,7 +27,7 @@ fn cli_daemon_records_exact_accept_and_recent_events() {
             "--cwd",
             &cwd,
             "--format",
-            "shell-tsv-v2",
+            "shell-tsv-v3",
         ],
     );
     let mut lines = completion.lines();
@@ -62,7 +62,7 @@ fn cli_daemon_records_exact_accept_and_recent_events() {
             "--cwd",
             &cwd,
             "--format",
-            "shell-tsv-v2",
+            "shell-tsv-v3",
         ],
     );
     assert!(
@@ -139,7 +139,7 @@ fn cli_daemon_records_exact_accept_and_recent_events() {
             "--cwd",
             path_root.to_str().expect("utf8 path root"),
             "--format",
-            "shell-tsv-v2",
+            "shell-tsv-v3",
         ],
     );
     assert!(
@@ -175,7 +175,7 @@ fn cli_daemon_records_exact_accept_and_recent_events() {
             "--cwd",
             path_root.to_str().expect("utf8 path root"),
             "--format",
-            "shell-tsv-v2",
+            "shell-tsv-v3",
         ],
     );
     assert!(
@@ -234,7 +234,7 @@ fn path_jump_appears_when_paths_index_seeded() {
             "--cwd",
             cwd.to_str().expect("utf8 cwd"),
             "--format",
-            "shell-tsv-v2",
+            "shell-tsv-v3",
         ],
     );
 
@@ -270,7 +270,7 @@ fn path_jump_absent_when_paths_index_empty() {
             "--cwd",
             cwd.to_str().expect("utf8 cwd"),
             "--format",
-            "shell-tsv-v2",
+            "shell-tsv-v3",
         ],
     );
 

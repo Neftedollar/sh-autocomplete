@@ -38,6 +38,7 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
   typeset -gi _shac_ui_inline_zsh=0
   typeset -gi _shac_inline_active=0
   typeset -g _shac_inline_suffix=""
+  typeset -g _shac_inline_insert_text=""
   typeset -g _shac_inline_item_key=""
   typeset -g _shac_inline_request_id=""
   typeset -g _shac_pending_tip_id=""
@@ -139,6 +140,7 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
     if (( _shac_inline_active )); then
       _shac_inline_active=0
       _shac_inline_suffix=""
+      _shac_inline_insert_text=""
       _shac_inline_item_key=""
       _shac_inline_request_id=""
       if ! (( _shac_menu_open )); then
@@ -159,26 +161,64 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
     fi
   }
 
+  function _shac_decode() {
+    # Reverse wire-format v3 field encoding: \\->\, \t->tab, \n->LF, \r->CR.
+    # An unrecognized escape (or a trailing lone backslash) passes through
+    # literally, mirroring src/wire.rs::decode_field exactly.
+    local s="$1"
+    local -i i=1
+    local -i len=${#s}
+    local out="" c next
+    while (( i <= len )); do
+      c="${s[i]}"
+      if [[ "$c" == "\\" ]]; then
+        if (( i < len )); then
+          next="${s[i+1]}"
+          case "$next" in
+            "\\") out+="\\" ;;
+            t) out+=$'\t' ;;
+            n) out+=$'\n' ;;
+            r) out+=$'\r' ;;
+            *) out+="\\${next}" ;;
+          esac
+          i+=2
+        else
+          out+="\\"
+          i+=1
+        fi
+      else
+        out+="$c"
+        i+=1
+      fi
+    done
+    REPLY="$out"
+  }
+
   function _shac_fetch_inline() {
     [[ -z "$BUFFER" ]] && return 1
     (( ${#BUFFER} < 2 )) && return 1
     [[ "$BUFFER" == *$'\n'* ]] && return 1
     local tty_value
     tty_value="$(tty 2>/dev/null || true)"
-    local found_item=0 insert_text="" item_key="" request_id="" line
+    local found_item=0 insert_text="" display="" item_key="" request_id="" line
     while IFS= read -r line; do
       [[ -z "$line" ]] && continue
       if [[ "$line" == __shac_request_id$'\t'* ]]; then
         local -a header=("${(ps:\t:)line}")
-        request_id="${header[2]:-}"
+        _shac_decode "${header[2]:-}"
+        request_id="$REPLY"
       elif [[ "$line" == __shac_*$'\t'* ]]; then
         # Skip any other sentinel rows (e.g. __shac_tip) — inline mode only
         # consumes real candidate rows.
         continue
       elif (( !found_item )); then
         local -a fields=("${(ps:\t:)line}")
-        item_key="${fields[1]:-}"
-        insert_text="${fields[2]:-}"
+        _shac_decode "${fields[1]:-}"
+        item_key="$REPLY"
+        _shac_decode "${fields[2]:-}"
+        insert_text="$REPLY"
+        _shac_decode "${fields[3]:-}"
+        display="$REPLY"
         found_item=1
       fi
     done < <(
@@ -187,11 +227,15 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
         --line "$BUFFER" \
         --cursor "$CURSOR" \
         --cwd "$PWD" \
-        --format shell-tsv-v2 \
+        --format shell-tsv-v3 \
         2>/dev/null | head -n3
     )
     (( found_item )) && [[ -n "$insert_text" ]] || return 1
-    _shac_preview_buffer_for_item "$BUFFER" "$CURSOR" "$insert_text"
+    # Ghost text previews the readable `display` remainder; the escaped
+    # `insert_text` is what actually lands in BUFFER on accept (see
+    # _shac_forward_char_widget), since it can't be substring-sliced at the
+    # typed/untyped boundary once it contains escape sequences.
+    _shac_preview_buffer_for_item "$BUFFER" "$CURSOR" "$display"
     local preview="$REPLY"
     [[ "$preview" == "$BUFFER" ]] && return 1
     local suffix
@@ -199,8 +243,8 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
       suffix="${preview[$((${#BUFFER}+1)),-1]}"
     else
       local token_prefix="${BUFFER##*[[:space:]]}"
-      if [[ -n "$token_prefix" && "$insert_text" == ${token_prefix}* ]]; then
-        suffix="${insert_text[$((${#token_prefix}+1)),-1]}"
+      if [[ -n "$token_prefix" && "$display" == ${token_prefix}* ]]; then
+        suffix="${display[$((${#token_prefix}+1)),-1]}"
       else
         return 1
       fi
@@ -208,6 +252,7 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
     [[ -z "$suffix" ]] && return 1
     _shac_inline_active=1
     _shac_inline_suffix="$suffix"
+    _shac_inline_insert_text="$insert_text"
     _shac_inline_item_key="$item_key"
     _shac_inline_request_id="$request_id"
     return 0
@@ -235,33 +280,68 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
     _shac_clear_inline
   }
 
+  function _shac_active_token_span() {
+    # Return the 1-based [start, end) span (REPLY, REPLY2) of the shell word
+    # containing the cursor in $1 at char offset $2: start is right after the
+    # last boundary at or before the cursor, end is the first boundary at or
+    # after the cursor (or len+1). A boundary is an unquoted, unescaped
+    # whitespace char -- mirrors context.rs's tokenize() rule that an open
+    # quote or a backslash suppresses it. This makes a quoted word containing
+    # a space -- e.g. `"My Do cs"` -- or an escaped space -- `My\ Docs` --
+    # one span (including its quote chars) on BOTH sides of the cursor, not
+    # split at the interior space. Naive `${s##*[[:space:]]}` /
+    # `${s%%[[:space:]]*}` splitting gets this wrong, which corrupts the
+    # buffer once insert_text is a self-contained quoted literal: it either
+    # duplicates/mismatches the already-typed prefix, or leaves a dangling
+    # fragment of the original quoted word (with its own stray closing quote)
+    # appended after the replacement.
+    local buf="$1"
+    local -i cursor="$2" i=1 len=${#buf} start=1 escaped=0
+    local -i end=$(( len + 1 ))
+    local quote="" c
+    while (( i <= len )); do
+      c="${buf[i]}"
+      if (( escaped )); then
+        escaped=0
+      elif [[ "$c" == "\\" ]]; then
+        escaped=1
+      elif [[ "$c" == '"' || "$c" == "'" ]]; then
+        if [[ "$quote" == "$c" ]]; then
+          quote=""
+        elif [[ -z "$quote" ]]; then
+          quote="$c"
+        fi
+      elif [[ -z "$quote" && "$c" == [[:space:]] ]]; then
+        if (( i <= cursor )); then
+          start=$(( i + 1 ))
+        elif (( end > len )); then
+          end=$i
+        fi
+      fi
+      i+=1
+    done
+    REPLY=$start
+    REPLY2=$end
+  }
+
   function _shac_preview_buffer_for_item() {
     local base_buffer="$1"
     local base_cursor="$2"
     local insert_text="$3"
-    local left right token_prefix before_token token_suffix after_token
+    local before_token after_token
 
-    if (( base_cursor <= 0 )); then
-      left=""
+    _shac_active_token_span "$base_buffer" "$base_cursor"
+    local -i token_start=$REPLY token_end=$REPLY2
+    if (( token_start > 1 )); then
+      before_token="${base_buffer[1,$(( token_start - 1 ))]}"
     else
-      left="${base_buffer[1,base_cursor]}"
+      before_token=""
     fi
-
-    if (( base_cursor >= ${#base_buffer} )); then
-      right=""
+    if (( token_end <= ${#base_buffer} )); then
+      after_token="${base_buffer[token_end,-1]}"
     else
-      right="${base_buffer[$(( base_cursor + 1 )),-1]}"
+      after_token=""
     fi
-
-    token_prefix="${left##*[[:space:]]}"
-    if (( ${#token_prefix} > 0 )); then
-      before_token="${left[1,$(( ${#left} - ${#token_prefix} ))]}"
-    else
-      before_token="$left"
-    fi
-
-    token_suffix="${right%%[[:space:]]*}"
-    after_token="${right#$token_suffix}"
 
     REPLY="${before_token}${insert_text}${after_token}"
     REPLY2=$(( ${#before_token} + ${#insert_text} ))
@@ -524,23 +604,32 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
       if [[ "$line" == __shac_request_id$'\t'* ]]; then
         local -a header
         header=("${(ps:\t:)line}")
-        _shac_last_request_id="${header[2]:-}"
+        _shac_decode "${header[2]:-}"
+        _shac_last_request_id="$REPLY"
       elif [[ "$line" == __shac_tip$'\t'* ]]; then
         if [[ -z "${SHAC_NO_TIPS:-}" ]]; then
           local -a tip_fields
           tip_fields=("${(ps:\t:)line}")
-          _shac_pending_tip_id="${tip_fields[2]:-}"
-          _shac_pending_tip_text="${tip_fields[3]:-}"
+          _shac_decode "${tip_fields[2]:-}"
+          _shac_pending_tip_id="$REPLY"
+          _shac_decode "${tip_fields[3]:-}"
+          _shac_pending_tip_text="$REPLY"
         fi
       else
         local -a fields
         fields=("${(ps:\t:)line}")
-        _shac_menu_item_keys+=("${fields[1]:-}")
-        _shac_menu_insert_texts+=("${fields[2]:-}")
-        _shac_menu_displays+=("${fields[3]:-}")
-        _shac_menu_kinds+=("${fields[4]:-}")
-        _shac_menu_sources+=("${fields[5]:-}")
-        _shac_menu_descriptions+=("${fields[6]:-}")
+        _shac_decode "${fields[1]:-}"
+        _shac_menu_item_keys+=("$REPLY")
+        _shac_decode "${fields[2]:-}"
+        _shac_menu_insert_texts+=("$REPLY")
+        _shac_decode "${fields[3]:-}"
+        _shac_menu_displays+=("$REPLY")
+        _shac_decode "${fields[4]:-}"
+        _shac_menu_kinds+=("$REPLY")
+        _shac_decode "${fields[5]:-}"
+        _shac_menu_sources+=("$REPLY")
+        _shac_decode "${fields[6]:-}"
+        _shac_menu_descriptions+=("$REPLY")
       fi
     done < <(
       TTY="$tty_value" shac complete \
@@ -550,7 +639,7 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
         --cwd "$PWD" \
         --prev-command "$(fc -ln -1 2>/dev/null | sed 's/^[[:space:]]*//')" \
         "${runtime_history_args[@]}" \
-        --format shell-tsv-v2 \
+        --format shell-tsv-v3 \
         2>/dev/null
     )
 
@@ -571,12 +660,14 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
       _default
       return $?
     fi
-    if (( ${#_shac_menu_displays[@]} == 0 )); then
+    if (( ${#_shac_menu_insert_texts[@]} == 0 )); then
       _default
       return $?
     fi
-    results=("${_shac_menu_displays[@]}")
-    compadd -Q -- "${results[@]}"
+    # insert_text is the escaped shell literal (what lands on accept);
+    # display (via -d) is only the on-screen label.
+    results=("${_shac_menu_insert_texts[@]}")
+    compadd -Q -d _shac_menu_displays -- "${results[@]}"
   }
 
   function _shac_open_menu() {
@@ -724,12 +815,17 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
       return $?
     fi
     if (( _shac_inline_active )) && (( CURSOR >= ${#BUFFER} )); then
-      local suffix="$_shac_inline_suffix"
+      local insert_text="$_shac_inline_insert_text"
       local item_key="$_shac_inline_item_key"
       local request_id="$_shac_inline_request_id"
+      local base_buffer="$BUFFER"
+      local base_cursor="$CURSOR"
       _shac_clear_inline
-      BUFFER="${BUFFER}${suffix}"
-      CURSOR=${#BUFFER}
+      # Whole-token replace, not a suffix append: insert_text is an escaped
+      # shell literal and can't be substring-sliced at the typed boundary.
+      _shac_preview_buffer_for_item "$base_buffer" "$base_cursor" "$insert_text"
+      BUFFER="$REPLY"
+      CURSOR=$REPLY2
       _shac_last_request_id="$request_id"
       _shac_last_accepted_item_key="$item_key"
       _shac_last_accepted_rank="0"

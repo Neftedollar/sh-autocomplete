@@ -14,7 +14,7 @@ use std::thread;
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Parse shell-tsv-v2 output, returning `(insert_text, kind, source)` triples.
+/// Parse shell-tsv-v3 output, returning `(insert_text, kind, source)` triples.
 fn parse_candidates(output: &str) -> Vec<(String, String, String)> {
     let mut out = Vec::new();
     for line in output.lines() {
@@ -127,7 +127,7 @@ fn complete_line(
         "--cwd",
         "/tmp",
         "--format",
-        "shell-tsv-v2",
+        "shell-tsv-v3",
     ]);
     let result = cmd.output().expect("run shac complete");
     let stdout = String::from_utf8_lossy(&result.stdout).to_string();

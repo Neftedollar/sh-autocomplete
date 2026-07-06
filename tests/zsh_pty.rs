@@ -448,6 +448,7 @@ BUFFER="git che"
 CURSOR=${{#BUFFER}}
 _shac_inline_active=1
 _shac_inline_suffix="ckout"
+_shac_inline_insert_text="checkout"
 _shac_inline_item_key="git checkout"
 _shac_inline_request_id="req-42"
 

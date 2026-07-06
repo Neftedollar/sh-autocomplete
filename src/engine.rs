@@ -515,7 +515,7 @@ impl Engine {
                         &mut seen,
                         Candidate {
                             insert_text: name.clone(),
-                            display: name,
+                            display: sanitize_display(&name),
                             kind,
                             source: "path_index".to_string(),
                             description: None,
@@ -601,7 +601,11 @@ impl Engine {
                             &mut seen,
                             Candidate {
                                 insert_text: doc.item_value.clone(),
-                                display: doc.item_value,
+                                // F8: doc text is user/tool-authored (e.g. a
+                                // --help line) and reaches the terminal raw
+                                // if not sanitized like every other display
+                                // site.
+                                display: sanitize_display(&doc.item_value),
                                 kind: doc.item_type,
                                 source: doc.source,
                                 description: Some(doc.description),
@@ -619,7 +623,9 @@ impl Engine {
                                     &mut seen,
                                     Candidate {
                                         insert_text: doc.item_value.clone(),
-                                        display: doc.item_value,
+                                        // F8: same rationale as the
+                                        // docs_for_command branch above.
+                                        display: sanitize_display(&doc.item_value),
                                         kind: doc.item_type,
                                         source: "doc_search".to_string(),
                                         description: Some(doc.description),
@@ -685,7 +691,7 @@ impl Engine {
                         &mut seen,
                         Candidate {
                             insert_text: transition.next.clone(),
-                            display: transition.next,
+                            display: sanitize_display(&transition.next),
                             kind: if matches!(parsed.role, TokenRole::Command) {
                                 "command".to_string()
                             } else {
@@ -828,7 +834,9 @@ impl Engine {
             let abs = path.to_string_lossy().to_string();
             let display_path = shorten_with_home(&abs, home.as_deref());
             let insert_text = display_path.clone();
-            let display = format!("\u{2192} {display_path}");
+            // The arrow is daemon-authored decoration and stays as-is; only
+            // the user-derived path text is sanitized before composition.
+            let display = format!("\u{2192} {}", sanitize_display(&display_path));
             let description = format_path_jump_description(row.is_git_repo, row.last_visit, now);
 
             push_candidate(
@@ -881,7 +889,7 @@ impl Engine {
             {
                 continue;
             }
-            let display = refname.clone();
+            let display = sanitize_display(&refname);
             let description = if refname.starts_with("origin/") {
                 Some("remote-tracking branch".to_string())
             } else {
@@ -943,7 +951,7 @@ impl Engine {
                 seen,
                 Candidate {
                     insert_text: name.clone(),
-                    display: name,
+                    display: sanitize_display(&name),
                     kind: "npm_script".to_string(),
                     source: "npm_script".to_string(),
                     description: Some(description),
@@ -1018,7 +1026,7 @@ impl Engine {
                 seen,
                 Candidate {
                     insert_text: hostname.clone(),
-                    display: hostname,
+                    display: sanitize_display(&hostname),
                     kind: "ssh_host".to_string(),
                     source: "ssh_host".to_string(),
                     description: Some(description),
@@ -1079,7 +1087,7 @@ impl Engine {
                 seen,
                 Candidate {
                     insert_text: target.clone(),
-                    display: target,
+                    display: sanitize_display(&target),
                     kind: "build_target".to_string(),
                     source: "build_target".to_string(),
                     description: Some(description),
@@ -1166,10 +1174,12 @@ impl Engine {
                 .map(|e| e.eq_ignore_ascii_case("code-workspace"))
                 .unwrap_or(false);
 
+            let basename_safe = sanitize_display(&basename);
+            let parent_safe = sanitize_display(&parent_str);
             let display = if is_workspace_bundle {
-                format!("{basename} [workspace bundle] \u{00b7} {parent_str}")
+                format!("{basename_safe} [workspace bundle] \u{00b7} {parent_safe}")
             } else {
-                format!("{basename} \u{00b7} {parent_str}")
+                format!("{basename_safe} \u{00b7} {parent_safe}")
             };
 
             push_candidate(
@@ -1275,7 +1285,7 @@ impl Engine {
                 seen,
                 Candidate {
                     insert_text: name.clone(),
-                    display: name,
+                    display: sanitize_display(&name),
                     kind: "k8s_resource".to_string(),
                     source: "k8s_resource".to_string(),
                     description: Some(description),
@@ -1318,7 +1328,7 @@ impl Engine {
                 seen,
                 Candidate {
                     insert_text: image_ref.clone(),
-                    display: image_ref.clone(),
+                    display: sanitize_display(&image_ref),
                     kind: "docker_image".to_string(),
                     source: "docker_image".to_string(),
                     description: Some(format!("docker image · {tag}")),
@@ -1354,7 +1364,7 @@ impl Engine {
                 seen,
                 Candidate {
                     insert_text: name.clone(),
-                    display: name,
+                    display: sanitize_display(&name),
                     kind: "docker_container".to_string(),
                     source: "docker_container".to_string(),
                     description: Some("docker container · running".to_string()),
@@ -1417,7 +1427,7 @@ impl Engine {
                     seen,
                     Candidate {
                         insert_text: insert_text.clone(),
-                        display: insert_text,
+                        display: sanitize_display(&insert_text),
                         kind: "path".to_string(),
                         source: "path_cache".to_string(),
                         description: None,
@@ -2529,6 +2539,27 @@ fn format_path_jump_description(is_git_repo: bool, last_visit: i64, now: i64) ->
     }
 }
 
+/// Strip control/ESC bytes from user-derived text before it enters `display`.
+/// `display` is only ever rendered, never re-parsed by a shell — unlike
+/// `insert_text` (escaped by `quote::quote_token`), it needs no shell-specific
+/// encoding, just neutralizing anything that could hijack the terminal (ANSI
+/// escapes). Whitespace control bytes collapse to a single space so a
+/// multi-line/tab-containing value still reads as one line; other C0/DEL
+/// bytes are dropped outright.
+fn sanitize_display(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if matches!(c, '\t' | '\n' | '\r') {
+            out.push(' ');
+        } else if (c as u32) < 0x20 || c == '\u{7f}' {
+            // drop other C0/DEL bytes (e.g. ESC) outright
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 fn sanitize_fts_query(query: &str) -> Option<String> {
     let tokens = query
         .split(|ch: char| !ch.is_alphanumeric() && ch != '_' && ch != '.')
@@ -2630,7 +2661,11 @@ fn project_history_candidate(
     parsed: &ParsedContext,
 ) -> Option<(String, String, String)> {
     if matches!(parsed.role, TokenRole::Command) {
-        return Some((entry.to_string(), entry.to_string(), "history".to_string()));
+        return Some((
+            entry.to_string(),
+            sanitize_display(entry),
+            "history".to_string(),
+        ));
     }
     let command = parsed.command.as_deref()?;
     let tokens = context::shell_split(entry);
@@ -2644,7 +2679,8 @@ fn project_history_candidate(
         TokenRole::SubcommandOrArg => "subcommand",
         TokenRole::Command => "history",
     };
-    Some((token.clone(), token, kind.to_string()))
+    let display = sanitize_display(&token);
+    Some((token, display, kind.to_string()))
 }
 
 fn contextual_candidate_key(parsed: &ParsedContext, candidate: &Candidate) -> String {
@@ -3047,6 +3083,13 @@ mod tests {
     }
 
     #[test]
+    fn display_strips_control_bytes_from_filename() {
+        // a filename containing an ESC must not carry it into `display`.
+        let cleaned = super::sanitize_display("na\u{1b}[31mme");
+        assert_eq!(cleaned, "na[31mme");
+    }
+
+    #[test]
     fn fts_query_sanitizer_drops_operator_only_queries() {
         assert_eq!(sanitize_fts_query("-"), None);
         assert_eq!(sanitize_fts_query("--"), None);
@@ -3183,6 +3226,43 @@ mod tests {
     }
 
     #[test]
+    fn raw_fs_entry_named_like_home_ref_has_non_home_kind() {
+        use std::fs;
+        // F3/F4: a real directory whose name merely starts with `~` must
+        // surface with a `kind` distinct from the home-shortened sources
+        // (`path_jump`/`workspace`) — `shac.rs` infers `TokenContext::home_ref`
+        // from `kind`, so `collect_path_candidates` emitting the wrong kind
+        // here would let a file literally named `~evil` tilde-expand on
+        // insertion.
+        let (engine, _dir) = test_engine("home-ref-raw-fs");
+        let cwd = unique_tmp("shac-home-ref-raw-cwd");
+        fs::create_dir_all(cwd.join("~evil")).unwrap();
+
+        let response = engine
+            .complete(make_request("cd ", &cwd.to_string_lossy()))
+            .expect("complete");
+        let item = response
+            .items
+            .iter()
+            .find(|i| i.insert_text == "~evil/")
+            .expect("expected a raw fs candidate for the ~evil directory");
+        assert_eq!(
+            item.kind, "path",
+            "a raw filesystem entry literally named ~evil must not carry a \
+             home-shortened kind (path_jump/workspace), or it would be \
+             inferred as a home reference and tilde-expand on insertion"
+        );
+        // Close the loop: quote_token with home_ref=false (what shac.rs
+        // infers for kind == "path") escapes the leading ~ so the shell
+        // inserts it literally instead of expanding it.
+        let ctx = crate::quote::TokenContext::default();
+        let quoted = crate::quote::quote_token(crate::shell::Shell::Zsh, &ctx, &item.insert_text);
+        assert_eq!(quoted, "\\~evil/");
+
+        let _ = fs::remove_dir_all(&cwd);
+    }
+
+    #[test]
     fn contextual_candidate_key_rebuilds_command_line() {
         let parsed = ParsedContext {
             line_before_cursor: "git ch".to_string(),
@@ -3193,6 +3273,7 @@ mod tests {
             command: Some("git".to_string()),
             prev_token: Some("git".to_string()),
             project_markers: Vec::new(),
+            open_quote: None,
         };
         let candidate = Candidate {
             insert_text: "checkout".to_string(),
