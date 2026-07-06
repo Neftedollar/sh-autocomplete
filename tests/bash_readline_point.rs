@@ -15,10 +15,7 @@ use std::process::Command;
 /// variables it assigns (`READLINE_LINE`/`READLINE_POINT` are ordinary
 /// variables outside of an actual `bind -x` dispatch).
 fn run_splice(before: &str, insert: &str, after: &str) -> (String, String) {
-    let script_path = format!(
-        "{}/shell/bash/shac.bash",
-        env!("CARGO_MANIFEST_DIR")
-    );
+    let script_path = format!("{}/shell/bash/shac.bash", env!("CARGO_MANIFEST_DIR"));
     let script = format!(
         r#"
 source "{script_path}"
