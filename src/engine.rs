@@ -207,6 +207,10 @@ impl Engine {
             .or_else(|| self.db.latest_command().ok().flatten());
 
         let max_path_rank = self.db.paths_index_max_rank().unwrap_or(0.0);
+        // Detect once and reuse for every candidate: it depends only on
+        // `req.cwd`, which is fixed for the whole request, so re-detecting
+        // it per candidate (an upward filesystem walk) is wasted work.
+        let project_root = self.db.project_root_for_cwd(&req.cwd);
         let mut items: Vec<RankedCandidate> = candidates
             .drain(..)
             .map(|candidate| {
@@ -216,6 +220,7 @@ impl Engine {
                     &req.cwd,
                     prev_command.as_deref(),
                     max_path_rank,
+                    project_root.as_deref(),
                 )
             })
             .collect();
@@ -270,6 +275,7 @@ impl Engine {
             .clone()
             .or_else(|| self.db.latest_command().ok().flatten());
         let max_path_rank = self.db.paths_index_max_rank().unwrap_or(0.0);
+        let project_root = self.db.project_root_for_cwd(&req.cwd);
         let mut explained = self
             .collect_candidates(&req, &parsed)?
             .into_iter()
@@ -280,6 +286,7 @@ impl Engine {
                     &req.cwd,
                     prev_command.as_deref(),
                     max_path_rank,
+                    project_root.as_deref(),
                 )
             })
             .collect::<Vec<_>>();
@@ -1413,27 +1420,50 @@ impl Engine {
             entries
         };
 
+        // Cap at collection time, same idiom as every other collector: an
+        // unbounded directory (e.g. 10k entries) must not reach scoring,
+        // where each candidate costs ~5 SQL-backed feature lookups.
+        //
+        // Keeping the first `limit` prefix matches in raw (alphabetical)
+        // collection order silently drops the best match whenever it sorts
+        // past the cap among same-prefix siblings (e.g. a hundred
+        // `log-0-...` files burying a short, high-fuzzy-score `log-z.txt`).
+        // So instead: gather every prefix (and dirs_only) match, cheaply
+        // pre-rank by the same string-only fuzzy relevance the full scorer
+        // uses, and only carry the top `limit` of those into the expensive
+        // SQL-backed scoring pass below.
+        let limit = self.config.max_results.saturating_mul(2).max(8);
+        let mut matches: Vec<(String, f64)> = Vec::new();
         for entry in entries {
-            if entry.starts_with(&prefix) {
-                let entry_path = dir.join(&entry);
-                let is_dir = entry_path.is_dir();
-                if dirs_only && !is_dir {
-                    continue;
-                }
-                let suffix = if is_dir { "/" } else { "" };
-                let insert_text = format!("{insertion_prefix}{entry}{suffix}");
-                push_candidate(
-                    candidates,
-                    seen,
-                    Candidate {
-                        insert_text: insert_text.clone(),
-                        display: sanitize_display(&insert_text),
-                        kind: "path".to_string(),
-                        source: "path_cache".to_string(),
-                        description: None,
-                    },
-                );
+            if !entry.starts_with(&prefix) {
+                continue;
             }
+            let entry_path = dir.join(&entry);
+            let is_dir = entry_path.is_dir();
+            if dirs_only && !is_dir {
+                continue;
+            }
+            let suffix = if is_dir { "/" } else { "" };
+            let insert_text = format!("{insertion_prefix}{entry}{suffix}");
+            let fuzzy = fuzzy_match_score(token, &insert_text);
+            matches.push((insert_text, fuzzy));
+        }
+        // Stable sort: ties keep their original (alphabetical) collection order.
+        matches.sort_by(|(_, left), (_, right)| cmp_score(*right, *left));
+        matches.truncate(limit);
+
+        for (insert_text, _) in matches {
+            push_candidate(
+                candidates,
+                seen,
+                Candidate {
+                    insert_text: insert_text.clone(),
+                    display: sanitize_display(&insert_text),
+                    kind: "path".to_string(),
+                    source: "path_cache".to_string(),
+                    description: None,
+                },
+            );
         }
         Ok(())
     }
@@ -1445,6 +1475,7 @@ impl Engine {
         cwd: &str,
         prev_command: Option<&str>,
         max_path_rank: f64,
+        project_root: Option<&str>,
     ) -> RankedCandidate {
         let active = parsed.active_token.as_str();
         let history_key = contextual_candidate_key(parsed, candidate);
@@ -1491,7 +1522,7 @@ impl Engine {
                 project_affinity_score(&parsed.project_markers, first_word)
                     + self
                         .db
-                        .project_tool_count(cwd, first_word)
+                        .project_tool_count_for_root(project_root, first_word)
                         .unwrap_or_default()
                         / 10.0,
                 self.config.ranking.project_affinity_score,
@@ -4230,5 +4261,123 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&cwd_symlink);
+    }
+
+    #[test]
+    fn collect_path_candidates_caps_large_directory() {
+        // Regression for the runtime-audit BLOCKER: unlike every other
+        // collector, `collect_path_candidates` used to emit every matching
+        // entry with no cap, so `Engine::complete` had to score all of them
+        // before truncating — a 10k-entry directory wedged the daemon.
+        use std::fs;
+        let (engine, _dir) = test_engine("path-cap");
+        let big = unique_tmp("shac-path-cap-big");
+        for i in 0..500 {
+            fs::write(big.join(format!("file-{i:04}.txt")), b"").unwrap();
+        }
+
+        let mut candidates = Vec::new();
+        let mut seen = HashSet::new();
+        engine
+            .collect_path_candidates(
+                "",
+                &big.to_string_lossy(),
+                false,
+                &mut candidates,
+                &mut seen,
+            )
+            .expect("collect path candidates");
+
+        let cap = engine.config().max_results.saturating_mul(2).max(8);
+        assert!(
+            candidates.len() <= cap,
+            "expected at most {cap} candidates from an unbounded directory, got {}",
+            candidates.len()
+        );
+
+        let _ = fs::remove_dir_all(&big);
+    }
+
+    #[test]
+    fn collect_path_candidates_prefix_filter_survives_cap() {
+        // The cap must be applied to *matching* entries, not to raw entries
+        // scanned — otherwise a specific typed prefix could get dropped by
+        // the cap before the scan ever reaches it.
+        use std::fs;
+        let (engine, _dir) = test_engine("path-cap-prefix");
+        let big = unique_tmp("shac-path-cap-prefix-big");
+        for i in 0..2000 {
+            fs::write(big.join(format!("file-{i:04}.txt")), b"").unwrap();
+        }
+        fs::write(big.join("uniquename.txt"), b"").unwrap();
+
+        let mut candidates = Vec::new();
+        let mut seen = HashSet::new();
+        engine
+            .collect_path_candidates(
+                "uniquename",
+                &big.to_string_lossy(),
+                false,
+                &mut candidates,
+                &mut seen,
+            )
+            .expect("collect path candidates");
+
+        assert!(
+            candidates.iter().any(|c| c.insert_text == "uniquename.txt"),
+            "expected uniquename.txt to survive the cap, got: {:?}",
+            candidates
+                .iter()
+                .map(|c| &c.insert_text)
+                .collect::<Vec<_>>()
+        );
+
+        let _ = fs::remove_dir_all(&big);
+    }
+
+    #[test]
+    fn collect_path_candidates_cap_keeps_best_fuzzy_match_not_first_alphabetically() {
+        // Regression: the perf cap used to keep the first `limit`
+        // prefix-matching entries in raw (alphabetical) collection order,
+        // *then* score them. With 100 `log-0-...` siblings and a short
+        // `log-z.txt` that would win on fuzzy relevance (shorter candidate
+        // -> higher `fuzzy_match_score`), `log-z.txt` sorts alphabetically
+        // last and got dropped by the cap before it was ever scored. The
+        // cap must pre-rank by the same cheap fuzzy relevance the full
+        // scorer uses, not by alphabetical collection order.
+        use std::fs;
+        let (engine, _dir) = test_engine("path-cap-fuzzy");
+        let big = unique_tmp("shac-path-cap-fuzzy-big");
+        for i in 0..100 {
+            fs::write(
+                big.join(format!("log-0-verbose-debug-trace-session-{i:02}.txt")),
+                b"",
+            )
+            .unwrap();
+        }
+        fs::write(big.join("log-z.txt"), b"").unwrap();
+
+        let mut candidates = Vec::new();
+        let mut seen = HashSet::new();
+        engine
+            .collect_path_candidates(
+                "log-",
+                &big.to_string_lossy(),
+                false,
+                &mut candidates,
+                &mut seen,
+            )
+            .expect("collect path candidates");
+
+        assert!(
+            candidates.iter().any(|c| c.insert_text == "log-z.txt"),
+            "expected log-z.txt to survive the cap via fuzzy pre-rank, got: {:?}",
+            candidates
+                .iter()
+                .map(|c| &c.insert_text)
+                .collect::<Vec<_>>()
+        );
+
+        let _ = fs::remove_dir_all(&big);
     }
 }

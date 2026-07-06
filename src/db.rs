@@ -823,22 +823,44 @@ impl AppDb {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    /// Detects the project root for `cwd` — the nearest ancestor directory
+    /// containing a recognized project marker (`.git`, `Cargo.toml`, ...).
+    ///
+    /// Pure filesystem walk, no DB access, and depends only on `cwd`. A
+    /// request scoring many candidates against the same `cwd` should call
+    /// this once and reuse the result via [`AppDb::project_tool_count_for_root`]
+    /// rather than re-walking the filesystem per candidate.
+    pub fn project_root_for_cwd(&self, cwd: &str) -> Option<String> {
+        detect_project_root(cwd)
+    }
+
+    /// Looks up the recorded usage weight for `tool` under an
+    /// already-detected `project_root`, without re-walking the filesystem.
+    /// Pairs with [`AppDb::project_root_for_cwd`].
+    pub fn project_tool_count_for_root(
+        &self,
+        project_root: Option<&str>,
+        tool: &str,
+    ) -> Result<f64> {
+        let Some(project_root) = project_root else {
+            return Ok(0.0);
+        };
+        let value = self
+            .conn
+            .query_row(
+                "SELECT (interactive_count + legacy_count * ?3)
+                 FROM project_profiles
+                 WHERE project_root = ?1 AND tool = ?2",
+                params![project_root, tool, LEGACY_PENALTY],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or(0.0);
+        Ok(value)
+    }
+
     pub fn project_tool_count(&self, cwd: &str, tool: &str) -> Result<f64> {
-        if let Some(project_root) = detect_project_root(cwd) {
-            let value = self
-                .conn
-                .query_row(
-                    "SELECT (interactive_count + legacy_count * ?3)
-                     FROM project_profiles
-                     WHERE project_root = ?1 AND tool = ?2",
-                    params![project_root, tool, LEGACY_PENALTY],
-                    |row| row.get(0),
-                )
-                .optional()?
-                .unwrap_or(0.0);
-            return Ok(value);
-        }
-        Ok(0.0)
+        self.project_tool_count_for_root(self.project_root_for_cwd(cwd).as_deref(), tool)
     }
 
     pub fn get_dir_cache(&self, dir: &str) -> Result<Option<(i64, String)>> {
