@@ -1,6 +1,6 @@
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -54,9 +54,30 @@ impl MlModel {
         serde_json::from_str(&raw).context("parse ml model")
     }
 
+    /// Writes the model atomically: serialize to a temp file in the same
+    /// directory, then `rename` over the target. A crash or disk-full error
+    /// mid-write leaves the temp file orphaned rather than truncating the
+    /// live model.json that `Engine::new` reads on daemon startup.
     pub fn save(&self, path: &Path) -> Result<()> {
         let raw = serde_json::to_string_pretty(self).context("serialize ml model")?;
-        fs::write(path, raw).with_context(|| format!("write model file {}", path.display()))?;
+        let dir = path.parent().filter(|p| !p.as_os_str().is_empty());
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("model.json");
+        let tmp_path = match dir {
+            Some(dir) => dir.join(format!(".{file_name}.tmp-{}", std::process::id())),
+            None => PathBuf::from(format!(".{file_name}.tmp-{}", std::process::id())),
+        };
+        fs::write(&tmp_path, raw)
+            .with_context(|| format!("write temp model file {}", tmp_path.display()))?;
+        fs::rename(&tmp_path, path).with_context(|| {
+            format!(
+                "rename temp model file {} to {}",
+                tmp_path.display(),
+                path.display()
+            )
+        })?;
         Ok(())
     }
 
@@ -145,5 +166,36 @@ mod tests {
             model.predict(&positive.features, &positive.kind, &positive.source)
                 > model.predict(&negative.features, &negative.kind, &negative.source)
         );
+    }
+
+    #[test]
+    fn save_writes_atomically_and_leaves_no_temp_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "shac-ml-atomic-save-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("model.json");
+
+        let model = MlModel {
+            bias: 1.5,
+            ..MlModel::default()
+        };
+        model.save(&path).expect("save model");
+
+        let loaded = MlModel::load(&path).expect("load model");
+        assert_eq!(loaded.bias, 1.5);
+
+        let leftover_temp_files = fs::read_dir(&dir)
+            .expect("read temp dir")
+            .filter_map(|entry| entry.ok())
+            .any(|entry| entry.file_name().to_string_lossy().contains(".tmp-"));
+        assert!(!leftover_temp_files, "atomic save left a temp file behind");
+
+        fs::remove_dir_all(&dir).ok();
     }
 }

@@ -1390,6 +1390,21 @@ fn daemon_action(paths: &AppPaths, action: DaemonAction) -> Result<()> {
                 return Ok(());
             }
             let pid = fs::read_to_string(&paths.pid_file)?.trim().to_string();
+            if !pid_is_shacd(&pid) {
+                // The pid-file is stale: either the daemon already exited and
+                // the OS recycled this pid for an unrelated (still-running)
+                // process, or it never started. Don't signal a process we
+                // don't own — just clear our own state. (Not delegated to
+                // `cleanup_stale_daemon_state`: that treats any live pid as
+                // "daemon running" and would leave this stale pid-file in
+                // place.)
+                fs::remove_file(&paths.pid_file).ok();
+                if paths.socket_file.exists() && UnixStream::connect(&paths.socket_file).is_err() {
+                    fs::remove_file(&paths.socket_file).ok();
+                }
+                println!("stopped");
+                return Ok(());
+            }
             let status = Command::new("kill")
                 .arg(&pid)
                 .stdout(Stdio::null())
@@ -1987,6 +2002,40 @@ fn process_exists(pid: &str) -> Result<bool> {
     Ok(status.success())
 }
 
+/// Verifies `pid` is actually running as `shacd` before we `kill` it. PIDs
+/// get recycled by the OS (e.g. after a reboot), so a pid-file alone is not
+/// proof the process it names is still our daemon — signaling an unverified
+/// PID could kill an unrelated, innocent process.
+fn pid_is_shacd(pid: &str) -> bool {
+    let output = match Command::new("ps")
+        .arg("-p")
+        .arg(pid)
+        .arg("-o")
+        .arg("comm=")
+        .output()
+    {
+        Ok(output) => output,
+        Err(_) => return false,
+    };
+    if !output.status.success() {
+        return false;
+    }
+    comm_is_shacd(String::from_utf8_lossy(&output.stdout).trim())
+}
+
+/// `ps -p PID -o comm=` reports the full executable path on macOS (and often
+/// just the bare process name on Linux) — matching with `.contains("shacd")`
+/// would misidentify any recycled-pid process whose path merely *contains*
+/// "shacd" as a substring (e.g. `/tmp/team-shacd-tools/backup-agent`) as our
+/// daemon and kill it. Compare the basename exactly instead.
+fn comm_is_shacd(comm: &str) -> bool {
+    Path::new(comm.trim())
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| name == "shacd")
+        .unwrap_or(false)
+}
+
 fn wait_for_shutdown(paths: &AppPaths, timeout: Duration) {
     let started = Instant::now();
     while started.elapsed() < timeout {
@@ -2295,5 +2344,38 @@ mod completion_response_tests {
         };
         let item = json!({"kind": "path"});
         assert_eq!(item_token_context(&ctx, None, &item).open_quote, Some('"'));
+    }
+}
+
+#[cfg(test)]
+mod pid_is_shacd_tests {
+    use super::*;
+
+    /// A full path ending in `/shacd` (what `ps -o comm=` reports on macOS
+    /// for the real daemon) must match.
+    #[test]
+    fn full_path_ending_in_shacd_matches() {
+        assert!(comm_is_shacd("/Users/me/dev/shac/target/debug/shacd"));
+    }
+
+    /// A path that merely *contains* "shacd" in a parent directory, but whose
+    /// basename is unrelated, must NOT match — this is the exact
+    /// innocent-process-kill hole a substring check reopens.
+    #[test]
+    fn path_containing_shacd_in_parent_dir_does_not_match() {
+        assert!(!comm_is_shacd("/tmp/team-shacd-tools/backup-agent"));
+    }
+
+    /// A bare basename with no path separators still matches (Linux
+    /// typically reports just the process name).
+    #[test]
+    fn bare_basename_shacd_matches() {
+        assert!(comm_is_shacd("shacd"));
+    }
+
+    /// An unrelated bare name does not match.
+    #[test]
+    fn unrelated_bare_name_does_not_match() {
+        assert!(!comm_is_shacd("backup-agent"));
     }
 }

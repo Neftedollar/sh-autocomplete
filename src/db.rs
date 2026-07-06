@@ -18,6 +18,11 @@ const LEGACY_PENALTY: f64 = 0.15;
 const PASTE_PENALTY: f64 = 0.25;
 const TRUST_MIGRATION_KEY: &str = "trust_migration_v1";
 
+/// Default retention window for completion telemetry (`completion_requests` /
+/// `completion_items`). These tables are appended on every completion with no
+/// other pruning, so inline mode can write tens of MB/day without this cap.
+pub const COMPLETION_TELEMETRY_RETENTION_DAYS: i64 = 30;
+
 #[derive(Debug, Clone)]
 pub struct StoredDoc {
     pub command: String,
@@ -1421,6 +1426,31 @@ impl AppDb {
         Ok(std::collections::HashSet::new())
     }
 
+    /// Deletes `completion_requests` older than `retention_days` (default
+    /// [`COMPLETION_TELEMETRY_RETENTION_DAYS`]), EXCEPT rows that are the ML
+    /// training signal — accepted completions eligible for learning
+    /// (`accepted_command IS NOT NULL AND eligible_for_learning = 1`). Those
+    /// are few and are exactly what `maybe_auto_train` / retrain / export
+    /// read, so they're kept indefinitely rather than aged out with the
+    /// unbounded non-accepted noise the disk-bloat pruning is meant to
+    /// address. `completion_items` rows are removed via the `ON DELETE
+    /// CASCADE` FK (see schema in `init`, which also enables `PRAGMA
+    /// foreign_keys = ON`) rather than a second DELETE. Returns the number of
+    /// requests pruned.
+    pub fn prune_completion_telemetry(&self, retention_days: i64) -> Result<usize> {
+        let cutoff = unix_ts() - retention_days.max(0) * 86_400;
+        let deleted = self
+            .conn
+            .execute(
+                "DELETE FROM completion_requests
+                 WHERE ts < ?1
+                   AND (accepted_command IS NULL OR eligible_for_learning = 0)",
+                params![cutoff],
+            )
+            .context("prune completion telemetry")?;
+        Ok(deleted)
+    }
+
     pub fn reset_personalization(&self) -> Result<()> {
         self.conn.execute_batch(
             r#"
@@ -2364,5 +2394,121 @@ mod tests {
     fn extract_cd_target_cd_dash_and_bare_cd_unchanged() {
         assert_eq!(extract_cd_target("cd -"), None);
         assert_eq!(extract_cd_target("cd"), None);
+    }
+
+    /// B4: completion telemetry older than the retention window is pruned,
+    /// and completion_items cascades via the schema's `ON DELETE CASCADE`
+    /// FK (enabled by `PRAGMA foreign_keys = ON` in `init`) rather than
+    /// needing an explicit second DELETE.
+    ///
+    /// M3: an old row is only pruned if it's NOT the ML training signal — an
+    /// old row that was accepted and is eligible for learning
+    /// (`accepted_command IS NOT NULL AND eligible_for_learning = 1`) must
+    /// survive indefinitely, since `maybe_auto_train`/retrain/export read it.
+    #[test]
+    fn prune_completion_telemetry_deletes_only_unaccepted_rows_older_than_cutoff() {
+        let db = test_db();
+        let now = unix_ts();
+        let old_ts = now - 40 * 86_400;
+        let recent_ts = now - 86_400;
+
+        // Old + never accepted: pure telemetry noise — must be pruned.
+        db.conn
+            .execute(
+                "INSERT INTO completion_requests(ts, shell, cwd, line, cursor, active_token)
+                 VALUES (?1, 'zsh', '/tmp', 'ls', 2, 'ls')",
+                params![old_ts],
+            )
+            .expect("insert old unaccepted request");
+        let old_unaccepted_id = db.conn.last_insert_rowid();
+        db.conn
+            .execute(
+                "INSERT INTO completion_items(request_id, rank, item_key, insert_text, display, kind, source, score, feature_json)
+                 VALUES (?1, 0, 'ls', 'ls', 'ls', 'command', 'path_index', 1.0, '{}')",
+                params![old_unaccepted_id],
+            )
+            .expect("insert old unaccepted item");
+
+        // Old but accepted + eligible for learning: the ML training signal —
+        // must survive the prune despite being past the retention window.
+        db.conn
+            .execute(
+                "INSERT INTO completion_requests(ts, shell, cwd, line, cursor, active_token, eligible_for_learning, accepted_command)
+                 VALUES (?1, 'zsh', '/tmp', 'gi', 2, 'gi', 1, 'git status')",
+                params![old_ts],
+            )
+            .expect("insert old accepted request");
+        let old_accepted_id = db.conn.last_insert_rowid();
+        db.conn
+            .execute(
+                "INSERT INTO completion_items(request_id, rank, item_key, insert_text, display, kind, source, score, feature_json)
+                 VALUES (?1, 0, 'git status', 'git status', 'git status', 'command', 'path_index', 1.0, '{}')",
+                params![old_accepted_id],
+            )
+            .expect("insert old accepted item");
+
+        // Recent + never accepted: within the retention window — must survive
+        // regardless of acceptance.
+        db.conn
+            .execute(
+                "INSERT INTO completion_requests(ts, shell, cwd, line, cursor, active_token)
+                 VALUES (?1, 'zsh', '/tmp', 'cd', 2, 'cd')",
+                params![recent_ts],
+            )
+            .expect("insert recent request");
+        let recent_id = db.conn.last_insert_rowid();
+        db.conn
+            .execute(
+                "INSERT INTO completion_items(request_id, rank, item_key, insert_text, display, kind, source, score, feature_json)
+                 VALUES (?1, 0, 'cd', 'cd', 'cd', 'command', 'path_index', 1.0, '{}')",
+                params![recent_id],
+            )
+            .expect("insert recent item");
+
+        let deleted = db
+            .prune_completion_telemetry(COMPLETION_TELEMETRY_RETENTION_DAYS)
+            .expect("prune");
+        assert_eq!(deleted, 1);
+
+        let remaining_requests: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM completion_requests", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(remaining_requests, 2);
+
+        let remaining_items: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM completion_items", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(remaining_items, 2);
+
+        let mut surviving_ids: Vec<i64> = db
+            .conn
+            .prepare("SELECT id FROM completion_requests ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        surviving_ids.sort_unstable();
+        let mut expected = vec![old_accepted_id, recent_id];
+        expected.sort_unstable();
+        assert_eq!(
+            surviving_ids, expected,
+            "old-accepted and recent rows must survive; old-unaccepted must be pruned"
+        );
+
+        let old_accepted_items: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM completion_items WHERE request_id = ?1",
+                params![old_accepted_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            old_accepted_items, 1,
+            "old-accepted row's completion_items must not have cascaded away"
+        );
     }
 }

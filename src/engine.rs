@@ -161,13 +161,25 @@ impl Engine {
         paths.ensure()?;
         let config = AppConfig::load(paths)?;
         let db = AppDb::open(&paths.db_file)?;
+        // A missing or truncated/unparsable model file must never prevent the
+        // daemon from starting (e.g. a crash mid-write before the B5 atomic
+        // save fix, or a hand-edited file). Degrade to "no ml rerank" instead
+        // of propagating the error out of `Engine::new`.
         let ml_model = config
             .ml_model_file
             .as_deref()
             .map(PathBuf::from)
             .filter(|path| path.exists())
-            .map(|path| MlModel::load(&path))
-            .transpose()?;
+            .and_then(|path| match MlModel::load(&path) {
+                Ok(model) => Some(model),
+                Err(err) => {
+                    eprintln!(
+                        "shac: warning: failed to load ml model {}: {err:#}; continuing without ml rerank",
+                        path.display()
+                    );
+                    None
+                }
+            });
         Ok(Self {
             config,
             db,

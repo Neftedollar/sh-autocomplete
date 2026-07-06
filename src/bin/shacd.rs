@@ -1,6 +1,6 @@
 use std::fs;
 use std::io::ErrorKind;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::thread;
@@ -9,12 +9,29 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use clap::Parser;
 use shac::config::AppPaths;
-use shac::db::AppDb;
+use shac::db::{AppDb, COMPLETION_TELEMETRY_RETENTION_DAYS};
 use shac::engine::{self, Engine};
 use shac::indexer;
 use shac::protocol::RecordCommandRequest;
 
 const BG_REINDEX_INTERVAL: Duration = Duration::from_secs(6 * 3600);
+
+/// Caps a single client request line so a client that never sends a newline
+/// can't grow daemon memory without bound. A completion request is a few KB.
+const MAX_REQUEST_BYTES: u64 = 1024 * 1024; // 1 MiB
+
+/// The accept loop is single-threaded, so a silent/stalled client must not be
+/// allowed to block completions for every other shell forever. Real clients
+/// give up and fall back to native completion after their `daemon_timeout_ms`
+/// budget (150ms by default — see `AppConfig::default`), so a multi-second
+/// server-side timeout stalls every other client for far longer than any
+/// client actually waits. 500ms comfortably covers a legitimate local
+/// unix-socket round trip (the request is written immediately after
+/// connect()) while bounding the serial-loop stall to a fraction of a
+/// second. Note this only shrinks the stall window — it does not eliminate
+/// it; a fully robust fix would make the accept loop handle connections
+/// concurrently instead of serially, which is out of scope here.
+const CLIENT_READ_TIMEOUT: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Parser)]
 struct Args {
@@ -30,11 +47,32 @@ fn main() -> Result<()> {
     }
     paths.ensure()?;
     if paths.socket_file.exists() {
+        if UnixStream::connect(&paths.socket_file).is_ok() {
+            // A live daemon is still listening on this socket — do not
+            // unlink it out from under it, and do not start a second one.
+            anyhow::bail!(
+                "another shacd instance is already listening on {}",
+                paths.socket_file.display()
+            );
+        }
+        // Nothing answered: a stale socket left behind by a crashed/killed
+        // daemon. Safe to unlink and rebind.
         fs::remove_file(&paths.socket_file).ok();
     }
-    fs::write(&paths.pid_file, std::process::id().to_string()).context("write pid file")?;
     let listener = UnixListener::bind(&paths.socket_file).context("bind unix socket")?;
+    // Only claim the pid-file after a successful bind, so a bind failure
+    // never leaves an orphaned pid-file pointing at a process that's about
+    // to exit.
+    fs::write(&paths.pid_file, std::process::id().to_string()).context("write pid file")?;
     let _state_guard = StateGuard::new(paths.socket_file.clone(), paths.pid_file.clone());
+    // SHAC_CLIENT_READ_TIMEOUT_MS overrides the per-client read timeout —
+    // intended for integration tests only (the 5s default would make a
+    // stalled-client test slow).
+    let client_read_timeout = std::env::var("SHAC_CLIENT_READ_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(CLIENT_READ_TIMEOUT);
     if engine::maybe_auto_train(&paths).unwrap_or(false) {
         eprintln!("shac: personalized model activated");
     }
@@ -78,13 +116,23 @@ fn main() -> Result<()> {
             ];
             let mut fail_count: usize = 0;
             loop {
-                match AppDb::open(&db_path)
+                match AppDb::open(&db_path).and_then(|db| {
+                    // Prune completion telemetry once per daemon start (this
+                    // loop's first pass) and then on every periodic tick, so
+                    // completion_requests/completion_items don't grow
+                    // unbounded. Best-effort: a prune failure never blocks
+                    // reindexing.
+                    if let Err(e) =
+                        db.prune_completion_telemetry(COMPLETION_TELEMETRY_RETENTION_DAYS)
+                    {
+                        eprintln!("shac: telemetry prune error: {e}");
+                    }
                     // bg indexer never shells out to `<cmd> --help`; only
                     // records names + paths and seeds bundled static_docs.
                     // Per-command --help extraction is opt-in via
                     // `shac index add-command <name>` only.
-                    .and_then(|db| indexer::reindex_path_commands(&db, path_env.as_deref(), true))
-                {
+                    indexer::reindex_path_commands(&db, path_env.as_deref(), true)
+                }) {
                     Ok(n) => {
                         eprintln!("shac: background indexed {} commands", n);
                         fail_count = 0;
@@ -104,7 +152,7 @@ fn main() -> Result<()> {
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
-                if let Err(err) = handle_client(&engine, stream) {
+                if let Err(err) = handle_client(&engine, stream, client_read_timeout) {
                     if !is_broken_pipe(&err) {
                         eprintln!("client error: {err:#}");
                     }
@@ -137,12 +185,25 @@ impl Drop for StateGuard {
     }
 }
 
-fn handle_client(engine: &Engine, mut stream: UnixStream) -> Result<()> {
-    let mut reader = BufReader::new(stream.try_clone()?);
+fn handle_client(engine: &Engine, mut stream: UnixStream, read_timeout: Duration) -> Result<()> {
+    stream
+        .set_read_timeout(Some(read_timeout))
+        .context("set client read timeout")?;
+    let mut reader = BufReader::new(stream.try_clone()?.take(MAX_REQUEST_BYTES));
     let mut line = String::new();
-    reader.read_line(&mut line)?;
+    match reader.read_line(&mut line) {
+        Ok(_) => {}
+        Err(err) if is_timeout(&err) => return Ok(()),
+        Err(err) => return Err(err).context("read client request"),
+    }
     if line.trim().is_empty() {
         return Ok(());
+    }
+    if !line.ends_with('\n') {
+        // Either the request exceeded MAX_REQUEST_BYTES with no newline in
+        // sight, or the peer closed the connection mid-line. Drop it
+        // cleanly instead of parsing a truncated/oversized request.
+        anyhow::bail!("request exceeded {MAX_REQUEST_BYTES}-byte limit or was truncated");
     }
     let request: serde_json::Value = serde_json::from_str(&line).context("parse request json")?;
     let action = request
@@ -187,6 +248,10 @@ fn handle_client(engine: &Engine, mut stream: UnixStream) -> Result<()> {
     stream.write_all(&payload)?;
     stream.write_all(b"\n")?;
     Ok(())
+}
+
+fn is_timeout(err: &std::io::Error) -> bool {
+    matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut)
 }
 
 fn is_broken_pipe(err: &anyhow::Error) -> bool {
