@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.6.1 — 2026-07-06
+
+### Fixed
+- Homebrew installs now use a pre-built bottle instead of compiling from source.
+  The bottle-publish CI blocked on a single slow runner (one platform's queue
+  stalled the tap update for everyone), so `brew install/upgrade shac` fell back
+  to `cargo install`, which drags in the whole Rust + LLVM toolchain (~600 MB:
+  llvm, rust, z3, python, libgit2, openssl) that shac never needs at runtime.
+  Bottles are now built and published per-platform independently, the arm64
+  bottle is built on the oldest supported macOS so it covers sonoma/sequoia/
+  tahoe, and the tap formula merges each platform's sha additively.
+
 ## v0.6.0 — 2026-07-06
 
 ### Changed
