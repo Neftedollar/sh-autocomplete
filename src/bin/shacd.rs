@@ -8,9 +8,9 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use shac::config::AppPaths;
+use shac::config::{AppConfig, AppPaths};
 use shac::db::{AppDb, COMPLETION_TELEMETRY_RETENTION_DAYS};
-use shac::engine::{self, Engine};
+use shac::engine::Engine;
 use shac::indexer;
 use shac::protocol::RecordCommandRequest;
 
@@ -73,9 +73,6 @@ fn main() -> Result<()> {
         .and_then(|v| v.parse::<u64>().ok())
         .map(Duration::from_millis)
         .unwrap_or(CLIENT_READ_TIMEOUT);
-    if engine::maybe_auto_train(&paths).unwrap_or(false) {
-        eprintln!("shac: personalized model activated");
-    }
     let engine = Engine::new(&paths)?;
 
     // Background indexer: opens its own DB connection (WAL-safe) and
@@ -96,6 +93,7 @@ fn main() -> Result<()> {
         eprintln!("shacd: bg indexer disabled via SHAC_BG_DISABLED");
     } else {
         let db_path = paths.db_file.clone();
+        let config_paths = paths.clone();
         let path_env = std::env::var("PATH").ok();
         let reindex_interval = std::env::var("SHAC_BG_REINDEX_INTERVAL_SECS")
             .ok()
@@ -121,10 +119,16 @@ fn main() -> Result<()> {
                     // loop's first pass) and then on every periodic tick, so
                     // completion_requests/completion_items don't grow
                     // unbounded. Best-effort: a prune failure never blocks
-                    // reindexing.
-                    if let Err(e) =
-                        db.prune_completion_telemetry(COMPLETION_TELEMETRY_RETENTION_DAYS)
-                    {
+                    // reindexing. Reloaded from config on every tick (cheap:
+                    // a small TOML file) rather than once at daemon startup,
+                    // so `shac config set telemetry_retention_days ...`
+                    // takes effect without restarting the daemon — this is
+                    // the user-facing privacy control, it should be
+                    // responsive.
+                    let retention_days = AppConfig::load(&config_paths)
+                        .map(|c| c.telemetry_retention_days as i64)
+                        .unwrap_or(COMPLETION_TELEMETRY_RETENTION_DAYS);
+                    if let Err(e) = db.prune_completion_telemetry(retention_days) {
                         eprintln!("shac: telemetry prune error: {e}");
                     }
                     // bg indexer never shells out to `<cmd> --help`; only

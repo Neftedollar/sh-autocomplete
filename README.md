@@ -22,7 +22,6 @@ Landing page: https://neftedollar.github.io/sh-autocomplete/
 - owned `zsh` Tab widget with mini-menu UI and exact accepted-item tracking
 - confidence-aware `zsh` paste detection with exact and conservative heuristic paths
 - project-aware heuristic reranking
-- optional local ML reranking from a JSON model file
 - on-demand path completion with cached hot directories
 - branch-aware completion for `git checkout|switch|branch|merge|rebase` via `git for-each-ref` (200 ms timeout, no cache yet)
 - bundled command priors (~60 grammar pairs for git, docker, kubectl, npm, ...) seeded on first install for cold-start (filtered to installed CLIs only)
@@ -220,10 +219,6 @@ cargo run --bin shac -- migration-status
 cargo run --bin shac -- recent-events --limit 10
 cargo run --bin shac -- debug completion --shell zsh --line "pyt" --cursor 3
 cargo run --bin shac -- explain --shell zsh --line "git ch" --cursor 6 --cwd "$PWD"
-cargo run --bin shac -- export-training-data --limit 1000
-cargo run --bin shac -- train-model --output "$HOME/.config/shac/model.json"
-cargo run --bin shac -- config set ml_model_file "$HOME/.config/shac/model.json"
-cargo run --bin shac -- config set features.ml_rerank on
 ```
 
 ## Explicit indexing
@@ -279,12 +274,36 @@ Default paths:
 - SQLite and caches: `~/.local/share/shac/`
 - daemon socket/pid/state: `~/.local/state/shac/`
 
+### Completion telemetry retention
+
+Every completion request logs `completion_requests`/`completion_items` rows
+(query, candidates shown, what got accepted) purely for local diagnostics —
+`shac stats` and `shac doctor`. This is local-only; nothing leaves the
+machine.
+
+The background daemon prunes rows older than `telemetry_retention_days`
+(default 30) once at startup and on every reindex tick, so this data never
+grows unbounded. Check what's currently retained and for how long with:
+
+```bash
+shac stats
+```
+
+To change the window:
+
+```bash
+shac config set telemetry_retention_days 7    # keep a week
+shac config set telemetry_retention_days 0    # max privacy: prune everything on the next cycle
+```
+
+A running daemon picks up the new value on its next prune tick — no restart
+needed.
+
 ## Trust-aware migration
 
 When this version starts on an existing database, old personalization data is kept and marked as `legacy`.
 
 - `legacy` rows still help the heuristic ranker with a strong penalty
-- `legacy` rows do not participate in ML training
 - new `interactive` + `typed_manual` / `accepted_completion` events gradually replace old behavior
 - `pasted` history in `zsh` is tracked with exact or heuristic confidence and only weakly influences heuristic ranking
 

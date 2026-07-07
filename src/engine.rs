@@ -114,7 +114,6 @@ use crate::config::{AppConfig, AppPaths};
 use crate::context::{self, ParsedContext, TokenRole};
 use crate::db::{AppDb, LoggedCompletionItem, StoredDoc};
 use crate::indexer;
-use crate::ml::{train_model, MlModel, TrainOptions, TrainingSample};
 use crate::protocol::{
     CompletionItem, CompletionMeta, CompletionRequest, CompletionResponse, CompletionTip,
     ExplainFeature, ExplainItem, ExplainResponse, MigrationStatusResponse, RecentEvent,
@@ -148,7 +147,6 @@ pub struct Engine {
     config: AppConfig,
     db: AppDb,
     paths: AppPaths,
-    ml_model: Option<MlModel>,
     tips_runtime: crate::tips::Runtime,
     /// Per-locale catalog cache. Built lazily on first request for each lang
     /// (bundled `en` + user override at `<config_dir>/locales/<lang>.toml`).
@@ -161,30 +159,10 @@ impl Engine {
         paths.ensure()?;
         let config = AppConfig::load(paths)?;
         let db = AppDb::open(&paths.db_file)?;
-        // A missing or truncated/unparsable model file must never prevent the
-        // daemon from starting (e.g. a crash mid-write before the B5 atomic
-        // save fix, or a hand-edited file). Degrade to "no ml rerank" instead
-        // of propagating the error out of `Engine::new`.
-        let ml_model = config
-            .ml_model_file
-            .as_deref()
-            .map(PathBuf::from)
-            .filter(|path| path.exists())
-            .and_then(|path| match MlModel::load(&path) {
-                Ok(model) => Some(model),
-                Err(err) => {
-                    eprintln!(
-                        "shac: warning: failed to load ml model {}: {err:#}; continuing without ml rerank",
-                        path.display()
-                    );
-                    None
-                }
-            });
         Ok(Self {
             config,
             db,
             paths: paths.clone(),
-            ml_model,
             tips_runtime: crate::tips::Runtime::default(),
             catalog_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
         })
@@ -342,15 +320,21 @@ impl Engine {
     }
 
     pub fn stats(&self) -> Result<StatsResponse> {
-        self.db.stats()
+        let mut stats = self.db.stats()?;
+        // The DB layer has no config access; overlay the configured retention
+        // window here so `shac stats` shows the setting the user controls, not
+        // the DB-layer fallback constant. Read it FRESH from disk rather than
+        // the construction-time `self.config`: the daemon's prune thread reloads
+        // config each tick, so a cached value would report a stale window after
+        // `config set telemetry_retention_days`. Fall back to the cache on error.
+        stats.telemetry_retention_days = AppConfig::load(&self.paths)
+            .map(|c| c.telemetry_retention_days)
+            .unwrap_or(self.config.telemetry_retention_days);
+        Ok(stats)
     }
 
     pub fn migration_status(&self) -> Result<MigrationStatusResponse> {
         self.db.migration_status()
-    }
-
-    pub fn training_samples(&self, limit: usize) -> Result<Vec<TrainingSample>> {
-        self.db.training_samples(limit)
     }
 
     pub fn reset_personalization(&self) -> Result<()> {
@@ -360,37 +344,6 @@ impl Engine {
     pub fn recent_events(&self, limit: usize) -> Result<Vec<RecentEvent>> {
         self.db.recent_events(limit)
     }
-}
-
-const ML_ACTIVATION_THRESHOLD: i64 = 50;
-const ML_TRAIN_LIMIT: usize = 10_000;
-
-/// Checks whether enough accepted completions have been collected to train and
-/// auto-enable the ML model. Called once at daemon startup. Returns true when
-/// the model was just activated for the first time.
-pub fn maybe_auto_train(paths: &AppPaths) -> Result<bool> {
-    let mut config = AppConfig::load(paths)?;
-    if config.features.ml_rerank {
-        return Ok(false);
-    }
-    let db = AppDb::open(&paths.db_file)?;
-    let stats = db.stats()?;
-    if stats.accepted_clean_completions < ML_ACTIVATION_THRESHOLD {
-        return Ok(false);
-    }
-    let model_path = paths.data_dir.join("model.json");
-    if !model_path.exists() {
-        let samples = db.training_samples(ML_TRAIN_LIMIT)?;
-        if samples.is_empty() {
-            return Ok(false);
-        }
-        let model = train_model(&samples, &TrainOptions::default());
-        model.save(&model_path)?;
-    }
-    config.ml_model_file = Some(model_path.to_string_lossy().into_owned());
-    config.features.ml_rerank = true;
-    config.save(paths)?;
-    Ok(true)
 }
 
 impl Engine {
@@ -1572,22 +1525,6 @@ impl Engine {
             .iter()
             .map(|feature| feature.value * feature.weight)
             .sum::<f64>();
-        let mut final_features = features.clone();
-        let mut score = heuristic_score;
-
-        if self.config.features.ml_rerank {
-            if let Some(model) = &self.ml_model {
-                let ml_score = model.predict(
-                    &feature_values(&features),
-                    &candidate.kind,
-                    &candidate.source,
-                );
-                let blend = self.config.ml_blend_weight.clamp(0.0, 1.0);
-                score = heuristic_score * (1.0 - blend) + ml_score * blend;
-                final_features.push(feature("heuristic_score", heuristic_score, 1.0 - blend));
-                final_features.push(feature("ml_model_score", ml_score, blend));
-            }
-        }
 
         RankedCandidate {
             item: CompletionItem {
@@ -1595,14 +1532,14 @@ impl Engine {
                 insert_text: candidate.insert_text.clone(),
                 display: candidate.display.clone(),
                 kind: candidate.kind.clone(),
-                score,
+                score: heuristic_score,
                 source: candidate.source.clone(),
                 meta: CompletionMeta {
                     description: candidate.description.clone(),
                 },
             },
             item_key: history_key,
-            features: final_features,
+            features,
         }
     }
 
@@ -1653,7 +1590,6 @@ fn feature(name: &'static str, value: f64, weight: f64) -> FeatureBreakdown {
 fn feature_values(features: &[FeatureBreakdown]) -> HashMap<String, f64> {
     features
         .iter()
-        .filter(|feature| feature.name != "heuristic_score" && feature.name != "ml_model_score")
         .map(|feature| (feature.name.to_string(), feature.value))
         .collect()
 }

@@ -4,7 +4,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 
-use crate::ml::TrainingSample;
 use crate::protocol::{
     MigrationStatusResponse, RecentEvent, RecordCommandRequest, StatsResponse,
     PROVENANCE_ACCEPTED_COMPLETION, PROVENANCE_CONFIDENCE_EXACT, PROVENANCE_CONFIDENCE_HEURISTIC,
@@ -615,6 +614,13 @@ impl AppDb {
         Ok(classified)
     }
 
+    /// Records one completion impression (`completion_requests` +
+    /// `completion_items`) for local diagnostics (`shac stats` / `shac
+    /// doctor`) only — this data never leaves the machine. Pruned by
+    /// [`prune_completion_telemetry`](Self::prune_completion_telemetry)
+    /// after `telemetry_retention_days` (config; default
+    /// [`COMPLETION_TELEMETRY_RETENTION_DAYS`] days); set it to `0` for
+    /// maximum privacy (everything pruned on the next cycle).
     #[allow(clippy::too_many_arguments)]
     pub fn record_completion_request(
         &self,
@@ -1215,6 +1221,11 @@ impl AppDb {
             paths_index_rows,
             time_to_first_accept_seconds,
             import_coverage_pct,
+            // The DB layer has no config access; `Engine::stats` overwrites
+            // this with the configured `telemetry_retention_days`. The
+            // fallback here only matters for direct `AppDb::stats()` callers
+            // (e.g. tests) that skip the `Engine` wrapper.
+            telemetry_retention_days: COMPLETION_TELEMETRY_RETENTION_DAYS as u32,
         })
     }
 
@@ -1257,41 +1268,6 @@ impl AppDb {
                 tty_present: row.get::<_, i64>(10)? != 0,
             })
         })?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
-    }
-
-    pub fn training_samples(&self, limit: usize) -> Result<Vec<TrainingSample>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT i.kind, i.source, i.feature_json,
-                    CASE WHEN r.accepted_item_key = i.item_key THEN 1.0 ELSE 0.0 END AS label
-             FROM completion_items i
-             JOIN completion_requests r ON r.id = i.request_id
-             WHERE r.eligible_for_learning = 1
-               AND r.trust = ?1
-               AND r.accepted_trust = ?1
-               AND r.accepted_provenance IN (?2, ?3)
-               AND r.accepted_command IS NOT NULL
-             ORDER BY i.id DESC
-             LIMIT ?4",
-        )?;
-        let rows = stmt.query_map(
-            params![
-                TRUST_INTERACTIVE,
-                PROVENANCE_TYPED_MANUAL,
-                PROVENANCE_ACCEPTED_COMPLETION,
-                limit as i64
-            ],
-            |row| {
-                let feature_json: String = row.get(2)?;
-                let features = serde_json::from_str(&feature_json).unwrap_or_default();
-                Ok(TrainingSample {
-                    kind: row.get(0)?,
-                    source: row.get(1)?,
-                    features,
-                    label: row.get(3)?,
-                })
-            },
-        )?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
@@ -1468,25 +1444,23 @@ impl AppDb {
         Ok(std::collections::HashSet::new())
     }
 
-    /// Deletes `completion_requests` older than `retention_days` (default
-    /// [`COMPLETION_TELEMETRY_RETENTION_DAYS`]), EXCEPT rows that are the ML
-    /// training signal — accepted completions eligible for learning
-    /// (`accepted_command IS NOT NULL AND eligible_for_learning = 1`). Those
-    /// are few and are exactly what `maybe_auto_train` / retrain / export
-    /// read, so they're kept indefinitely rather than aged out with the
-    /// unbounded non-accepted noise the disk-bloat pruning is meant to
-    /// address. `completion_items` rows are removed via the `ON DELETE
-    /// CASCADE` FK (see schema in `init`, which also enables `PRAGMA
-    /// foreign_keys = ON`) rather than a second DELETE. Returns the number of
-    /// requests pruned.
+    /// Deletes ALL `completion_requests` older than `retention_days` (the
+    /// configured `telemetry_retention_days`, default
+    /// [`COMPLETION_TELEMETRY_RETENTION_DAYS`]), uniformly — including rows
+    /// carrying the acceptance-tracking signal. That carve-out existed only
+    /// to preserve ML training signal for the (now removed) learner; with no
+    /// learner reading this data, there's no reason to keep any row past the
+    /// retention window it was told to observe. `retention_days <= 0` prunes
+    /// everything on the next cycle (maximum privacy). `completion_items`
+    /// rows are removed via the `ON DELETE CASCADE` FK (see schema in
+    /// `init`, which also enables `PRAGMA foreign_keys = ON`) rather than a
+    /// second DELETE. Returns the number of requests pruned.
     pub fn prune_completion_telemetry(&self, retention_days: i64) -> Result<usize> {
         let cutoff = unix_ts() - retention_days.max(0) * 86_400;
         let deleted = self
             .conn
             .execute(
-                "DELETE FROM completion_requests
-                 WHERE ts < ?1
-                   AND (accepted_command IS NULL OR eligible_for_learning = 0)",
+                "DELETE FROM completion_requests WHERE ts < ?1",
                 params![cutoff],
             )
             .context("prune completion telemetry")?;
@@ -2201,116 +2175,6 @@ mod tests {
     }
 
     #[test]
-    fn training_samples_include_clean_accepts_and_exclude_paste() {
-        let mut path = std::env::temp_dir();
-        path.push(format!("shac-test-{}-training-clean.db", unix_ts()));
-        std::fs::remove_file(&path).ok();
-
-        let db = AppDb::open(PathBuf::from(&path).as_path()).expect("open db");
-        let clean_request_id = db
-            .record_completion_request(
-                "zsh",
-                "/tmp",
-                "pyt",
-                3,
-                "pyt",
-                None,
-                TRUST_INTERACTIVE,
-                &[
-                    LoggedCompletionItem {
-                        rank: 0,
-                        item_key: "python3".to_string(),
-                        insert_text: "python3".to_string(),
-                        display: "python3".to_string(),
-                        kind: "command".to_string(),
-                        source: "path_index".to_string(),
-                        score: 1.0,
-                        feature_json: r#"{"prefix_score":1.0}"#.to_string(),
-                    },
-                    LoggedCompletionItem {
-                        rank: 1,
-                        item_key: "python3-config".to_string(),
-                        insert_text: "python3-config".to_string(),
-                        display: "python3-config".to_string(),
-                        kind: "command".to_string(),
-                        source: "path_index".to_string(),
-                        score: 0.7,
-                        feature_json: r#"{"prefix_score":0.7}"#.to_string(),
-                    },
-                ],
-            )
-            .expect("record clean completion request");
-        db.record_history(&RecordCommandRequest {
-            command: "python3".to_string(),
-            cwd: "/tmp".to_string(),
-            shell: Some("zsh".to_string()),
-            trust: Some(TRUST_INTERACTIVE.to_string()),
-            provenance: Some(PROVENANCE_ACCEPTED_COMPLETION.to_string()),
-            provenance_source: None,
-            provenance_confidence: None,
-            origin: Some("zsh_precmd".to_string()),
-            tty_present: Some(true),
-            exit_status: None,
-            accepted_request_id: Some(clean_request_id),
-            accepted_item_key: Some("python3".to_string()),
-            accepted_rank: Some(0),
-        })
-        .expect("record clean accept");
-
-        let pasted_request_id = db
-            .record_completion_request(
-                "zsh",
-                "/tmp",
-                "ech",
-                3,
-                "ech",
-                None,
-                TRUST_INTERACTIVE,
-                &[LoggedCompletionItem {
-                    rank: 0,
-                    item_key: "echo pasted".to_string(),
-                    insert_text: "echo pasted".to_string(),
-                    display: "echo pasted".to_string(),
-                    kind: "history".to_string(),
-                    source: "history".to_string(),
-                    score: 1.0,
-                    feature_json: r#"{"prefix_score":1.0}"#.to_string(),
-                }],
-            )
-            .expect("record pasted completion request");
-        db.record_history(&RecordCommandRequest {
-            command: "echo pasted".to_string(),
-            cwd: "/tmp".to_string(),
-            shell: Some("zsh".to_string()),
-            trust: Some(TRUST_INTERACTIVE.to_string()),
-            provenance: Some(PROVENANCE_PASTED.to_string()),
-            provenance_source: Some(PROVENANCE_SOURCE_ZSH_BRACKETED_PASTE.to_string()),
-            provenance_confidence: Some(PROVENANCE_CONFIDENCE_EXACT.to_string()),
-            origin: Some("zsh_precmd".to_string()),
-            tty_present: Some(true),
-            exit_status: None,
-            accepted_request_id: Some(pasted_request_id),
-            accepted_item_key: Some("echo pasted".to_string()),
-            accepted_rank: Some(0),
-        })
-        .expect("record pasted command");
-
-        let samples = db.training_samples(10).expect("training samples");
-        assert_eq!(samples.len(), 2);
-        assert_eq!(
-            samples.iter().filter(|sample| sample.label == 1.0).count(),
-            1
-        );
-        assert_eq!(
-            samples.iter().filter(|sample| sample.label == 0.0).count(),
-            1
-        );
-        assert!(samples.iter().all(|sample| sample.kind == "command"));
-
-        std::fs::remove_file(&path).ok();
-    }
-
-    #[test]
     fn command_has_docs_returns_false_when_empty() {
         let db = test_db();
         assert!(!db.command_has_docs("nonexistent_cmd"));
@@ -2502,17 +2366,14 @@ mod tests {
         assert_eq!(extract_cd_target("cd"), None);
     }
 
-    /// B4: completion telemetry older than the retention window is pruned,
-    /// and completion_items cascades via the schema's `ON DELETE CASCADE`
-    /// FK (enabled by `PRAGMA foreign_keys = ON` in `init`) rather than
-    /// needing an explicit second DELETE.
-    ///
-    /// M3: an old row is only pruned if it's NOT the ML training signal — an
-    /// old row that was accepted and is eligible for learning
-    /// (`accepted_command IS NOT NULL AND eligible_for_learning = 1`) must
-    /// survive indefinitely, since `maybe_auto_train`/retrain/export read it.
+    /// B4: completion telemetry older than the retention window is pruned
+    /// uniformly, regardless of acceptance status — the carve-out for
+    /// accepted/eligible-for-learning rows existed only to preserve signal
+    /// for the (now removed) ML learner. completion_items cascades via the
+    /// schema's `ON DELETE CASCADE` FK (enabled by `PRAGMA foreign_keys =
+    /// ON` in `init`) rather than needing an explicit second DELETE.
     #[test]
-    fn prune_completion_telemetry_deletes_only_unaccepted_rows_older_than_cutoff() {
+    fn prune_completion_telemetry_deletes_all_rows_older_than_cutoff() {
         let db = test_db();
         let now = unix_ts();
         let old_ts = now - 40 * 86_400;
@@ -2535,8 +2396,9 @@ mod tests {
             )
             .expect("insert old unaccepted item");
 
-        // Old but accepted + eligible for learning: the ML training signal —
-        // must survive the prune despite being past the retention window.
+        // Old AND accepted + eligible for learning: with no learner left to
+        // read this signal, this must now be pruned too (previously it
+        // survived indefinitely).
         db.conn
             .execute(
                 "INSERT INTO completion_requests(ts, shell, cwd, line, cursor, active_token, eligible_for_learning, accepted_command)
@@ -2574,21 +2436,24 @@ mod tests {
         let deleted = db
             .prune_completion_telemetry(COMPLETION_TELEMETRY_RETENTION_DAYS)
             .expect("prune");
-        assert_eq!(deleted, 1);
+        assert_eq!(
+            deleted, 2,
+            "both old rows are pruned regardless of acceptance"
+        );
 
         let remaining_requests: i64 = db
             .conn
             .query_row("SELECT COUNT(*) FROM completion_requests", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(remaining_requests, 2);
+        assert_eq!(remaining_requests, 1);
 
         let remaining_items: i64 = db
             .conn
             .query_row("SELECT COUNT(*) FROM completion_items", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(remaining_items, 2);
+        assert_eq!(remaining_items, 1);
 
-        let mut surviving_ids: Vec<i64> = db
+        let surviving_ids: Vec<i64> = db
             .conn
             .prepare("SELECT id FROM completion_requests ORDER BY id")
             .unwrap()
@@ -2596,12 +2461,10 @@ mod tests {
             .unwrap()
             .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap();
-        surviving_ids.sort_unstable();
-        let mut expected = vec![old_accepted_id, recent_id];
-        expected.sort_unstable();
         assert_eq!(
-            surviving_ids, expected,
-            "old-accepted and recent rows must survive; old-unaccepted must be pruned"
+            surviving_ids,
+            vec![recent_id],
+            "only the recent row survives; old-accepted and old-unaccepted are both pruned"
         );
 
         let old_accepted_items: i64 = db
@@ -2613,9 +2476,34 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            old_accepted_items, 1,
-            "old-accepted row's completion_items must not have cascaded away"
+            old_accepted_items, 0,
+            "old-accepted row's completion_items must cascade away with it"
         );
+    }
+
+    /// `telemetry_retention_days = 0` (max privacy) prunes everything on the
+    /// next cycle, including rows recorded moments ago.
+    #[test]
+    fn prune_completion_telemetry_zero_retention_prunes_everything() {
+        let db = test_db();
+        let now = unix_ts();
+
+        db.conn
+            .execute(
+                "INSERT INTO completion_requests(ts, shell, cwd, line, cursor, active_token)
+                 VALUES (?1, 'zsh', '/tmp', 'ls', 2, 'ls')",
+                params![now - 1],
+            )
+            .expect("insert request");
+
+        let deleted = db.prune_completion_telemetry(0).expect("prune");
+        assert_eq!(deleted, 1);
+
+        let remaining_requests: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM completion_requests", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(remaining_requests, 0);
     }
 
     #[test]

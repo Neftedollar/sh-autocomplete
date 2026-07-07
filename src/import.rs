@@ -97,11 +97,9 @@ pub fn default_zoxide_path() -> Option<PathBuf> {
 // Redaction
 // ---------------------------------------------------------------------------
 
-/// Secret-shape patterns — the single source of truth for two consumers:
-/// history import (`Redactor`) drops whole matching commands, and the
-/// shac-ml-train scrubber replaces each match with `<TOKEN>`. Because of the
-/// second consumer, every pattern must cover the FULL secret token, not just
-/// a distinguishing prefix.
+/// Secret-shape patterns used by history import (`Redactor`) to drop whole
+/// matching commands. Every pattern covers the FULL secret token, not just a
+/// distinguishing prefix.
 pub const SECRET_PATTERNS: &[&str] = &[
     r"\bAKIA[0-9A-Z]{16}\b",
     r"\bASIA[0-9A-Z]{16}\b",

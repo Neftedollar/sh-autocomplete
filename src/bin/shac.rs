@@ -13,7 +13,6 @@ use shac::config::{AppConfig, AppPaths};
 use shac::context;
 use shac::engine::Engine;
 use shac::indexer;
-use shac::ml::{train_model, TrainOptions};
 use shac::protocol::{CompletionRequest, ExplainResponse, RecordCommandRequest, SessionInfo};
 use shac::quote::{quote_token, TokenContext};
 use shac::shell::{Shell, BASH_COMPLETION, FISH_COMPLETION, ZSH_COMPLETION};
@@ -45,8 +44,6 @@ enum Commands {
     RecentEvents(RecentEventsArgs),
     ShellEnv(ShellEnvArgs),
     ResetPersonalization,
-    ExportTrainingData(TrainingDataArgs),
-    TrainModel(TrainModelArgs),
     Import(ImportArgs),
     ScanProjects(ScanProjectsArgs),
     Tips(TipsArgs),
@@ -294,14 +291,6 @@ enum ConfigAction {
 }
 
 #[derive(Debug, Args)]
-struct TrainingDataArgs {
-    #[arg(long)]
-    output: Option<String>,
-    #[arg(long, default_value_t = 10000)]
-    limit: usize,
-}
-
-#[derive(Debug, Args)]
 struct SuggestArgs {
     #[arg(long, default_value = ".")]
     cwd: String,
@@ -309,18 +298,6 @@ struct SuggestArgs {
     all: bool,
     #[arg(long)]
     json: bool,
-}
-
-#[derive(Debug, Args)]
-struct TrainModelArgs {
-    #[arg(long)]
-    output: String,
-    #[arg(long, default_value_t = 10000)]
-    limit: usize,
-    #[arg(long, default_value_t = 30)]
-    iterations: usize,
-    #[arg(long, default_value_t = 0.15)]
-    learning_rate: f64,
 }
 
 fn main() -> Result<()> {
@@ -393,8 +370,6 @@ fn main() -> Result<()> {
         Commands::RecentEvents(args) => recent_events(&paths, args),
         Commands::ShellEnv(args) => shell_env(&paths, args),
         Commands::ResetPersonalization => reset_personalization(&paths),
-        Commands::ExportTrainingData(args) => export_training_data(&paths, args),
-        Commands::TrainModel(args) => train_model_file(&paths, args),
         Commands::Import(args) => import_action(&paths, args),
         Commands::ScanProjects(args) => scan_projects_action(&paths, args),
         Commands::Tips(args) => run_tips(&paths, args),
@@ -629,24 +604,18 @@ fn index_action(paths: &AppPaths, action: IndexAction) -> Result<()> {
     }
 }
 
-fn learning_status_check(paths: &AppPaths, config: &AppConfig) -> serde_json::Value {
+fn learning_status_check(paths: &AppPaths) -> serde_json::Value {
     let accepted = shac::db::AppDb::open(&paths.db_file)
         .and_then(|db| db.stats())
         .map(|s| s.accepted_clean_completions)
         .unwrap_or(0);
-    let (ok, detail) = if config.features.ml_rerank {
-        (
-            true,
-            format!("personalized model active ({accepted} accepted completions)"),
-        )
-    } else if accepted == 0 {
+    let (ok, detail) = if accepted == 0 {
         (
             false,
             "no accepted completions yet — press Tab a few times to start learning".to_string(),
         )
     } else {
-        let remaining = (50 - accepted).max(0);
-        (false, format!("{accepted}/50 accepted completions — {remaining} more to activate personalized model"))
+        (true, format!("{accepted} accepted completions recorded"))
     };
     doctor_check("learning_status", ok, detail)
 }
@@ -784,7 +753,7 @@ fn doctor(paths: &AppPaths, args: DoctorArgs) -> Result<()> {
             ),
         ),
     ];
-    checks.push(learning_status_check(paths, &config));
+    checks.push(learning_status_check(paths));
     checks.extend(cold_start_checks(paths));
     if matches!(args.shell, Some(ShellKind::Zsh)) {
         checks.extend(zsh_doctor_checks(paths)?);
@@ -1758,40 +1727,6 @@ fn recent_events(paths: &AppPaths, args: RecentEventsArgs) -> Result<()> {
 fn reset_personalization(paths: &AppPaths) -> Result<()> {
     let engine = Engine::new(paths)?;
     engine.reset_personalization()?;
-    Ok(())
-}
-
-fn export_training_data(paths: &AppPaths, args: TrainingDataArgs) -> Result<()> {
-    let engine = Engine::new(paths)?;
-    let samples = engine.training_samples(args.limit)?;
-    let mut output = String::new();
-    for sample in samples {
-        output.push_str(&serde_json::to_string(&sample)?);
-        output.push('\n');
-    }
-    if let Some(path) = args.output {
-        fs::write(path, output)?;
-    } else {
-        print!("{output}");
-    }
-    Ok(())
-}
-
-fn train_model_file(paths: &AppPaths, args: TrainModelArgs) -> Result<()> {
-    let engine = Engine::new(paths)?;
-    let samples = engine.training_samples(args.limit)?;
-    if samples.is_empty() {
-        bail!("no training samples available yet");
-    }
-    let model = train_model(
-        &samples,
-        &TrainOptions {
-            iterations: args.iterations,
-            learning_rate: args.learning_rate,
-        },
-    );
-    model.save(&PathBuf::from(&args.output))?;
-    println!("{}", args.output);
     Ok(())
 }
 

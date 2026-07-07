@@ -5,7 +5,6 @@ pub mod engine;
 pub mod i18n;
 pub mod import;
 pub mod indexer;
-pub mod ml;
 pub mod priors;
 pub mod profiles;
 pub mod protocol;
