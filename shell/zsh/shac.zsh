@@ -50,6 +50,9 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
   # ${(@)region_highlight:#...} yields a bogus single empty-string element.
   typeset -ga region_highlight
   typeset -ga _shac_region_highlights=()
+  typeset -g _shac_client_version=""
+  typeset -g _shac_daemon_version=""
+  typeset -gi _shac_version_warned=0
 
   if command -v shac >/dev/null 2>&1; then
     eval "$(shac shell-env --shell zsh 2>/dev/null)"
@@ -76,6 +79,29 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
     _shac_menu_descriptions=()
     _shac_pending_tip_id=""
     _shac_pending_tip_text=""
+  }
+
+  function _shac_version_gt() {
+    local -a av=("${(s:.:)1}") bv=("${(s:.:)2}")
+    local i
+    for i in 1 2 3; do
+      local a="${av[$i]:-0}" b="${bv[$i]:-0}"
+      (( a > b )) && return 0
+      (( a < b )) && return 1
+    done
+    return 1
+  }
+
+  function _shac_check_version_mismatch() {
+    (( _shac_version_warned )) && return 0
+    [[ -z "$_shac_client_version" || -z "$_shac_daemon_version" ]] && return 0
+    [[ "$_shac_client_version" == "$_shac_daemon_version" ]] && return 0
+    _shac_version_warned=1
+    if _shac_version_gt "$_shac_client_version" "$_shac_daemon_version"; then
+      _shac_pending_tip_text="shacd v${_shac_daemon_version} still running (client v${_shac_client_version}) — shac daemon restart"
+    else
+      _shac_pending_tip_text="shell has old client v${_shac_client_version} (daemon v${_shac_daemon_version}) — exec \$SHELL"
+    fi
   }
 
   function _shac_set_input_provenance() {
@@ -672,6 +698,10 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
           _shac_decode "${tip_fields[3]:-}"
           _shac_pending_tip_text="$REPLY"
         fi
+      elif [[ "$line" == __shac_daemon_version$'\t'* ]]; then
+        local -a dv_fields
+        dv_fields=("${(ps:\t:)line}")
+        _shac_daemon_version="${dv_fields[2]:-}"
       else
         local -a fields
         fields=("${(ps:\t:)line}")
@@ -758,6 +788,8 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
       return $?
     fi
 
+    _shac_check_version_mismatch
+
     local total="${#_shac_menu_item_keys[@]}"
     if (( total == 0 )); then
       # Even with no candidates, we may have a tip to surface (notably the
@@ -773,6 +805,7 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
       local original_buffer="$BUFFER"
       local original_cursor="$CURSOR"
       _shac_apply_selected_item 1 "$original_buffer" "$original_cursor"
+      _shac_render_tip_only
       if zle; then
         zle -R
       fi
@@ -828,7 +861,7 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
   function _shac_note_manual_edit() {
     _shac_clear_inline
     if (( _shac_menu_open )); then
-      _shac_close_menu 1
+      _shac_close_menu 0
     fi
     _shac_mark_typed_manual
   }
@@ -836,7 +869,8 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
   function _shac_self_insert_widget() {
     local before_buffer="$BUFFER"
     if (( _shac_menu_open )); then
-      _shac_close_menu 1
+      _shac_commit_selected_item never
+      before_buffer="$BUFFER"
     fi
     _shac_clear_inline
     zle _shac_orig_self_insert -- "$@"
@@ -979,6 +1013,10 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
     _shac_clear_inline
     zle _shac_orig_self_insert -- "$@"
     _shac_update_inline
+  }
+
+  function shac-update() {
+    shac daemon restart && exec ${SHELL}
   }
 
   function _shac_record_precmd() {

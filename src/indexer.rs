@@ -13,6 +13,7 @@ use anyhow::Result;
 use crate::db::{AppDb, StoredDoc};
 
 const HELP_TIMEOUT: Duration = Duration::from_millis(350);
+const MAN_TIMEOUT: Duration = Duration::from_millis(500);
 const MAX_DOCS_PER_COMMAND: usize = 80;
 const MAX_DESCRIPTION_LEN: usize = 160;
 
@@ -202,6 +203,7 @@ fn upsert_static_docs(db: &AppDb, command: &str) -> Result<()> {
 /// nothing (covers tools that print help to a man page or stderr).
 fn upsert_docs_with_help_shellout(db: &AppDb, command: &str) -> Result<()> {
     let docs = static_docs(command)
+        .or_else(|| parse_man_output(command))
         .or_else(|| parse_help_output(command))
         .unwrap_or_default();
     if !docs.is_empty() {
@@ -240,6 +242,10 @@ fn run_help_with_timeout(command: &str, timeout: Duration) -> Option<std::proces
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
+        .env("TERM", "dumb")
+        .env("NO_COLOR", "1")
+        .env_remove("DISPLAY")
+        .env_remove("WAYLAND_DISPLAY")
         .spawn()
         .ok()?;
     let start = Instant::now();
@@ -253,6 +259,100 @@ fn run_help_with_timeout(command: &str, timeout: Duration) -> Option<std::proces
         let _ = child.kill();
     }
     child.wait_with_output().ok()
+}
+
+fn parse_man_output(command: &str) -> Option<Vec<StoredDoc>> {
+    let mut child = Command::new("man")
+        .args(["-P", "cat", command])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .env("MANWIDTH", "200")
+        .env("MANPAGER", "cat")
+        .spawn()
+        .ok()?;
+    let start = Instant::now();
+    let timed_out = loop {
+        if child.try_wait().ok()?.is_some() {
+            break false;
+        }
+        if start.elapsed() >= MAN_TIMEOUT {
+            break true;
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+    if timed_out {
+        let _ = child.kill();
+        let _ = child.wait();
+        return None;
+    }
+    let output = child.wait_with_output().ok()?;
+    if !output.status.success() || output.stdout.is_empty() {
+        return None;
+    }
+    let raw = String::from_utf8_lossy(&output.stdout);
+    let text = strip_man_formatting(&raw);
+    parse_man_sections(&text, command)
+}
+
+fn strip_man_formatting(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if i + 2 < bytes.len() && bytes[i + 1] == b'\x08' {
+            // overstrike bold: char, backspace, char — keep the second copy
+            out.push(bytes[i + 2]);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn parse_man_sections(text: &str, command: &str) -> Option<Vec<StoredDoc>> {
+    const SECTION_HEADERS: &[&str] = &[
+        "OPTIONS",
+        "COMMANDS",
+        "SUBCOMMANDS",
+        "VERBS",
+        "ACTIONS",
+        "AVAILABLE COMMANDS",
+        "GLOBAL OPTIONS",
+        "GLOBAL FLAGS",
+    ];
+    let mut docs = Vec::new();
+    let mut in_section = false;
+    for line in text.lines() {
+        if !line.starts_with(' ') && !line.starts_with('\t') && !line.is_empty() {
+            let upper = line.trim().to_uppercase();
+            in_section = SECTION_HEADERS.iter().any(|&h| upper.starts_with(h));
+            continue;
+        }
+        if !in_section {
+            continue;
+        }
+        let trimmed = line.trim();
+        if trimmed.starts_with('-') {
+            let mut parts = trimmed.splitn(2, "  ");
+            if let Some(item) = parts.next().map(str::trim).filter(|s| !s.is_empty()) {
+                let description = parts.next().unwrap_or("").trim();
+                if !description.is_empty() {
+                    docs.push(doc(command, "option", item, description, "man"));
+                    if docs.len() >= MAX_DOCS_PER_COMMAND {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    if docs.is_empty() {
+        None
+    } else {
+        Some(docs)
+    }
 }
 
 fn doc(

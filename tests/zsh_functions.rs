@@ -208,6 +208,102 @@ assert_eq "${#region_highlight[@]}" "0" "non-path_jump kind adds no highlight sp
     );
 }
 
+#[test]
+fn zsh_menu_type_and_backspace_keep_selected_buffer() {
+    if !support::command_available("zsh") {
+        eprintln!("skipping zsh function tests: zsh is unavailable");
+        return;
+    }
+
+    run_zsh(
+        r#"
+# Set up a menu with "cd Do" typed, "Documents" selected (already applied to BUFFER).
+function setup_menu() {
+  BUFFER="cd Documents"
+  CURSOR=13
+  _shac_menu_open=1
+  _shac_menu_selected_index=1
+  _shac_menu_original_buffer="cd Do"
+  _shac_menu_original_cursor=5
+  _shac_menu_item_keys=("cd Documents")
+  _shac_menu_insert_texts=("Documents")
+  _shac_menu_displays=("Documents")
+  _shac_menu_kinds=("directory")
+  _shac_menu_sources=("path")
+  _shac_menu_descriptions=("")
+}
+
+# Typing "/" while menu open: commit_selected_item keeps the selected text.
+# (_shac_self_insert_widget calls _shac_commit_selected_item never before inserting)
+setup_menu
+_shac_commit_selected_item never
+assert_eq "$BUFFER" "cd Documents" "commit_selected_item never keeps selected buffer"
+assert_eq "$_shac_menu_open" "0" "menu closed after commit"
+
+# Backspace while menu open: note_manual_edit should NOT restore original buffer.
+# Before the fix, close_menu 1 reverted BUFFER to "cd Do". Now close_menu 0 keeps it.
+setup_menu
+_shac_note_manual_edit
+assert_eq "$BUFFER" "cd Documents" "note_manual_edit keeps selected buffer, not original"
+assert_eq "$_shac_menu_open" "0" "menu closed after note_manual_edit"
+"#,
+    );
+}
+
+#[test]
+fn zsh_version_mismatch_warning() {
+    if !support::command_available("zsh") {
+        eprintln!("skipping zsh function tests: zsh is unavailable");
+        return;
+    }
+
+    run_zsh(
+        r#"
+# _shac_version_gt: basic ordering
+_shac_version_gt "0.5.2" "0.5.1" && assert_eq "yes" "yes" "0.5.2 > 0.5.1" || { print -ru2 "FAIL: 0.5.2 should be > 0.5.1"; exit 1; }
+_shac_version_gt "0.5.1" "0.5.2" && { print -ru2 "FAIL: 0.5.1 should NOT be > 0.5.2"; exit 1; } || true
+_shac_version_gt "1.0.0" "0.9.9" && assert_eq "yes" "yes" "1.0.0 > 0.9.9" || { print -ru2 "FAIL: 1.0.0 should be > 0.9.9"; exit 1; }
+_shac_version_gt "0.5.1" "0.5.1" && { print -ru2 "FAIL: equal versions should not be gt"; exit 1; } || true
+
+# Daemon stale (client newer): expect "brew services restart shac"
+_shac_version_warned=0
+_shac_client_version="0.5.2"
+_shac_daemon_version="0.5.1"
+_shac_pending_tip_text=""
+_shac_check_version_mismatch
+assert_contains "$_shac_pending_tip_text" "shac daemon restart" "stale daemon shows restart command"
+assert_contains "$_shac_pending_tip_text" "still running" "stale daemon warning says still running"
+assert_eq "$_shac_version_warned" "1" "version_warned flag set after mismatch"
+
+# Client outdated (daemon newer): expect "brew upgrade shac"
+_shac_version_warned=0
+_shac_client_version="0.5.1"
+_shac_daemon_version="0.5.2"
+_shac_pending_tip_text=""
+_shac_check_version_mismatch
+assert_contains "$_shac_pending_tip_text" "exec" "stale shell shows exec command"
+assert_contains "$_shac_pending_tip_text" "SHELL" "stale shell warning mentions SHELL"
+
+# Same version: no warning
+_shac_version_warned=0
+_shac_client_version="0.5.2"
+_shac_daemon_version="0.5.2"
+_shac_pending_tip_text=""
+_shac_check_version_mismatch
+assert_eq "$_shac_pending_tip_text" "" "no warning when versions match"
+assert_eq "$_shac_version_warned" "0" "version_warned not set when versions match"
+
+# Already warned: tip not overwritten
+_shac_version_warned=1
+_shac_client_version="0.5.2"
+_shac_daemon_version="0.5.1"
+_shac_pending_tip_text="already set"
+_shac_check_version_mismatch
+assert_eq "$_shac_pending_tip_text" "already set" "already warned: tip not overwritten"
+"#,
+    );
+}
+
 fn run_zsh(body: &str) {
     let script_path = std::env::current_dir()
         .expect("current dir")
