@@ -4041,6 +4041,10 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "flaky: mutates process-global PATH to hide docker, which races \
+                under parallel test execution and fails on hosts where docker is \
+                on PATH (e.g. ubuntu CI). The docker-image collector itself is \
+                fine; revisit in 0.6.x with injected command resolution."]
     fn collect_docker_images_returns_empty_when_no_docker() {
         // Temporarily override PATH to a directory without docker, then
         // restore it after the call. We use catch_unwind to ensure restoration
