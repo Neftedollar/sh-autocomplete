@@ -141,6 +141,11 @@ fn daemon_stop_does_not_kill_unrelated_process_with_recycled_pid() {
 /// substring somewhere in a parent directory (e.g.
 /// `/tmp/team-shacd-tools/backup-agent`) must NOT be misidentified as the
 /// shacd daemon and killed — only an exact basename match of `shacd` counts.
+// macOS-only: `ps -o comm=` reports the full executable path there, so a path
+// containing "shacd" as a substring is the exact mis-kill vector this guards
+// against. On Linux `ps -o comm=` reports only the (basename) command name, so
+// the scenario is not reproducible; the basename fix itself is correct on both.
+#[cfg(target_os = "macos")]
 #[test]
 fn daemon_stop_does_not_kill_process_whose_path_contains_shacd_substring() {
     let env = support::TestEnv::new("shacd-substring-path");
