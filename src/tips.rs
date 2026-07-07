@@ -182,7 +182,9 @@ mod triggers {
         if !starts_with_token(c.line, "kubectl") {
             return false;
         }
-        let rest = c.line.strip_prefix("kubectl ").unwrap_or("");
+        // starts_with_token tolerates leading whitespace, so trim it before
+        // strip_prefix or a leading-space `kubectl ...` never matches.
+        let rest = c.line.trim_start().strip_prefix("kubectl ").unwrap_or("");
         if rest.split_whitespace().next().is_none() {
             return false;
         }
@@ -445,5 +447,46 @@ impl Runtime {
         let entry = map.entry(tty.to_string()).or_default();
         entry.shown_this_session.insert(tip_id.to_string());
         entry.last_tab_at = Some(Instant::now());
+    }
+}
+
+#[cfg(test)]
+mod kubectl_tip_tests {
+    use super::triggers_for_test::kubectl_resources;
+    use super::Context;
+    use std::path::Path;
+
+    fn ctx<'a>(line: &'a str, home: &'a Path) -> Context<'a> {
+        Context {
+            line,
+            cursor: line.len(),
+            cwd: Path::new("/tmp"),
+            tty: "",
+            home,
+            response_sources: &[],
+            has_path_jump: false,
+            n_candidates: 0,
+            unknown_bin: None,
+        }
+    }
+
+    #[test]
+    fn kubectl_tip_fires_with_leading_space() {
+        // A `.kube/config` under a temp home makes the trigger eligible without
+        // relying on the ambient KUBECONFIG (which, if set, only adds true-paths
+        // and never flips the false case below).
+        let base = std::env::temp_dir().join(format!("shac-kubectl-{}", std::process::id()));
+        let kube = base.join(".kube");
+        std::fs::create_dir_all(&kube).unwrap();
+        std::fs::write(kube.join("config"), "apiVersion: v1").unwrap();
+
+        // Leading space (hist_ignore_space habit) must still fire the tip.
+        assert!(kubectl_resources(&ctx(" kubectl get pods", &base)));
+        // No leading space still fires.
+        assert!(kubectl_resources(&ctx("kubectl get pods", &base)));
+        // Bare `kubectl` with no subcommand does not (guarded before the config check).
+        assert!(!kubectl_resources(&ctx(" kubectl", &base)));
+
+        std::fs::remove_dir_all(&base).ok();
     }
 }

@@ -11,7 +11,6 @@ pub struct FeatureFlags {
     pub history_ranking: bool,
     pub doc_search: bool,
     pub project_context: bool,
-    pub ml_rerank: bool,
     pub inline_zsh: bool,
 }
 
@@ -21,7 +20,6 @@ impl Default for FeatureFlags {
             history_ranking: true,
             doc_search: true,
             project_context: true,
-            ml_rerank: false,
             inline_zsh: false,
         }
     }
@@ -118,8 +116,14 @@ pub struct AppConfig {
     pub ui: UiConfig,
     pub max_results: usize,
     pub daemon_timeout_ms: u64,
-    pub ml_model_file: Option<String>,
-    pub ml_blend_weight: f64,
+    /// How many days of completion telemetry (`completion_requests` /
+    /// `completion_items`) the background prune keeps before deleting it.
+    /// `0` means every row is pruned on the next cycle (maximum privacy —
+    /// nothing but the current in-flight request is retained); larger
+    /// values keep more history for `shac stats` / `shac doctor`
+    /// diagnostics. There is no learner reading this data anymore, so the
+    /// only trade-off is diagnostics depth vs. how long local data lingers.
+    pub telemetry_retention_days: u32,
 }
 
 impl Default for AppConfig {
@@ -131,8 +135,7 @@ impl Default for AppConfig {
             ui: UiConfig::default(),
             max_results: 12,
             daemon_timeout_ms: 150,
-            ml_model_file: None,
-            ml_blend_weight: 0.35,
+            telemetry_retention_days: 30,
         }
     }
 }
@@ -208,12 +211,10 @@ impl AppConfig {
             "features.history_ranking" => Some(self.features.history_ranking.to_string()),
             "features.doc_search" => Some(self.features.doc_search.to_string()),
             "features.project_context" => Some(self.features.project_context.to_string()),
-            "features.ml_rerank" => Some(self.features.ml_rerank.to_string()),
             "features.inline_zsh" => Some(self.features.inline_zsh.to_string()),
             "max_results" => Some(self.max_results.to_string()),
             "daemon_timeout_ms" => Some(self.daemon_timeout_ms.to_string()),
-            "ml_model_file" => Some(self.ml_model_file.clone().unwrap_or_default()),
-            "ml_blend_weight" => Some(self.ml_blend_weight.to_string()),
+            "telemetry_retention_days" => Some(self.telemetry_retention_days.to_string()),
             "ranking.prefix_score" => Some(self.ranking.prefix_score.to_string()),
             "ranking.fuzzy_score" => Some(self.ranking.fuzzy_score.to_string()),
             "ranking.global_usage_score" => Some(self.ranking.global_usage_score.to_string()),
@@ -248,18 +249,10 @@ impl AppConfig {
             "features.history_ranking" => self.features.history_ranking = parse_bool(value)?,
             "features.doc_search" => self.features.doc_search = parse_bool(value)?,
             "features.project_context" => self.features.project_context = parse_bool(value)?,
-            "features.ml_rerank" => self.features.ml_rerank = parse_bool(value)?,
             "features.inline_zsh" => self.features.inline_zsh = parse_bool(value)?,
             "max_results" => self.max_results = value.parse()?,
             "daemon_timeout_ms" => self.daemon_timeout_ms = value.parse()?,
-            "ml_model_file" => {
-                self.ml_model_file = if value.is_empty() || value == "none" {
-                    None
-                } else {
-                    Some(value.to_string())
-                }
-            }
-            "ml_blend_weight" => self.ml_blend_weight = value.parse()?,
+            "telemetry_retention_days" => self.telemetry_retention_days = value.parse()?,
             "ranking.prefix_score" => self.ranking.prefix_score = value.parse()?,
             "ranking.fuzzy_score" => self.ranking.fuzzy_score = value.parse()?,
             "ranking.global_usage_score" => self.ranking.global_usage_score = value.parse()?,
@@ -302,5 +295,54 @@ fn parse_bool(value: &str) -> Result<bool> {
         "true" | "1" | "on" => Ok(true),
         "false" | "0" | "off" => Ok(false),
         _ => anyhow::bail!("expected boolean-like value, got {value}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn telemetry_retention_days_defaults_to_30() {
+        assert_eq!(AppConfig::default().telemetry_retention_days, 30);
+    }
+
+    #[test]
+    fn telemetry_retention_days_get_set_roundtrip() {
+        let mut config = AppConfig::default();
+        assert_eq!(
+            config.get_key("telemetry_retention_days").as_deref(),
+            Some("30")
+        );
+
+        config
+            .set_key("telemetry_retention_days", "0")
+            .expect("set to 0 (max privacy: prune everything each cycle)");
+        assert_eq!(
+            config.get_key("telemetry_retention_days").as_deref(),
+            Some("0")
+        );
+        assert_eq!(config.telemetry_retention_days, 0);
+
+        config
+            .set_key("telemetry_retention_days", "90")
+            .expect("set to 90");
+        assert_eq!(config.telemetry_retention_days, 90);
+
+        assert!(
+            config.set_key("telemetry_retention_days", "-1").is_err(),
+            "negative retention is not a valid u32"
+        );
+    }
+
+    #[test]
+    fn telemetry_retention_days_survives_toml_roundtrip() {
+        let config = AppConfig {
+            telemetry_retention_days: 7,
+            ..AppConfig::default()
+        };
+        let raw = toml::to_string_pretty(&config).expect("serialize config");
+        let parsed: AppConfig = toml::from_str(&raw).expect("parse config");
+        assert_eq!(parsed.telemetry_retention_days, 7);
     }
 }

@@ -18,7 +18,7 @@ fn write_pkg_json(dir: &Path, scripts_obj: &str) {
 /// Parse the candidates emitted by a `complete` invocation, returning
 /// `(insert_text, kind, source)` triples for every non-meta line. Filters
 /// out the `__shac_request_id` header and lines that don't have the
-/// expected shell-tsv-v2 column count.
+/// expected shell-tsv-v3 column count.
 fn parse_candidates(output: &str) -> Vec<(String, String, String)> {
     let mut out = Vec::new();
     for line in output.lines() {
@@ -64,7 +64,7 @@ fn npm_run_lists_scripts_from_package_json() {
             "--cwd",
             project.to_str().expect("utf8"),
             "--format",
-            "shell-tsv-v2",
+            "shell-tsv-v3",
         ],
     );
 
@@ -114,7 +114,7 @@ fn npm_run_filters_by_prefix() {
             "--cwd",
             project.to_str().expect("utf8"),
             "--format",
-            "shell-tsv-v2",
+            "shell-tsv-v3",
         ],
     );
 
@@ -161,7 +161,7 @@ fn npm_run_with_no_package_json_silently_returns_empty() {
             "--cwd",
             cwd.to_str().expect("utf8"),
             "--format",
-            "shell-tsv-v2",
+            "shell-tsv-v3",
         ],
     );
 
@@ -199,7 +199,7 @@ fn npm_run_walks_up_to_project_root() {
             "--cwd",
             nested.to_str().expect("utf8"),
             "--format",
-            "shell-tsv-v2",
+            "shell-tsv-v3",
         ],
     );
 
@@ -242,7 +242,7 @@ fn pnpm_and_yarn_run_use_same_collector() {
                 "--cwd",
                 project.to_str().expect("utf8"),
                 "--format",
-                "shell-tsv-v2",
+                "shell-tsv-v3",
             ],
         );
         let names: Vec<String> = parse_candidates(&output)
@@ -286,7 +286,7 @@ fn npm_run_handles_malformed_package_json() {
             "--cwd",
             project.to_str().expect("utf8"),
             "--format",
-            "shell-tsv-v2",
+            "shell-tsv-v3",
         ],
     );
 

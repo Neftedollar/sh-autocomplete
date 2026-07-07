@@ -18,21 +18,22 @@ pub struct ParsedContext {
     pub command: Option<String>,
     pub prev_token: Option<String>,
     pub project_markers: Vec<String>,
+    /// The unterminated quote char (`"` or `'`) of the active token, if any.
+    pub open_quote: Option<char>,
 }
 
 pub fn parse(line: &str, cursor: usize, cwd: &Path) -> ParsedContext {
-    // Round down to the nearest UTF-8 char boundary so multibyte chars (e.g.
-    // Cyrillic, CJK) don't cause a panic when the cursor lands mid-codepoint.
-    let max = cursor.min(line.len());
-    let safe_cursor = (0..=max)
-        .rev()
-        .find(|&i| line.is_char_boundary(i))
-        .unwrap_or(0);
-    let before = line[..safe_cursor].to_string();
-    let mut tokens = shell_split(&before);
-    let ends_with_space = before.ends_with(char::is_whitespace);
+    // `cursor` is a CHARACTER offset (matching zsh $CURSOR / fish), not a byte
+    // offset, so multibyte text before the cursor must not be byte-sliced.
+    let before: String = line.chars().take(cursor).collect();
+    // Only the pipeline/list segment the cursor is in determines the command:
+    // completion after `|`, `&&`, `;`, `&`, or a redirection targets the
+    // command that starts that segment, not the one at the start of the line.
+    let segment = last_segment(&before);
+    let scanned = tokenize(&segment);
+    let mut tokens = scanned.tokens;
 
-    if ends_with_space {
+    if scanned.trailing_boundary {
         tokens.push(String::new());
     }
 
@@ -59,7 +60,56 @@ pub fn parse(line: &str, cursor: usize, cwd: &Path) -> ParsedContext {
         command,
         prev_token,
         project_markers,
+        open_quote: scanned.open_quote,
     }
+}
+
+/// Return the char index in `s` immediately after the last unquoted
+/// pipeline/list operator (`|`, `||`, `&&`, `;`, `&`) or redirection (`<`,
+/// `>`), so callers can restrict tokenization to the segment containing the
+/// cursor. Operators inside an open quote are not boundaries. 0 if none.
+fn last_segment_start(s: &str) -> usize {
+    let chars: Vec<char> = s.chars().collect();
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    let mut boundary = 0usize;
+    let mut i = 0;
+
+    while i < chars.len() {
+        let ch = chars[i];
+        if escaped {
+            escaped = false;
+            i += 1;
+            continue;
+        }
+        match ch {
+            '\\' => escaped = true,
+            '\'' | '"' => {
+                if quote == Some(ch) {
+                    quote = None;
+                } else if quote.is_none() {
+                    quote = Some(ch);
+                }
+            }
+            '|' | '&' | ';' | '<' | '>' if quote.is_none() => {
+                // Treat a doubled operator ("||", "&&") as a single boundary.
+                if matches!(ch, '|' | '&') && chars.get(i + 1) == Some(&ch) {
+                    i += 1;
+                }
+                boundary = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    boundary
+}
+
+/// The trailing pipeline/list segment of `s` (the part after the last
+/// top-level operator), or the whole string if there is none.
+fn last_segment(s: &str) -> String {
+    let start = last_segment_start(s);
+    s.chars().skip(start).collect()
 }
 
 fn classify_role(tokens: &[String], active_index: usize, cwd: &Path) -> TokenRole {
@@ -141,13 +191,27 @@ fn find_upwards(cwd: &Path, name: &str) -> Option<PathBuf> {
     None
 }
 
-pub fn shell_split(line: &str) -> Vec<String> {
+struct Tokenized {
+    tokens: Vec<String>,
+    /// The unterminated quote char at end-of-scan, if the input ends inside
+    /// an open quote.
+    open_quote: Option<char>,
+    /// True if the scan's LAST character was an unescaped, unquoted
+    /// whitespace: the user finished a word and a fresh token starts empty.
+    /// False if the trailing whitespace was escaped or inside a quote, in
+    /// which case it is content, not a boundary (kept in the active token).
+    trailing_boundary: bool,
+}
+
+fn tokenize(line: &str) -> Tokenized {
     let mut tokens = Vec::new();
     let mut current = String::new();
     let mut quote = None;
     let mut escaped = false;
+    let mut trailing_boundary = false;
 
     for ch in line.chars() {
+        trailing_boundary = false;
         if escaped {
             current.push(ch);
             escaped = false;
@@ -168,6 +232,7 @@ pub fn shell_split(line: &str) -> Vec<String> {
                 if !current.is_empty() {
                     tokens.push(std::mem::take(&mut current));
                 }
+                trailing_boundary = true;
             }
             _ => current.push(ch),
         }
@@ -176,7 +241,15 @@ pub fn shell_split(line: &str) -> Vec<String> {
     if !current.is_empty() {
         tokens.push(current);
     }
-    tokens
+    Tokenized {
+        tokens,
+        open_quote: quote,
+        trailing_boundary,
+    }
+}
+
+pub fn shell_split(line: &str) -> Vec<String> {
+    tokenize(line).tokens
 }
 
 #[cfg(test)]
@@ -197,5 +270,34 @@ mod tests {
             shell_split("echo \"hello world\""),
             vec!["echo", "hello world"]
         );
+    }
+
+    #[test]
+    fn cursor_is_character_offset() {
+        // "привет " has 7 chars; cursor 7 = end. Byte length is 13.
+        let cwd = std::path::Path::new("/tmp");
+        let ctx = parse("привет ls", 8, cwd); // 8 chars = after "привет l"
+        assert_eq!(ctx.active_token, "l");
+    }
+
+    #[test]
+    fn command_after_operator() {
+        let cwd = std::path::Path::new("/tmp");
+        let ctx = parse("git log | grep fo", 17, cwd);
+        assert_eq!(ctx.command.as_deref(), Some("grep"));
+        assert_eq!(ctx.active_token, "fo");
+        let ctx2 = parse("a && b -x", 9, cwd);
+        assert_eq!(ctx2.command.as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn escaped_trailing_space_keeps_token() {
+        let cwd = std::path::Path::new("/tmp");
+        let ctx = parse("cd My\\ ", 7, cwd);
+        assert_eq!(ctx.active_token, "My ");
+        assert_eq!(ctx.open_quote, None);
+        let q = parse("cd \"My ", 7, cwd);
+        assert_eq!(q.active_token, "My ");
+        assert_eq!(q.open_quote, Some('"'));
     }
 }

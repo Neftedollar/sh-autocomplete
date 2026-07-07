@@ -8,7 +8,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
-/// Parse TSV candidates from `shac complete --format shell-tsv-v2` output.
+/// Parse TSV candidates from `shac complete --format shell-tsv-v3` output.
 /// Returns `(insert_text, kind, source)` triples, skipping the
 /// `__shac_request_id` header and short lines.
 fn parse_candidates(output: &str) -> Vec<(String, String, String)> {
@@ -70,7 +70,7 @@ fn kubectl_get_lists_static_fallback_when_no_kubectl() {
             "--cwd",
             "/tmp",
             "--format",
-            "shell-tsv-v2",
+            "shell-tsv-v3",
         ]);
         let result = cmd.output().expect("run shac complete");
         String::from_utf8_lossy(&result.stdout).to_string()
@@ -125,7 +125,7 @@ fn kubectl_get_filters_by_active_prefix() {
             "--cwd",
             "/tmp",
             "--format",
-            "shell-tsv-v2",
+            "shell-tsv-v3",
         ]);
         let result = cmd.output().expect("run shac complete");
         String::from_utf8_lossy(&result.stdout).to_string()
@@ -188,7 +188,7 @@ fn kubectl_describe_uses_same_collector() {
             "--cwd",
             "/tmp",
             "--format",
-            "shell-tsv-v2",
+            "shell-tsv-v3",
         ]);
         let result = cmd.output().expect("run shac complete");
         String::from_utf8_lossy(&result.stdout).to_string()
@@ -232,7 +232,7 @@ fn kubectl_delete_uses_same_collector() {
             "--cwd",
             "/tmp",
             "--format",
-            "shell-tsv-v2",
+            "shell-tsv-v3",
         ]);
         let result = cmd.output().expect("run shac complete");
         String::from_utf8_lossy(&result.stdout).to_string()
@@ -282,7 +282,7 @@ fn kubectl_get_handles_no_cluster() {
             "--cwd",
             "/tmp",
             "--format",
-            "shell-tsv-v2",
+            "shell-tsv-v3",
         ]);
         let result = cmd.output().expect("run shac complete");
         // Must succeed — errors from kubectl are never surfaced to the user.
@@ -343,7 +343,7 @@ fn kubectl_get_returns_core_resources() {
             "--cwd",
             "/tmp",
             "--format",
-            "shell-tsv-v2",
+            "shell-tsv-v3",
         ]);
         let result = cmd.output().expect("run shac complete");
         String::from_utf8_lossy(&result.stdout).to_string()

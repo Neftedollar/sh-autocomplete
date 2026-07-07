@@ -48,7 +48,7 @@ fn write_storage_json(env: &support::TestEnv, content: &str) {
     fs::write(dir.join("storage.json"), content).expect("write storage.json");
 }
 
-/// Parse shell-tsv-v2 output from a `complete` invocation, returning
+/// Parse shell-tsv-v3 output from a `complete` invocation, returning
 /// `(insert_text, display, kind, source)` quads for every non-meta data line.
 fn parse_candidates(output: &str) -> Vec<(String, String, String, String)> {
     let mut out = Vec::new();
@@ -87,7 +87,7 @@ fn complete(env: &support::TestEnv, line: &str) -> Vec<(String, String, String, 
             "--cwd",
             "/tmp",
             "--format",
-            "shell-tsv-v2",
+            "shell-tsv-v3",
         ],
     );
     parse_candidates(&output)

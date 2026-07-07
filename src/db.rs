@@ -4,7 +4,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 
-use crate::ml::TrainingSample;
 use crate::protocol::{
     MigrationStatusResponse, RecentEvent, RecordCommandRequest, StatsResponse,
     PROVENANCE_ACCEPTED_COMPLETION, PROVENANCE_CONFIDENCE_EXACT, PROVENANCE_CONFIDENCE_HEURISTIC,
@@ -17,6 +16,17 @@ use crate::protocol::{
 const LEGACY_PENALTY: f64 = 0.15;
 const PASTE_PENALTY: f64 = 0.25;
 const TRUST_MIGRATION_KEY: &str = "trust_migration_v1";
+
+/// Maximum gap (seconds) between the previous command and the current one
+/// for `record_history` to treat them as a prev->next transition. Without a
+/// window, a long idle gap or an interleaved terminal tab would pair
+/// unrelated commands together. 600s = 10 minutes.
+const TRANSITION_MAX_GAP_SECS: i64 = 600;
+
+/// Default retention window for completion telemetry (`completion_requests` /
+/// `completion_items`). These tables are appended on every completion with no
+/// other pruning, so inline mode can write tens of MB/day without this cap.
+pub const COMPLETION_TELEMETRY_RETENTION_DAYS: i64 = 30;
 
 #[derive(Debug, Clone)]
 pub struct StoredDoc {
@@ -383,22 +393,37 @@ impl AppDb {
     }
 
     pub fn replace_docs_for_command(&self, command: &str, docs: &[StoredDoc]) -> Result<()> {
-        self.conn
-            .execute("DELETE FROM command_docs WHERE command = ?1", [command])?;
-        let mut stmt = self.conn.prepare(
-            "INSERT OR REPLACE INTO command_docs(command, item_type, item_value, description, source)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-        )?;
-        for doc in docs {
-            stmt.execute(params![
-                doc.command,
-                doc.item_type,
-                doc.item_value,
-                doc.description,
-                doc.source
-            ])?;
+        // Wrap the delete + per-row inserts in one transaction: without it, a
+        // failure partway through the inserts permanently loses/truncates a
+        // command's docs (the DELETE already committed) and every row pays
+        // its own commit.
+        self.begin_txn()?;
+        let result = (|| -> Result<()> {
+            self.conn
+                .execute("DELETE FROM command_docs WHERE command = ?1", [command])?;
+            let mut stmt = self.conn.prepare(
+                "INSERT OR REPLACE INTO command_docs(command, item_type, item_value, description, source)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+            )?;
+            for doc in docs {
+                stmt.execute(params![
+                    doc.command,
+                    doc.item_type,
+                    doc.item_value,
+                    doc.description,
+                    doc.source
+                ])?;
+            }
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => self.commit_txn(),
+            Err(err) => {
+                let _ = self.rollback_txn();
+                Err(err)
+            }
         }
-        Ok(())
     }
 
     pub fn command_has_docs(&self, command: &str) -> bool {
@@ -533,7 +558,7 @@ impl AppDb {
     pub fn record_history(&self, request: &RecordCommandRequest) -> Result<ClassifiedEvent> {
         let classified = self.classify_record_event(request);
         let ts = unix_ts();
-        let prev = self.latest_command()?;
+        let prev = self.latest_command_with_ts()?;
         self.conn.execute(
             "INSERT INTO history_events(ts, cwd, command, shell, trust, provenance, provenance_source, provenance_confidence, origin, tty_present)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
@@ -552,14 +577,20 @@ impl AppDb {
         )?;
 
         if is_clean_personalization_signal(&classified) {
-            if let Some(prev_command) = prev {
-                self.conn.execute(
-                    "INSERT INTO transitions(prev_command, next_command, count, interactive_count, legacy_count)
-                     VALUES (?1, ?2, 1, 1, 0)
-                     ON CONFLICT(prev_command, next_command)
-                     DO UPDATE SET count = count + 1, interactive_count = interactive_count + 1",
-                    params![prev_command, request.command],
-                )?;
+            // Only pair prev->next as a transition when the gap between them
+            // is within TRANSITION_MAX_GAP_SECS -- otherwise a long idle gap
+            // or an interleaved terminal tab would record a bogus
+            // transition between two unrelated commands.
+            if let Some((prev_command, prev_ts)) = prev {
+                if (ts - prev_ts).abs() <= TRANSITION_MAX_GAP_SECS {
+                    self.conn.execute(
+                        "INSERT INTO transitions(prev_command, next_command, count, interactive_count, legacy_count)
+                         VALUES (?1, ?2, 1, 1, 0)
+                         ON CONFLICT(prev_command, next_command)
+                         DO UPDATE SET count = count + 1, interactive_count = interactive_count + 1",
+                        params![prev_command, request.command],
+                    )?;
+                }
             }
 
             if let Some(project_root) = detect_project_root(&request.cwd) {
@@ -583,6 +614,13 @@ impl AppDb {
         Ok(classified)
     }
 
+    /// Records one completion impression (`completion_requests` +
+    /// `completion_items`) for local diagnostics (`shac stats` / `shac
+    /// doctor`) only — this data never leaves the machine. Pruned by
+    /// [`prune_completion_telemetry`](Self::prune_completion_telemetry)
+    /// after `telemetry_retention_days` (config; default
+    /// [`COMPLETION_TELEMETRY_RETENTION_DAYS`] days); set it to `0` for
+    /// maximum privacy (everything pruned on the next cycle).
     #[allow(clippy::too_many_arguments)]
     pub fn record_completion_request(
         &self,
@@ -757,9 +795,16 @@ impl AppDb {
     }
 
     pub fn latest_command(&self) -> Result<Option<String>> {
+        Ok(self.latest_command_with_ts()?.map(|(command, _ts)| command))
+    }
+
+    /// Like [`AppDb::latest_command`], but also returns the event's
+    /// timestamp so callers (namely `record_history`) can bound how stale a
+    /// "previous command" is before treating it as part of a transition.
+    fn latest_command_with_ts(&self) -> Result<Option<(String, i64)>> {
         self.conn
             .query_row(
-                "SELECT command
+                "SELECT command, ts
                  FROM history_events
                  WHERE trust = ?1
                    AND provenance IN (?2, ?3)
@@ -770,7 +815,7 @@ impl AppDb {
                     PROVENANCE_TYPED_MANUAL,
                     PROVENANCE_ACCEPTED_COMPLETION
                 ],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()
             .map_err(Into::into)
@@ -823,22 +868,44 @@ impl AppDb {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    /// Detects the project root for `cwd` — the nearest ancestor directory
+    /// containing a recognized project marker (`.git`, `Cargo.toml`, ...).
+    ///
+    /// Pure filesystem walk, no DB access, and depends only on `cwd`. A
+    /// request scoring many candidates against the same `cwd` should call
+    /// this once and reuse the result via [`AppDb::project_tool_count_for_root`]
+    /// rather than re-walking the filesystem per candidate.
+    pub fn project_root_for_cwd(&self, cwd: &str) -> Option<String> {
+        detect_project_root(cwd)
+    }
+
+    /// Looks up the recorded usage weight for `tool` under an
+    /// already-detected `project_root`, without re-walking the filesystem.
+    /// Pairs with [`AppDb::project_root_for_cwd`].
+    pub fn project_tool_count_for_root(
+        &self,
+        project_root: Option<&str>,
+        tool: &str,
+    ) -> Result<f64> {
+        let Some(project_root) = project_root else {
+            return Ok(0.0);
+        };
+        let value = self
+            .conn
+            .query_row(
+                "SELECT (interactive_count + legacy_count * ?3)
+                 FROM project_profiles
+                 WHERE project_root = ?1 AND tool = ?2",
+                params![project_root, tool, LEGACY_PENALTY],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or(0.0);
+        Ok(value)
+    }
+
     pub fn project_tool_count(&self, cwd: &str, tool: &str) -> Result<f64> {
-        if let Some(project_root) = detect_project_root(cwd) {
-            let value = self
-                .conn
-                .query_row(
-                    "SELECT (interactive_count + legacy_count * ?3)
-                     FROM project_profiles
-                     WHERE project_root = ?1 AND tool = ?2",
-                    params![project_root, tool, LEGACY_PENALTY],
-                    |row| row.get(0),
-                )
-                .optional()?
-                .unwrap_or(0.0);
-            return Ok(value);
-        }
-        Ok(0.0)
+        self.project_tool_count_for_root(self.project_root_for_cwd(cwd).as_deref(), tool)
     }
 
     pub fn get_dir_cache(&self, dir: &str) -> Result<Option<(i64, String)>> {
@@ -934,53 +1001,19 @@ impl AppDb {
         // We over-fetch by 4x to give room for decay-based reordering, capped.
         let fetch = (limit * 4).max(limit + 16);
         let now = unix_ts();
-        let mut rows: Vec<PathFrecency> = if let Some(filter) = prefix_filter {
-            let pattern = format!("%{}%", filter.to_lowercase());
-            let mut stmt = self.conn.prepare(
-                "SELECT path, rank, last_visit, visit_count, source, is_git_repo, project_marker
-                 FROM paths_index
-                 WHERE LOWER(path) LIKE ?1
-                 ORDER BY rank DESC
-                 LIMIT ?2",
-            )?;
-            let mapped = stmt
-                .query_map(params![pattern, fetch as i64], |row| {
-                    Ok(PathFrecency {
-                        path: row.get(0)?,
-                        rank: row.get(1)?,
-                        last_visit: row.get(2)?,
-                        visit_count: row.get(3)?,
-                        source: row.get(4)?,
-                        is_git_repo: row.get::<_, i64>(5)? != 0,
-                        project_marker: row.get(6)?,
-                    })
-                })?
-                .filter_map(Result::ok)
-                .collect::<Vec<_>>();
-            mapped
-        } else {
-            let mut stmt = self.conn.prepare(
-                "SELECT path, rank, last_visit, visit_count, source, is_git_repo, project_marker
-                 FROM paths_index
-                 ORDER BY rank DESC
-                 LIMIT ?1",
-            )?;
-            let mapped = stmt
-                .query_map(params![fetch as i64], |row| {
-                    Ok(PathFrecency {
-                        path: row.get(0)?,
-                        rank: row.get(1)?,
-                        last_visit: row.get(2)?,
-                        visit_count: row.get(3)?,
-                        source: row.get(4)?,
-                        is_git_repo: row.get::<_, i64>(5)? != 0,
-                        project_marker: row.get(6)?,
-                    })
-                })?
-                .filter_map(Result::ok)
-                .collect::<Vec<_>>();
-            mapped
-        };
+
+        // A single `ORDER BY rank DESC` prefetch can starve a recently
+        // visited but low-rank path: if enough stale, higher-rank rows
+        // exist, the recent row never makes it into `rows` for the Rust
+        // decay pass below to even consider. Pull a second candidate set
+        // ordered by recency and union it in so a recent low-rank path
+        // always has a chance to surface.
+        let mut rows = self.top_paths_candidates(prefix_filter, "rank DESC", fetch)?;
+        for candidate in self.top_paths_candidates(prefix_filter, "last_visit DESC", fetch)? {
+            if !rows.iter().any(|existing| existing.path == candidate.path) {
+                rows.push(candidate);
+            }
+        }
 
         rows.sort_by(|a, b| {
             let sa = path_frecency_decayed(a.rank, a.last_visit, now);
@@ -988,6 +1021,48 @@ impl AppDb {
             sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
         });
         rows.truncate(limit);
+        Ok(rows)
+    }
+
+    /// Fetches up to `fetch` rows from `paths_index`, optionally filtered by
+    /// a case-insensitive substring match on `path`, ordered by `order_by`
+    /// (a trusted, internally-controlled SQL fragment — never user input).
+    fn top_paths_candidates(
+        &self,
+        prefix_filter: Option<&str>,
+        order_by: &str,
+        fetch: usize,
+    ) -> Result<Vec<PathFrecency>> {
+        let sql = if prefix_filter.is_some() {
+            format!(
+                "SELECT path, rank, last_visit, visit_count, source, is_git_repo, project_marker
+                 FROM paths_index
+                 WHERE LOWER(path) LIKE ?1 ESCAPE '\\'
+                 ORDER BY {order_by}
+                 LIMIT ?2"
+            )
+        } else {
+            format!(
+                "SELECT path, rank, last_visit, visit_count, source, is_git_repo, project_marker
+                 FROM paths_index
+                 ORDER BY {order_by}
+                 LIMIT ?1"
+            )
+        };
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = if let Some(filter) = prefix_filter {
+            // `filter` is the raw user-typed token; escape LIKE metacharacters
+            // so a literal `_`/`%` someone typed doesn't act as a wildcard
+            // and match unrelated paths.
+            let pattern = format!("%{}%", escape_like_literal(&filter.to_lowercase()));
+            stmt.query_map(params![pattern, fetch as i64], map_path_frecency_row)?
+                .filter_map(Result::ok)
+                .collect::<Vec<_>>()
+        } else {
+            stmt.query_map(params![fetch as i64], map_path_frecency_row)?
+                .filter_map(Result::ok)
+                .collect::<Vec<_>>()
+        };
         Ok(rows)
     }
 
@@ -1146,6 +1221,11 @@ impl AppDb {
             paths_index_rows,
             time_to_first_accept_seconds,
             import_coverage_pct,
+            // The DB layer has no config access; `Engine::stats` overwrites
+            // this with the configured `telemetry_retention_days`. The
+            // fallback here only matters for direct `AppDb::stats()` callers
+            // (e.g. tests) that skip the `Engine` wrapper.
+            telemetry_retention_days: COMPLETION_TELEMETRY_RETENTION_DAYS as u32,
         })
     }
 
@@ -1188,41 +1268,6 @@ impl AppDb {
                 tty_present: row.get::<_, i64>(10)? != 0,
             })
         })?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
-    }
-
-    pub fn training_samples(&self, limit: usize) -> Result<Vec<TrainingSample>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT i.kind, i.source, i.feature_json,
-                    CASE WHEN r.accepted_item_key = i.item_key THEN 1.0 ELSE 0.0 END AS label
-             FROM completion_items i
-             JOIN completion_requests r ON r.id = i.request_id
-             WHERE r.eligible_for_learning = 1
-               AND r.trust = ?1
-               AND r.accepted_trust = ?1
-               AND r.accepted_provenance IN (?2, ?3)
-               AND r.accepted_command IS NOT NULL
-             ORDER BY i.id DESC
-             LIMIT ?4",
-        )?;
-        let rows = stmt.query_map(
-            params![
-                TRUST_INTERACTIVE,
-                PROVENANCE_TYPED_MANUAL,
-                PROVENANCE_ACCEPTED_COMPLETION,
-                limit as i64
-            ],
-            |row| {
-                let feature_json: String = row.get(2)?;
-                let features = serde_json::from_str(&feature_json).unwrap_or_default();
-                Ok(TrainingSample {
-                    kind: row.get(0)?,
-                    source: row.get(1)?,
-                    features,
-                    label: row.get(3)?,
-                })
-            },
-        )?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
@@ -1399,6 +1444,29 @@ impl AppDb {
         Ok(std::collections::HashSet::new())
     }
 
+    /// Deletes ALL `completion_requests` older than `retention_days` (the
+    /// configured `telemetry_retention_days`, default
+    /// [`COMPLETION_TELEMETRY_RETENTION_DAYS`]), uniformly — including rows
+    /// carrying the acceptance-tracking signal. That carve-out existed only
+    /// to preserve ML training signal for the (now removed) learner; with no
+    /// learner reading this data, there's no reason to keep any row past the
+    /// retention window it was told to observe. `retention_days <= 0` prunes
+    /// everything on the next cycle (maximum privacy). `completion_items`
+    /// rows are removed via the `ON DELETE CASCADE` FK (see schema in
+    /// `init`, which also enables `PRAGMA foreign_keys = ON`) rather than a
+    /// second DELETE. Returns the number of requests pruned.
+    pub fn prune_completion_telemetry(&self, retention_days: i64) -> Result<usize> {
+        let cutoff = unix_ts() - retention_days.max(0) * 86_400;
+        let deleted = self
+            .conn
+            .execute(
+                "DELETE FROM completion_requests WHERE ts < ?1",
+                params![cutoff],
+            )
+            .context("prune completion telemetry")?;
+        Ok(deleted)
+    }
+
     pub fn reset_personalization(&self) -> Result<()> {
         self.conn.execute_batch(
             r#"
@@ -1418,7 +1486,10 @@ impl AppDb {
         cwd: Option<&str>,
         limit: usize,
     ) -> Result<Vec<HistoryEntry>> {
-        let like = format!("{prefix}%");
+        // `prefix` is the raw user-typed active token; escape LIKE
+        // metacharacters so a literal `_`/`%` someone typed doesn't act as a
+        // wildcard and match unrelated history.
+        let like = format!("{}%", escape_like_literal(prefix));
         let weighted_case = weighted_history_case();
         let sql = if cwd.is_some() {
             format!(
@@ -1426,7 +1497,7 @@ impl AppDb {
                     SUM({weighted_case}) AS weighted_cnt,
                     MAX(ts) AS last_seen
              FROM history_events
-             WHERE cwd = ?1 AND command LIKE ?2
+             WHERE cwd = ?1 AND command LIKE ?2 ESCAPE '\\'
              GROUP BY command
              HAVING weighted_cnt > 0
              ORDER BY weighted_cnt DESC, last_seen DESC
@@ -1438,7 +1509,7 @@ impl AppDb {
                     SUM({weighted_case}) AS weighted_cnt,
                     MAX(ts) AS last_seen
              FROM history_events
-             WHERE command LIKE ?1
+             WHERE command LIKE ?1 ESCAPE '\\'
              GROUP BY command
              HAVING weighted_cnt > 0
              ORDER BY weighted_cnt DESC, last_seen DESC
@@ -1575,6 +1646,33 @@ fn path_frecency_decayed(rank: f64, last_visit: i64, now: i64) -> f64 {
     rank * decay
 }
 
+fn map_path_frecency_row(row: &rusqlite::Row) -> rusqlite::Result<PathFrecency> {
+    Ok(PathFrecency {
+        path: row.get(0)?,
+        rank: row.get(1)?,
+        last_visit: row.get(2)?,
+        visit_count: row.get(3)?,
+        source: row.get(4)?,
+        is_git_repo: row.get::<_, i64>(5)? != 0,
+        project_marker: row.get(6)?,
+    })
+}
+
+/// Escapes `%`, `_`, and the escape character itself so a raw, user-typed
+/// token embedded in a SQL `LIKE` pattern matches literally instead of being
+/// interpreted as a wildcard. Callers must pair this with `ESCAPE '\'` on
+/// the `LIKE` predicate.
+fn escape_like_literal(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if matches!(ch, '\\' | '%' | '_') {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    escaped
+}
+
 /// Resolve a `cd` target to an absolute path string.
 /// Returns None for relative paths and shell substitutions (skip).
 fn resolve_cd_target(target: &str) -> Option<String> {
@@ -1597,24 +1695,58 @@ fn resolve_cd_target(target: &str) -> Option<String> {
 }
 
 /// If `command` is a `cd <path>`, return the resolved absolute target.
+///
+/// A quoted argument (single or double quotes) is taken whole up to its
+/// matching closing quote -- embedded spaces included -- rather than being
+/// cut at the first whitespace. An unquoted argument still stops at the
+/// first unescaped whitespace (so `cd /a/b c` is still two words), but a
+/// backslash-escaped space is treated as part of the path.
 fn extract_cd_target(command: &str) -> Option<String> {
     let trimmed = command.trim();
     let rest = trimmed.strip_prefix("cd ")?;
-    // Strip surrounding quotes if any (single, double).
     let arg = rest.trim();
-    let unquoted = if (arg.starts_with('"') && arg.ends_with('"') && arg.len() >= 2)
-        || (arg.starts_with('\'') && arg.ends_with('\'') && arg.len() >= 2)
-    {
-        &arg[1..arg.len() - 1]
-    } else {
-        arg
-    };
-    // Take only the first token (don't try to interpret flags).
-    let first = unquoted.split_whitespace().next().unwrap_or(unquoted);
-    if first.is_empty() {
+    if arg.is_empty() {
         return None;
     }
-    resolve_cd_target(first)
+    let mut chars = arg.chars();
+    let target = match chars.next()? {
+        quote @ ('"' | '\'') => {
+            // Take everything up to the matching closing quote as the
+            // literal path. An unterminated quote falls back to "the rest
+            // of the argument" rather than silently truncating.
+            let body = chars.as_str();
+            match body.find(quote) {
+                Some(end) => body[..end].to_string(),
+                None => body.to_string(),
+            }
+        }
+        _ => {
+            let mut result = String::new();
+            let mut it = arg.chars().peekable();
+            while let Some(c) = it.next() {
+                if c == '\\' {
+                    if let Some(&next) = it.peek() {
+                        if next.is_whitespace() {
+                            result.push(next);
+                            it.next();
+                            continue;
+                        }
+                    }
+                    result.push(c);
+                    continue;
+                }
+                if c.is_whitespace() {
+                    break;
+                }
+                result.push(c);
+            }
+            result
+        }
+    };
+    if target.is_empty() {
+        return None;
+    }
+    resolve_cd_target(&target)
 }
 
 fn sanitize_trust(value: Option<&str>) -> Option<String> {
@@ -1735,9 +1867,22 @@ fn first_word(command: &str) -> &str {
 }
 
 fn command_matches_completion(executed_command: &str, item_key: &str) -> bool {
-    executed_command == item_key
-        || executed_command.starts_with(&format!("{item_key} "))
-        || executed_command.starts_with(item_key)
+    // Require a token boundary after `item_key` so a mere string prefix
+    // (e.g. `git` vs. an executed `github-cli ...`) isn't credited as an
+    // accepted completion.
+    if executed_command == item_key || executed_command.starts_with(&format!("{item_key} ")) {
+        return true;
+    }
+    // Path-like item_keys legitimately extend without a space boundary
+    // (e.g. `src/foo` completed further into `src/foobar`), so credit a
+    // plain prefix match for those. The candidate's completion `kind` isn't
+    // in scope here, so fall back to treating a '/' in item_key as the
+    // path signal.
+    if (item_key.contains('/') || item_key.ends_with('/')) && executed_command.starts_with(item_key)
+    {
+        return true;
+    }
+    false
 }
 
 fn detect_project_root(cwd: &str) -> Option<String> {
@@ -1780,6 +1925,27 @@ mod tests {
 
     fn test_db() -> AppDb {
         AppDb::open(std::path::Path::new(":memory:")).unwrap()
+    }
+
+    /// Minimal "clean" (interactive, typed_manual) command request for tests
+    /// exercising history/transition scoring where no other classification
+    /// field is under test.
+    fn typed_request(command: &str, cwd: &str) -> RecordCommandRequest {
+        RecordCommandRequest {
+            command: command.to_string(),
+            cwd: cwd.to_string(),
+            shell: Some("zsh".to_string()),
+            trust: Some(TRUST_INTERACTIVE.to_string()),
+            provenance: Some(PROVENANCE_TYPED_MANUAL.to_string()),
+            provenance_source: None,
+            provenance_confidence: None,
+            origin: Some("zsh_precmd".to_string()),
+            tty_present: Some(true),
+            exit_status: None,
+            accepted_request_id: None,
+            accepted_item_key: None,
+            accepted_rank: None,
+        }
     }
 
     #[test]
@@ -2009,116 +2175,6 @@ mod tests {
     }
 
     #[test]
-    fn training_samples_include_clean_accepts_and_exclude_paste() {
-        let mut path = std::env::temp_dir();
-        path.push(format!("shac-test-{}-training-clean.db", unix_ts()));
-        std::fs::remove_file(&path).ok();
-
-        let db = AppDb::open(PathBuf::from(&path).as_path()).expect("open db");
-        let clean_request_id = db
-            .record_completion_request(
-                "zsh",
-                "/tmp",
-                "pyt",
-                3,
-                "pyt",
-                None,
-                TRUST_INTERACTIVE,
-                &[
-                    LoggedCompletionItem {
-                        rank: 0,
-                        item_key: "python3".to_string(),
-                        insert_text: "python3".to_string(),
-                        display: "python3".to_string(),
-                        kind: "command".to_string(),
-                        source: "path_index".to_string(),
-                        score: 1.0,
-                        feature_json: r#"{"prefix_score":1.0}"#.to_string(),
-                    },
-                    LoggedCompletionItem {
-                        rank: 1,
-                        item_key: "python3-config".to_string(),
-                        insert_text: "python3-config".to_string(),
-                        display: "python3-config".to_string(),
-                        kind: "command".to_string(),
-                        source: "path_index".to_string(),
-                        score: 0.7,
-                        feature_json: r#"{"prefix_score":0.7}"#.to_string(),
-                    },
-                ],
-            )
-            .expect("record clean completion request");
-        db.record_history(&RecordCommandRequest {
-            command: "python3".to_string(),
-            cwd: "/tmp".to_string(),
-            shell: Some("zsh".to_string()),
-            trust: Some(TRUST_INTERACTIVE.to_string()),
-            provenance: Some(PROVENANCE_ACCEPTED_COMPLETION.to_string()),
-            provenance_source: None,
-            provenance_confidence: None,
-            origin: Some("zsh_precmd".to_string()),
-            tty_present: Some(true),
-            exit_status: None,
-            accepted_request_id: Some(clean_request_id),
-            accepted_item_key: Some("python3".to_string()),
-            accepted_rank: Some(0),
-        })
-        .expect("record clean accept");
-
-        let pasted_request_id = db
-            .record_completion_request(
-                "zsh",
-                "/tmp",
-                "ech",
-                3,
-                "ech",
-                None,
-                TRUST_INTERACTIVE,
-                &[LoggedCompletionItem {
-                    rank: 0,
-                    item_key: "echo pasted".to_string(),
-                    insert_text: "echo pasted".to_string(),
-                    display: "echo pasted".to_string(),
-                    kind: "history".to_string(),
-                    source: "history".to_string(),
-                    score: 1.0,
-                    feature_json: r#"{"prefix_score":1.0}"#.to_string(),
-                }],
-            )
-            .expect("record pasted completion request");
-        db.record_history(&RecordCommandRequest {
-            command: "echo pasted".to_string(),
-            cwd: "/tmp".to_string(),
-            shell: Some("zsh".to_string()),
-            trust: Some(TRUST_INTERACTIVE.to_string()),
-            provenance: Some(PROVENANCE_PASTED.to_string()),
-            provenance_source: Some(PROVENANCE_SOURCE_ZSH_BRACKETED_PASTE.to_string()),
-            provenance_confidence: Some(PROVENANCE_CONFIDENCE_EXACT.to_string()),
-            origin: Some("zsh_precmd".to_string()),
-            tty_present: Some(true),
-            exit_status: None,
-            accepted_request_id: Some(pasted_request_id),
-            accepted_item_key: Some("echo pasted".to_string()),
-            accepted_rank: Some(0),
-        })
-        .expect("record pasted command");
-
-        let samples = db.training_samples(10).expect("training samples");
-        assert_eq!(samples.len(), 2);
-        assert_eq!(
-            samples.iter().filter(|sample| sample.label == 1.0).count(),
-            1
-        );
-        assert_eq!(
-            samples.iter().filter(|sample| sample.label == 0.0).count(),
-            1
-        );
-        assert!(samples.iter().all(|sample| sample.kind == "command"));
-
-        std::fs::remove_file(&path).ok();
-    }
-
-    #[test]
     fn command_has_docs_returns_false_when_empty() {
         let db = test_db();
         assert!(!db.command_has_docs("nonexistent_cmd"));
@@ -2265,5 +2321,440 @@ mod tests {
         assert_eq!(extract_cd_target("cd $VAR"), None);
         assert_eq!(extract_cd_target("git cd /tmp"), None);
         assert_eq!(extract_cd_target("cd"), None);
+    }
+
+    /// C3: a quoted `cd` argument containing spaces must be indexed as the
+    /// full path, not truncated at the first space inside the quotes.
+    #[test]
+    fn extract_cd_target_quoted_path_with_spaces_keeps_full_path() {
+        assert_eq!(
+            extract_cd_target("cd \"/Users/roman/My Drive\""),
+            Some("/Users/roman/My Drive".to_string())
+        );
+        assert_eq!(
+            extract_cd_target("cd '/Users/roman/My Drive'"),
+            Some("/Users/roman/My Drive".to_string())
+        );
+    }
+
+    /// An unquoted argument with a backslash-escaped space is also a single
+    /// path, not two words.
+    #[test]
+    fn extract_cd_target_escaped_space_keeps_full_path() {
+        assert_eq!(
+            extract_cd_target("cd /Users/roman/My\\ Drive"),
+            Some("/Users/roman/My Drive".to_string())
+        );
+    }
+
+    /// An unquoted single path is unchanged, and an unquoted argument
+    /// followed by an unrelated second word is still cut at the first
+    /// (unescaped) space -- `cd /a/b c` really is two words.
+    #[test]
+    fn extract_cd_target_unquoted_path_unchanged() {
+        assert_eq!(
+            extract_cd_target("cd /tmp/foo"),
+            Some("/tmp/foo".to_string())
+        );
+        assert_eq!(extract_cd_target("cd /a/b c"), Some("/a/b".to_string()));
+    }
+
+    /// `cd -` and bare `cd` (no arg) behave the same as before the fix.
+    #[test]
+    fn extract_cd_target_cd_dash_and_bare_cd_unchanged() {
+        assert_eq!(extract_cd_target("cd -"), None);
+        assert_eq!(extract_cd_target("cd"), None);
+    }
+
+    /// B4: completion telemetry older than the retention window is pruned
+    /// uniformly, regardless of acceptance status — the carve-out for
+    /// accepted/eligible-for-learning rows existed only to preserve signal
+    /// for the (now removed) ML learner. completion_items cascades via the
+    /// schema's `ON DELETE CASCADE` FK (enabled by `PRAGMA foreign_keys =
+    /// ON` in `init`) rather than needing an explicit second DELETE.
+    #[test]
+    fn prune_completion_telemetry_deletes_all_rows_older_than_cutoff() {
+        let db = test_db();
+        let now = unix_ts();
+        let old_ts = now - 40 * 86_400;
+        let recent_ts = now - 86_400;
+
+        // Old + never accepted: pure telemetry noise — must be pruned.
+        db.conn
+            .execute(
+                "INSERT INTO completion_requests(ts, shell, cwd, line, cursor, active_token)
+                 VALUES (?1, 'zsh', '/tmp', 'ls', 2, 'ls')",
+                params![old_ts],
+            )
+            .expect("insert old unaccepted request");
+        let old_unaccepted_id = db.conn.last_insert_rowid();
+        db.conn
+            .execute(
+                "INSERT INTO completion_items(request_id, rank, item_key, insert_text, display, kind, source, score, feature_json)
+                 VALUES (?1, 0, 'ls', 'ls', 'ls', 'command', 'path_index', 1.0, '{}')",
+                params![old_unaccepted_id],
+            )
+            .expect("insert old unaccepted item");
+
+        // Old AND accepted + eligible for learning: with no learner left to
+        // read this signal, this must now be pruned too (previously it
+        // survived indefinitely).
+        db.conn
+            .execute(
+                "INSERT INTO completion_requests(ts, shell, cwd, line, cursor, active_token, eligible_for_learning, accepted_command)
+                 VALUES (?1, 'zsh', '/tmp', 'gi', 2, 'gi', 1, 'git status')",
+                params![old_ts],
+            )
+            .expect("insert old accepted request");
+        let old_accepted_id = db.conn.last_insert_rowid();
+        db.conn
+            .execute(
+                "INSERT INTO completion_items(request_id, rank, item_key, insert_text, display, kind, source, score, feature_json)
+                 VALUES (?1, 0, 'git status', 'git status', 'git status', 'command', 'path_index', 1.0, '{}')",
+                params![old_accepted_id],
+            )
+            .expect("insert old accepted item");
+
+        // Recent + never accepted: within the retention window — must survive
+        // regardless of acceptance.
+        db.conn
+            .execute(
+                "INSERT INTO completion_requests(ts, shell, cwd, line, cursor, active_token)
+                 VALUES (?1, 'zsh', '/tmp', 'cd', 2, 'cd')",
+                params![recent_ts],
+            )
+            .expect("insert recent request");
+        let recent_id = db.conn.last_insert_rowid();
+        db.conn
+            .execute(
+                "INSERT INTO completion_items(request_id, rank, item_key, insert_text, display, kind, source, score, feature_json)
+                 VALUES (?1, 0, 'cd', 'cd', 'cd', 'command', 'path_index', 1.0, '{}')",
+                params![recent_id],
+            )
+            .expect("insert recent item");
+
+        let deleted = db
+            .prune_completion_telemetry(COMPLETION_TELEMETRY_RETENTION_DAYS)
+            .expect("prune");
+        assert_eq!(
+            deleted, 2,
+            "both old rows are pruned regardless of acceptance"
+        );
+
+        let remaining_requests: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM completion_requests", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(remaining_requests, 1);
+
+        let remaining_items: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM completion_items", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(remaining_items, 1);
+
+        let surviving_ids: Vec<i64> = db
+            .conn
+            .prepare("SELECT id FROM completion_requests ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            surviving_ids,
+            vec![recent_id],
+            "only the recent row survives; old-accepted and old-unaccepted are both pruned"
+        );
+
+        let old_accepted_items: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM completion_items WHERE request_id = ?1",
+                params![old_accepted_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            old_accepted_items, 0,
+            "old-accepted row's completion_items must cascade away with it"
+        );
+    }
+
+    /// `telemetry_retention_days = 0` (max privacy) prunes everything on the
+    /// next cycle, including rows recorded moments ago.
+    #[test]
+    fn prune_completion_telemetry_zero_retention_prunes_everything() {
+        let db = test_db();
+        let now = unix_ts();
+
+        db.conn
+            .execute(
+                "INSERT INTO completion_requests(ts, shell, cwd, line, cursor, active_token)
+                 VALUES (?1, 'zsh', '/tmp', 'ls', 2, 'ls')",
+                params![now - 1],
+            )
+            .expect("insert request");
+
+        let deleted = db.prune_completion_telemetry(0).expect("prune");
+        assert_eq!(deleted, 1);
+
+        let remaining_requests: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM completion_requests", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(remaining_requests, 0);
+    }
+
+    #[test]
+    fn frequent_history_prefix_escapes_like_wildcards() {
+        let db = test_db();
+        db.record_history(&typed_request("abc_def build", "/tmp"))
+            .expect("record literal-underscore command");
+        db.record_history(&typed_request("abcXdef build", "/tmp"))
+            .expect("record command that would match `_` as a wildcard");
+
+        let matches = db
+            .frequent_history("abc_def", "/tmp", 10)
+            .expect("history lookup");
+        assert!(matches.iter().any(|entry| entry.command == "abc_def build"));
+        assert!(
+            !matches.iter().any(|entry| entry.command == "abcXdef build"),
+            "underscore in the typed prefix must not act as a SQL LIKE wildcard: {matches:?}"
+        );
+    }
+
+    #[test]
+    fn top_paths_prefix_filter_escapes_like_wildcards() {
+        let db = test_db();
+        let now = unix_ts();
+        db.upsert_path_index_with_rank("/tmp/100%done", 5.0, now, "test", false, None)
+            .unwrap();
+        db.upsert_path_index_with_rank("/tmp/100xxxdone", 5.0, now, "test", false, None)
+            .unwrap();
+
+        let filtered = db.top_paths(Some("100%done"), 10).unwrap();
+        assert!(filtered.iter().any(|p| p.path == "/tmp/100%done"));
+        assert!(
+            !filtered.iter().any(|p| p.path == "/tmp/100xxxdone"),
+            "percent sign in the prefix filter must not act as a SQL LIKE wildcard: {filtered:?}"
+        );
+    }
+
+    #[test]
+    fn record_history_transition_recorded_within_gap_window() {
+        let db = test_db();
+        db.record_history(&typed_request("git status", "/tmp"))
+            .expect("record prev command");
+        // Backdate the prev command, but keep it comfortably inside
+        // TRANSITION_MAX_GAP_SECS.
+        db.conn
+            .execute(
+                "UPDATE history_events SET ts = ts - 60 WHERE command = 'git status'",
+                [],
+            )
+            .expect("backdate prev command");
+
+        db.record_history(&typed_request("git checkout main", "/tmp"))
+            .expect("record next command");
+
+        let transitions = db
+            .transitions_from("git status", 10)
+            .expect("transition lookup");
+        assert!(
+            transitions.iter().any(|t| t.next == "git checkout main"),
+            "commands within the transition window should record a transition: {transitions:?}"
+        );
+    }
+
+    #[test]
+    fn record_history_transition_skipped_when_gap_exceeds_window() {
+        let db = test_db();
+        db.record_history(&typed_request("git status", "/tmp"))
+            .expect("record prev command");
+        // Backdate the prev command well past TRANSITION_MAX_GAP_SECS, as if
+        // separated by a long idle gap or an interleaved terminal tab.
+        db.conn
+            .execute(
+                "UPDATE history_events SET ts = ts - ?1 WHERE command = 'git status'",
+                params![TRANSITION_MAX_GAP_SECS + 60],
+            )
+            .expect("backdate prev command");
+
+        db.record_history(&typed_request("git checkout main", "/tmp"))
+            .expect("record next command");
+
+        let transitions = db
+            .transitions_from("git status", 10)
+            .expect("transition lookup");
+        assert!(
+            transitions.is_empty(),
+            "commands separated by more than the transition window must not pair up: {transitions:?}"
+        );
+    }
+
+    #[test]
+    fn top_paths_considers_recent_low_rank_path_despite_many_stale_high_rank_rows() {
+        let db = test_db();
+        let now = unix_ts();
+        let stale_last_visit = now - 60 * 60 * 24 * 30; // 30 days old
+
+        // Enough stale, high-rank rows to fill the raw-rank prefetch window
+        // (fetch = max(limit*4, limit+16)) so a recent, low-rank path can
+        // only surface if a recency-ordered candidate set is also pulled.
+        for i in 0..30 {
+            db.upsert_path_index_with_rank(
+                &format!("/tmp/stale-{i}"),
+                100.0 - i as f64,
+                stale_last_visit,
+                "test",
+                false,
+                None,
+            )
+            .unwrap();
+        }
+        db.upsert_path_index_with_rank("/tmp/recent-low-rank", 0.5, now, "test", false, None)
+            .unwrap();
+
+        let top = db.top_paths(None, 5).unwrap();
+        assert!(
+            top.iter().any(|p| p.path == "/tmp/recent-low-rank"),
+            "a recently-visited low-rank path must be considered, not starved by stale high-rank rows: {top:?}"
+        );
+    }
+
+    #[test]
+    fn replace_docs_for_command_all_rows_land() {
+        let db = test_db();
+        let docs = vec![
+            StoredDoc {
+                command: "mycmd".into(),
+                item_type: "subcommand".into(),
+                item_value: "run".into(),
+                description: "Run something".into(),
+                source: "help".into(),
+            },
+            StoredDoc {
+                command: "mycmd".into(),
+                item_type: "subcommand".into(),
+                item_value: "build".into(),
+                description: "Build something".into(),
+                source: "help".into(),
+            },
+            StoredDoc {
+                command: "mycmd".into(),
+                item_type: "flag".into(),
+                item_value: "--verbose".into(),
+                description: "Verbose output".into(),
+                source: "help".into(),
+            },
+        ];
+        db.replace_docs_for_command("mycmd", &docs)
+            .expect("replace docs");
+
+        let stored = db.docs_for_command("mycmd").expect("read back docs");
+        assert_eq!(stored.len(), 3, "all rows must land: {stored:?}");
+        for expected in ["run", "build", "--verbose"] {
+            assert!(
+                stored.iter().any(|d| d.item_value == expected),
+                "missing {expected} in {stored:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn replace_docs_for_command_rolls_back_on_partial_failure() {
+        let db = test_db();
+        let original = StoredDoc {
+            command: "mycmd".into(),
+            item_type: "subcommand".into(),
+            item_value: "old".into(),
+            description: "original doc".into(),
+            source: "help".into(),
+        };
+        db.replace_docs_for_command("mycmd", &[original])
+            .expect("seed original doc");
+
+        // Force the second insert of the next replace call to fail, to
+        // simulate a mid-batch error after the DELETE and first INSERT have
+        // already run within the same transaction.
+        db.conn
+            .execute_batch(
+                "CREATE TRIGGER test_fail_on_sentinel
+                 BEFORE INSERT ON command_docs
+                 WHEN NEW.item_value = 'FAIL_SENTINEL'
+                 BEGIN
+                     SELECT RAISE(ABORT, 'simulated mid-batch failure');
+                 END;",
+            )
+            .expect("install failure trigger");
+
+        let replacement = vec![
+            StoredDoc {
+                command: "mycmd".into(),
+                item_type: "subcommand".into(),
+                item_value: "one".into(),
+                description: "first replacement".into(),
+                source: "help".into(),
+            },
+            StoredDoc {
+                command: "mycmd".into(),
+                item_type: "subcommand".into(),
+                item_value: "FAIL_SENTINEL".into(),
+                description: "second replacement".into(),
+                source: "help".into(),
+            },
+        ];
+
+        let result = db.replace_docs_for_command("mycmd", &replacement);
+        assert!(
+            result.is_err(),
+            "expected the seeded failure trigger to fail the second insert"
+        );
+
+        let docs = db.docs_for_command("mycmd").expect("read back docs");
+        assert_eq!(
+            docs.len(),
+            1,
+            "a failed replace must roll back to the prior state, not a partial one: {docs:?}"
+        );
+        assert_eq!(docs[0].item_value, "old");
+    }
+
+    #[test]
+    fn command_matches_completion_requires_token_boundary() {
+        assert!(command_matches_completion("git status", "git"));
+        assert!(command_matches_completion("git", "git"));
+        assert!(
+            !command_matches_completion("github-cli status", "git"),
+            "a mere string prefix must not be credited as an accepted completion"
+        );
+    }
+
+    #[test]
+    fn command_matches_completion_credits_path_prefix_without_space() {
+        // Path-like item_keys (containing '/') legitimately extend without a
+        // space token boundary, e.g. `src/foo` completed further into
+        // `src/foobar`. This must still be credited as an accepted
+        // completion, unlike bare-command prefixes.
+        assert!(
+            command_matches_completion("src/foobar", "src/foo"),
+            "a path item_key must be credited when the executed command extends it without a space"
+        );
+        assert!(
+            command_matches_completion("src/foo", "src/foo"),
+            "an exact match must always be credited"
+        );
+        assert!(
+            !command_matches_completion("something", "other/x"),
+            "an unrelated executed command must not be credited just because the item_key looks like a path"
+        );
+        // Command-like (non-path) item_keys still require the space token
+        // boundary, so a bare string prefix isn't credited.
+        assert!(
+            !command_matches_completion("github-cli status", "git"),
+            "a mere string prefix must not be credited as an accepted completion"
+        );
+        assert!(command_matches_completion("git status", "git"));
     }
 }

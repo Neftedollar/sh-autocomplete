@@ -634,15 +634,13 @@ fn prior_to_stored_doc(p: &Prior) -> StoredDoc {
 
 /// Seed the bundled prior corpus into `command_docs`.
 ///
-/// Idempotent: each per-command write goes through
-/// [`AppDb::replace_docs_for_command`], which `DELETE`s and re-`INSERT`s the
-/// rows for that command. Re-running does not duplicate.
-///
-/// **Note:** `replace_docs_for_command` deletes *all* rows for a command, so
-/// if a command has both priors and imported help docs, the priors will
-/// overwrite. For the cold-start path this is the intended behaviour — priors
-/// run first on fresh install before any help-text indexer fills the table.
-/// Subsequent `shac install` runs do not change `command_docs` net of priors.
+/// Idempotent and non-destructive: a command whose `command_docs` rows are
+/// all still `source = "priors"` (or empty) is refreshed via
+/// [`AppDb::replace_docs_for_command`]; a command that already carries richer
+/// docs from another source (e.g. `"help"`, written by the background
+/// `--help` indexer) is left untouched. This means a `shac install` re-run
+/// can never delete indexed help docs — see [`seed_priors_into_docs_filtered`]
+/// for the check.
 ///
 /// Returns the total number of prior rows seeded.
 ///
@@ -674,6 +672,18 @@ pub fn seed_priors_into_docs_filtered<F: ToolFilter>(db: &AppDb, filter: &F) -> 
     }
     let mut total = 0usize;
     for (cmd, docs) in &grouped {
+        // `replace_docs_for_command` DELETEs every row for `cmd` before
+        // re-inserting, so a command already enriched by the --help indexer
+        // (source != PRIORS_SOURCE) must be skipped entirely — otherwise a
+        // reinstall permanently destroys docs the indexer will never
+        // regenerate (it treats `cmd` as already indexed and moves on).
+        let has_richer_docs = db
+            .docs_for_command(cmd)?
+            .iter()
+            .any(|d| d.source != PRIORS_SOURCE);
+        if has_richer_docs {
+            continue;
+        }
         db.replace_docs_for_command(cmd, docs)?;
         total += docs.len();
     }
@@ -807,6 +817,53 @@ mod tests {
             seeded,
             PRIORS.len(),
             "AdmitAll should seed every prior; got {seeded}"
+        );
+    }
+
+    #[test]
+    fn seed_priors_preserves_existing_help_docs_on_reinstall() {
+        // Regression: a `shac install` re-run used to call
+        // `replace_docs_for_command` for every prior command unconditionally,
+        // which DELETEs *all* rows for that command — including richer
+        // `source = "help"` docs the background --help indexer had already
+        // written. Since the indexer's `skip_existing` guard then treats the
+        // (freshly priors-only) command as already indexed, the help docs
+        // were gone for good. Seeding must not destroy them.
+        let db = AppDb::open(std::path::Path::new(":memory:")).expect("open in-memory db");
+
+        // Simulate the bg --help indexer having already enriched "git"
+        // before priors seeding (re-)runs.
+        let help_doc = StoredDoc {
+            command: "git".to_string(),
+            item_type: "subcommand".to_string(),
+            item_value: "bisect".to_string(),
+            description: "Binary search to find a regression".to_string(),
+            source: "help".to_string(),
+        };
+        db.replace_docs_for_command("git", std::slice::from_ref(&help_doc))
+            .expect("seed help doc");
+
+        // Re-run priors seeding, as `shac install` does on every run.
+        seed_priors_into_docs(&db).expect("reseed priors");
+
+        let docs = db.docs_for_command("git").expect("docs_for_command");
+        assert!(
+            docs.iter()
+                .any(|d| d.source == "help" && d.item_value == "bisect"),
+            "expected help-sourced doc to survive a priors reinstall, got: {:?}",
+            docs
+        );
+
+        // First-install behavior is unaffected: commands with no existing
+        // docs still get seeded from an empty db.
+        assert!(
+            count_seeded_priors(&db) < PRIORS.len(),
+            "git priors should be skipped in favor of the richer help doc"
+        );
+        let npm_docs = db.docs_for_command("npm").expect("docs_for_command");
+        assert!(
+            npm_docs.iter().any(|d| d.source == PRIORS_SOURCE),
+            "commands without existing docs should still be seeded from priors"
         );
     }
 }

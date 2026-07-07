@@ -38,10 +38,18 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
   typeset -gi _shac_ui_inline_zsh=0
   typeset -gi _shac_inline_active=0
   typeset -g _shac_inline_suffix=""
+  typeset -g _shac_inline_insert_text=""
   typeset -g _shac_inline_item_key=""
   typeset -g _shac_inline_request_id=""
   typeset -g _shac_pending_tip_id=""
   typeset -g _shac_pending_tip_text=""
+  # Declared defensively so the first _shac_clear_highlights filter (below)
+  # always sees a real array: zle owns region_highlight and normally declares
+  # it, but nothing guarantees zle has touched it yet at source time (e.g. in
+  # the non-interactive test harness), and filtering an unset parameter with
+  # ${(@)region_highlight:#...} yields a bogus single empty-string element.
+  typeset -ga region_highlight
+  typeset -ga _shac_region_highlights=()
   typeset -g _shac_client_version=""
   typeset -g _shac_daemon_version=""
   typeset -gi _shac_version_warned=0
@@ -154,7 +162,31 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
     return 1
   }
 
+  function _shac_clear_highlights() {
+    # Remove exactly the region_highlight entries we previously added
+    # (matched by their literal "start end style" string), leaving any
+    # entries another zle consumer (e.g. a syntax highlighter) may have
+    # added untouched. ${array:#pattern} always does glob-pattern matching,
+    # so a tracked entry whose style contains glob metacharacters (*, [, ...)
+    # could mismatch; ${array[(Ie)value]} instead does a literal (non-glob)
+    # index lookup, so filter by rebuilding region_highlight from that.
+    local entry
+    local -a keep=()
+    for entry in "${region_highlight[@]}"; do
+      (( ${_shac_region_highlights[(Ie)$entry]} )) || keep+=("$entry")
+    done
+    region_highlight=("${keep[@]}")
+    _shac_region_highlights=()
+  }
+
+  function _shac_add_highlight() {
+    local entry="$1 $2 $3"
+    region_highlight+=("$entry")
+    _shac_region_highlights+=("$entry")
+  }
+
   function _shac_clear_menu_display() {
+    _shac_clear_highlights
     POSTDISPLAY=""
     if zle; then
       zle -R -c
@@ -165,9 +197,11 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
     if (( _shac_inline_active )); then
       _shac_inline_active=0
       _shac_inline_suffix=""
+      _shac_inline_insert_text=""
       _shac_inline_item_key=""
       _shac_inline_request_id=""
       if ! (( _shac_menu_open )); then
+        _shac_clear_highlights
         POSTDISPLAY=""
         if zle; then
           zle -R -c
@@ -179,10 +213,49 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
   function _shac_show_inline() {
     local suffix="$1"
     [[ -z "$suffix" ]] && return
-    POSTDISPLAY=$'\e[2m\e[38;5;240m'"$suffix"$'\e[0m'
+    # POSTDISPLAY is rendered literally by zle -- embedding raw ANSI here
+    # shows as caret-notation garbage (^[[2m...) instead of dim text. Style
+    # the region via region_highlight instead, spanning the ghost-text
+    # region that starts right after the visible buffer.
+    _shac_clear_highlights
+    POSTDISPLAY="$suffix"
+    _shac_add_highlight "${#BUFFER}" "$(( ${#BUFFER} + ${#POSTDISPLAY} ))" "fg=244"
     if zle; then
       zle -R
     fi
+  }
+
+  function _shac_decode() {
+    # Reverse wire-format v3 field encoding: \\->\, \t->tab, \n->LF, \r->CR.
+    # An unrecognized escape (or a trailing lone backslash) passes through
+    # literally, mirroring src/wire.rs::decode_field exactly.
+    local s="$1"
+    local -i i=1
+    local -i len=${#s}
+    local out="" c next
+    while (( i <= len )); do
+      c="${s[i]}"
+      if [[ "$c" == "\\" ]]; then
+        if (( i < len )); then
+          next="${s[i+1]}"
+          case "$next" in
+            "\\") out+="\\" ;;
+            t) out+=$'\t' ;;
+            n) out+=$'\n' ;;
+            r) out+=$'\r' ;;
+            *) out+="\\${next}" ;;
+          esac
+          i+=2
+        else
+          out+="\\"
+          i+=1
+        fi
+      else
+        out+="$c"
+        i+=1
+      fi
+    done
+    REPLY="$out"
   }
 
   function _shac_fetch_inline() {
@@ -191,20 +264,25 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
     [[ "$BUFFER" == *$'\n'* ]] && return 1
     local tty_value
     tty_value="$(tty 2>/dev/null || true)"
-    local found_item=0 insert_text="" item_key="" request_id="" line
+    local found_item=0 insert_text="" display="" item_key="" request_id="" line
     while IFS= read -r line; do
       [[ -z "$line" ]] && continue
       if [[ "$line" == __shac_request_id$'\t'* ]]; then
         local -a header=("${(ps:\t:)line}")
-        request_id="${header[2]:-}"
+        _shac_decode "${header[2]:-}"
+        request_id="$REPLY"
       elif [[ "$line" == __shac_*$'\t'* ]]; then
         # Skip any other sentinel rows (e.g. __shac_tip) — inline mode only
         # consumes real candidate rows.
         continue
       elif (( !found_item )); then
         local -a fields=("${(ps:\t:)line}")
-        item_key="${fields[1]:-}"
-        insert_text="${fields[2]:-}"
+        _shac_decode "${fields[1]:-}"
+        item_key="$REPLY"
+        _shac_decode "${fields[2]:-}"
+        insert_text="$REPLY"
+        _shac_decode "${fields[3]:-}"
+        display="$REPLY"
         found_item=1
       fi
     done < <(
@@ -213,11 +291,15 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
         --line "$BUFFER" \
         --cursor "$CURSOR" \
         --cwd "$PWD" \
-        --format shell-tsv-v2 \
+        --format shell-tsv-v3 \
         2>/dev/null | head -n3
     )
     (( found_item )) && [[ -n "$insert_text" ]] || return 1
-    _shac_preview_buffer_for_item "$BUFFER" "$CURSOR" "$insert_text"
+    # Ghost text previews the readable `display` remainder; the escaped
+    # `insert_text` is what actually lands in BUFFER on accept (see
+    # _shac_forward_char_widget), since it can't be substring-sliced at the
+    # typed/untyped boundary once it contains escape sequences.
+    _shac_preview_buffer_for_item "$BUFFER" "$CURSOR" "$display"
     local preview="$REPLY"
     [[ "$preview" == "$BUFFER" ]] && return 1
     local suffix
@@ -225,8 +307,8 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
       suffix="${preview[$((${#BUFFER}+1)),-1]}"
     else
       local token_prefix="${BUFFER##*[[:space:]]}"
-      if [[ -n "$token_prefix" && "$insert_text" == ${token_prefix}* ]]; then
-        suffix="${insert_text[$((${#token_prefix}+1)),-1]}"
+      if [[ -n "$token_prefix" && "$display" == ${token_prefix}* ]]; then
+        suffix="${display[$((${#token_prefix}+1)),-1]}"
       else
         return 1
       fi
@@ -234,6 +316,7 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
     [[ -z "$suffix" ]] && return 1
     _shac_inline_active=1
     _shac_inline_suffix="$suffix"
+    _shac_inline_insert_text="$insert_text"
     _shac_inline_item_key="$item_key"
     _shac_inline_request_id="$request_id"
     return 0
@@ -261,33 +344,68 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
     _shac_clear_inline
   }
 
+  function _shac_active_token_span() {
+    # Return the 1-based [start, end) span (REPLY, REPLY2) of the shell word
+    # containing the cursor in $1 at char offset $2: start is right after the
+    # last boundary at or before the cursor, end is the first boundary at or
+    # after the cursor (or len+1). A boundary is an unquoted, unescaped
+    # whitespace char -- mirrors context.rs's tokenize() rule that an open
+    # quote or a backslash suppresses it. This makes a quoted word containing
+    # a space -- e.g. `"My Do cs"` -- or an escaped space -- `My\ Docs` --
+    # one span (including its quote chars) on BOTH sides of the cursor, not
+    # split at the interior space. Naive `${s##*[[:space:]]}` /
+    # `${s%%[[:space:]]*}` splitting gets this wrong, which corrupts the
+    # buffer once insert_text is a self-contained quoted literal: it either
+    # duplicates/mismatches the already-typed prefix, or leaves a dangling
+    # fragment of the original quoted word (with its own stray closing quote)
+    # appended after the replacement.
+    local buf="$1"
+    local -i cursor="$2" i=1 len=${#buf} start=1 escaped=0
+    local -i end=$(( len + 1 ))
+    local quote="" c
+    while (( i <= len )); do
+      c="${buf[i]}"
+      if (( escaped )); then
+        escaped=0
+      elif [[ "$c" == "\\" ]]; then
+        escaped=1
+      elif [[ "$c" == '"' || "$c" == "'" ]]; then
+        if [[ "$quote" == "$c" ]]; then
+          quote=""
+        elif [[ -z "$quote" ]]; then
+          quote="$c"
+        fi
+      elif [[ -z "$quote" && "$c" == [[:space:]] ]]; then
+        if (( i <= cursor )); then
+          start=$(( i + 1 ))
+        elif (( end > len )); then
+          end=$i
+        fi
+      fi
+      i+=1
+    done
+    REPLY=$start
+    REPLY2=$end
+  }
+
   function _shac_preview_buffer_for_item() {
     local base_buffer="$1"
     local base_cursor="$2"
     local insert_text="$3"
-    local left right token_prefix before_token token_suffix after_token
+    local before_token after_token
 
-    if (( base_cursor <= 0 )); then
-      left=""
+    _shac_active_token_span "$base_buffer" "$base_cursor"
+    local -i token_start=$REPLY token_end=$REPLY2
+    if (( token_start > 1 )); then
+      before_token="${base_buffer[1,$(( token_start - 1 ))]}"
     else
-      left="${base_buffer[1,base_cursor]}"
+      before_token=""
     fi
-
-    if (( base_cursor >= ${#base_buffer} )); then
-      right=""
+    if (( token_end <= ${#base_buffer} )); then
+      after_token="${base_buffer[token_end,-1]}"
     else
-      right="${base_buffer[$(( base_cursor + 1 )),-1]}"
+      after_token=""
     fi
-
-    token_prefix="${left##*[[:space:]]}"
-    if (( ${#token_prefix} > 0 )); then
-      before_token="${left[1,$(( ${#left} - ${#token_prefix} ))]}"
-    else
-      before_token="$left"
-    fi
-
-    token_suffix="${right%%[[:space:]]*}"
-    after_token="${right#$token_suffix}"
 
     REPLY="${before_token}${insert_text}${after_token}"
     REPLY2=$(( ${#before_token} + ${#insert_text} ))
@@ -389,6 +507,11 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
     local detail="${_shac_ui_menu_detail:-compact}"
     local -a parts
 
+    # REPLY2 signals whether the caller should tint REPLY via region_highlight.
+    # REPLY itself is always plain text -- POSTDISPLAY is rendered literally
+    # by zle, so raw ANSI here would show as caret-notation garbage.
+    REPLY2=0
+
     if [[ "$detail" == "minimal" ]]; then
       REPLY=""
       return
@@ -405,15 +528,13 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
     if (( ${#parts[@]} == 0 )); then
       REPLY=""
     else
-      local raw="[${(j:/:)parts}]"
+      REPLY="[${(j:/:)parts}]"
       # Cosmetic tint: path_jump candidates (hybrid-cd, frecent global
       # paths) render with a cyan label so they're distinguishable from
-      # local cwd children at a glance. SHAC_NO_COLOR=1 disables ANSI
-      # output; default is on for interactive shells.
+      # local cwd children at a glance. SHAC_NO_COLOR=1 disables the tint;
+      # default is on for interactive shells.
       if [[ "$kind" == "path_jump" && -z "${SHAC_NO_COLOR:-}" ]]; then
-        REPLY=$'\e[36m'"$raw"$'\e[0m'
-      else
-        REPLY="$raw"
+        REPLY2=1
       fi
     fi
   }
@@ -429,6 +550,7 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
       _shac_clear_menu_display
       return
     fi
+    _shac_clear_highlights
 
     local limit="${_shac_ui_max_items:-8}"
     if (( limit <= 0 )); then
@@ -452,6 +574,14 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
     lines+=("shac ${_shac_menu_selected_index}/${total}")
 
     local i marker display kind source description line label
+    local -i tint_arrow tint_label arrow_offset label_offset
+    # Running offset (0-based chars within the eventual POSTDISPLAY string)
+    # where the line about to be built will start. POSTDISPLAY begins with a
+    # leading "\n" (position 0), so the header line above starts at 1; this
+    # tracks where each subsequent item line starts so path_jump tints can be
+    # expressed as region_highlight spans rather than embedded ANSI (zle
+    # renders POSTDISPLAY literally).
+    local -i line_offset=$(( 1 + ${#lines[1]} + 1 ))
     for (( i = start; i <= end; i++ )); do
       marker=" "
       if (( i == _shac_menu_selected_index )); then
@@ -461,17 +591,20 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
       kind="${_shac_menu_kinds[$i]}"
       source="${_shac_menu_sources[$i]}"
       description="${_shac_menu_descriptions[$i]}"
-      # Cosmetic tint: replace the leading arrow on path_jump items with a
-      # cyan-tinted arrow so frecent global paths are distinguishable from
-      # local cwd children at a glance. Idempotent — only the arrow glyph
-      # is colorized, the rest of the display string is unchanged.
-      if [[ "$kind" == "path_jump" && -z "${SHAC_NO_COLOR:-}" && "$display" == $'→ '* ]]; then
-        display=$'\e[36m→\e[0m'"${display#$'→'}"
-      fi
       line="${marker} ${display}"
+      # Cosmetic tint: path_jump candidates (hybrid-cd, frecent global paths)
+      # render with a cyan arrow so they're distinguishable from local cwd
+      # children at a glance. Idempotent — only the arrow glyph is tinted.
+      tint_arrow=0
+      if [[ "$kind" == "path_jump" && -z "${SHAC_NO_COLOR:-}" && "$display" == $'→ '* ]]; then
+        tint_arrow=1
+        arrow_offset=$(( line_offset + ${#marker} + 1 ))
+      fi
       _shac_render_metadata_label "$kind" "$source"
       label="$REPLY"
+      tint_label=$REPLY2
       if [[ -n "$label" ]]; then
+        label_offset=$(( line_offset + ${#line} + 1 ))
         line="${line} ${label}"
       fi
       if [[ -n "$description" ]] && _shac_should_show_description; then
@@ -484,6 +617,9 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
         fi
       fi
       lines+=("$line")
+      (( tint_arrow )) && _shac_add_highlight "$(( ${#BUFFER} + arrow_offset ))" "$(( ${#BUFFER} + arrow_offset + 1 ))" "fg=6"
+      (( tint_label )) && _shac_add_highlight "$(( ${#BUFFER} + label_offset ))" "$(( ${#BUFFER} + label_offset + ${#label} ))" "fg=6"
+      line_offset=$(( line_offset + ${#line} + 1 ))
     done
 
     if [[ -n "$_shac_pending_tip_text" && -z "${SHAC_NO_TIPS:-}" ]]; then
@@ -504,6 +640,7 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
   function _shac_render_tip_only() {
     [[ -z "$_shac_pending_tip_text" ]] && return 0
     [[ -n "${SHAC_NO_TIPS:-}" ]] && return 0
+    _shac_clear_highlights
     local bullet="💡"
     if [[ -n "${SHAC_NO_COLOR:-}" ]]; then
       bullet="tip:"
@@ -550,13 +687,16 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
       if [[ "$line" == __shac_request_id$'\t'* ]]; then
         local -a header
         header=("${(ps:\t:)line}")
-        _shac_last_request_id="${header[2]:-}"
+        _shac_decode "${header[2]:-}"
+        _shac_last_request_id="$REPLY"
       elif [[ "$line" == __shac_tip$'\t'* ]]; then
         if [[ -z "${SHAC_NO_TIPS:-}" ]]; then
           local -a tip_fields
           tip_fields=("${(ps:\t:)line}")
-          _shac_pending_tip_id="${tip_fields[2]:-}"
-          _shac_pending_tip_text="${tip_fields[3]:-}"
+          _shac_decode "${tip_fields[2]:-}"
+          _shac_pending_tip_id="$REPLY"
+          _shac_decode "${tip_fields[3]:-}"
+          _shac_pending_tip_text="$REPLY"
         fi
       elif [[ "$line" == __shac_daemon_version$'\t'* ]]; then
         local -a dv_fields
@@ -565,12 +705,18 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
       else
         local -a fields
         fields=("${(ps:\t:)line}")
-        _shac_menu_item_keys+=("${fields[1]:-}")
-        _shac_menu_insert_texts+=("${fields[2]:-}")
-        _shac_menu_displays+=("${fields[3]:-}")
-        _shac_menu_kinds+=("${fields[4]:-}")
-        _shac_menu_sources+=("${fields[5]:-}")
-        _shac_menu_descriptions+=("${fields[6]:-}")
+        _shac_decode "${fields[1]:-}"
+        _shac_menu_item_keys+=("$REPLY")
+        _shac_decode "${fields[2]:-}"
+        _shac_menu_insert_texts+=("$REPLY")
+        _shac_decode "${fields[3]:-}"
+        _shac_menu_displays+=("$REPLY")
+        _shac_decode "${fields[4]:-}"
+        _shac_menu_kinds+=("$REPLY")
+        _shac_decode "${fields[5]:-}"
+        _shac_menu_sources+=("$REPLY")
+        _shac_decode "${fields[6]:-}"
+        _shac_menu_descriptions+=("$REPLY")
       fi
     done < <(
       TTY="$tty_value" shac complete \
@@ -580,7 +726,7 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
         --cwd "$PWD" \
         --prev-command "$(fc -ln -1 2>/dev/null | sed 's/^[[:space:]]*//')" \
         "${runtime_history_args[@]}" \
-        --format shell-tsv-v2 \
+        --format shell-tsv-v3 \
         2>/dev/null
     )
 
@@ -601,12 +747,14 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
       _default
       return $?
     fi
-    if (( ${#_shac_menu_displays[@]} == 0 )); then
+    if (( ${#_shac_menu_insert_texts[@]} == 0 )); then
       _default
       return $?
     fi
-    results=("${_shac_menu_displays[@]}")
-    compadd -Q -- "${results[@]}"
+    # insert_text is the escaped shell literal (what lands on accept);
+    # display (via -d) is only the on-screen label.
+    results=("${_shac_menu_insert_texts[@]}")
+    compadd -Q -d _shac_menu_displays -- "${results[@]}"
   }
 
   function _shac_open_menu() {
@@ -758,12 +906,17 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
       return $?
     fi
     if (( _shac_inline_active )) && (( CURSOR >= ${#BUFFER} )); then
-      local suffix="$_shac_inline_suffix"
+      local insert_text="$_shac_inline_insert_text"
       local item_key="$_shac_inline_item_key"
       local request_id="$_shac_inline_request_id"
+      local base_buffer="$BUFFER"
+      local base_cursor="$CURSOR"
       _shac_clear_inline
-      BUFFER="${BUFFER}${suffix}"
-      CURSOR=${#BUFFER}
+      # Whole-token replace, not a suffix append: insert_text is an escaped
+      # shell literal and can't be substring-sliced at the typed boundary.
+      _shac_preview_buffer_for_item "$base_buffer" "$base_cursor" "$insert_text"
+      BUFFER="$REPLY"
+      CURSOR=$REPLY2
       _shac_last_request_id="$request_id"
       _shac_last_accepted_item_key="$item_key"
       _shac_last_accepted_rank="0"

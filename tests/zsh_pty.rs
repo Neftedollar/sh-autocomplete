@@ -404,17 +404,6 @@ function assert_eq() {{
     exit 1
   fi
 }}
-function assert_starts_with() {{
-  local haystack="$1"
-  local prefix="$2"
-  local message="$3"
-  if [[ "$haystack" != "$prefix"* ]]; then
-    print -ru2 -- "assertion failed: $message"
-    print -ru2 -- "missing prefix: <$prefix>"
-    print -ru2 -- "haystack: <$haystack>"
-    exit 1
-  fi
-}}
 function assert_nonempty() {{
   local value="$1"
   local message="$2"
@@ -428,19 +417,24 @@ source "{script_path}"
 # Enable the inline ghost-text feature flag the adapter reads.
 _shac_ui_inline_zsh=1
 
-# 1. _shac_show_inline writes the dim ANSI prefix and ends with reset.
+# 1. _shac_show_inline sets POSTDISPLAY to the plain suffix (zle renders
+#    POSTDISPLAY literally, so embedding raw ANSI there shows as
+#    caret-notation garbage) and styles it via a region_highlight span
+#    instead.
 POSTDISPLAY=""
+region_highlight=()
 _shac_show_inline "ckout"
 assert_nonempty "$POSTDISPLAY" "show_inline must populate POSTDISPLAY"
-assert_starts_with "$POSTDISPLAY" $'\e[2m' "POSTDISPLAY must start with the dim ANSI escape"
+assert_eq "$POSTDISPLAY" "ckout" "POSTDISPLAY must be the plain suffix, no escapes"
 case "$POSTDISPLAY" in
-  *$'\e[0m') ;;
-  *)
-    print -ru2 -- "POSTDISPLAY must end with the ANSI reset escape"
+  *$'\e'*)
+    print -ru2 -- "POSTDISPLAY must not contain raw ANSI escapes"
     print -ru2 -- "actual: <$POSTDISPLAY>"
     exit 1
     ;;
 esac
+assert_eq "${{#region_highlight[@]}}" "1" "show_inline adds exactly one highlight span"
+assert_eq "${{region_highlight[1]}}" "0 5 fg=244" "highlight span covers the suffix with a dim-grey style"
 
 # 2. With inline state primed and CURSOR at end-of-buffer, ^F (forward-char
 #    widget) accepts the ghost suffix by appending it to BUFFER.
@@ -448,6 +442,7 @@ BUFFER="git che"
 CURSOR=${{#BUFFER}}
 _shac_inline_active=1
 _shac_inline_suffix="ckout"
+_shac_inline_insert_text="checkout"
 _shac_inline_item_key="git checkout"
 _shac_inline_request_id="req-42"
 
@@ -463,15 +458,19 @@ assert_eq "$_shac_inline_active" "0" "inline state cleared after accept"
 assert_eq "$_shac_last_accepted_item_key" "git checkout" "accepted item key recorded"
 assert_eq "$_shac_input_provenance" "accepted_completion" "provenance set to accepted_completion"
 
-# 3. _shac_clear_inline wipes state and POSTDISPLAY when the menu is closed.
+# 3. _shac_clear_inline wipes state, POSTDISPLAY, and its highlight span when
+#    the menu is closed.
 _shac_inline_active=1
 _shac_inline_suffix="something"
-POSTDISPLAY=$'\e[2m\e[38;5;240msomething\e[0m'
+POSTDISPLAY="something"
+region_highlight=("0 9 fg=244")
+_shac_region_highlights=("0 9 fg=244")
 _shac_menu_open=0
 _shac_clear_inline
 assert_eq "$_shac_inline_active" "0" "clear_inline resets active flag"
 assert_eq "$_shac_inline_suffix" "" "clear_inline empties suffix"
 assert_eq "$POSTDISPLAY" "" "clear_inline empties POSTDISPLAY when menu closed"
+assert_eq "${{#region_highlight[@]}}" "0" "clear_inline removes the highlight span too"
 "#,
         script_path = script_path.display()
     );

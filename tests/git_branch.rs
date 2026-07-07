@@ -66,7 +66,7 @@ fn git_checkout_returns_branch_candidates() {
             "--cwd",
             repo.to_str().expect("utf8 repo"),
             "--format",
-            "shell-tsv-v2",
+            "shell-tsv-v3",
         ],
     );
 
@@ -125,7 +125,7 @@ fn git_checkout_filters_branches_by_active_prefix() {
             "--cwd",
             repo.to_str().expect("utf8 repo"),
             "--format",
-            "shell-tsv-v2",
+            "shell-tsv-v3",
         ],
     );
 
@@ -179,7 +179,7 @@ fn git_checkout_outside_repo_returns_no_branch_candidates() {
             "--cwd",
             cwd.to_str().expect("utf8 cwd"),
             "--format",
-            "shell-tsv-v2",
+            "shell-tsv-v3",
         ],
     );
 
@@ -218,7 +218,7 @@ fn git_switch_also_emits_branch_candidates() {
             "--cwd",
             repo.to_str().expect("utf8 repo"),
             "--format",
-            "shell-tsv-v2",
+            "shell-tsv-v3",
         ],
     );
 

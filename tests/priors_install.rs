@@ -60,7 +60,7 @@ fn install_seeds_priors_and_completions_surface_them() {
             "--cwd",
             &cwd,
             "--format",
-            "shell-tsv-v2",
+            "shell-tsv-v3",
         ],
     );
 

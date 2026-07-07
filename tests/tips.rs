@@ -476,7 +476,7 @@ fn complete_in_git_repo_emits_tip_line() {
             "--cwd",
             cwd.to_string_lossy().as_ref(),
             "--format",
-            "shell-tsv-v2",
+            "shell-tsv-v3",
         ],
     );
     // First call may emit greeter; either greeter or git_branches counts.
@@ -529,7 +529,7 @@ fn shac_no_tips_env_suppresses_tip_line() {
         "--cwd",
         cwd.to_string_lossy().as_ref(),
         "--format",
-        "shell-tsv-v2",
+        "shell-tsv-v3",
     ]);
     let out = cmd.output().expect("run");
     assert!(out.status.success());

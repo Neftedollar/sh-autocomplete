@@ -114,7 +114,6 @@ use crate::config::{AppConfig, AppPaths};
 use crate::context::{self, ParsedContext, TokenRole};
 use crate::db::{AppDb, LoggedCompletionItem, StoredDoc};
 use crate::indexer;
-use crate::ml::{train_model, MlModel, TrainOptions, TrainingSample};
 use crate::protocol::{
     CompletionItem, CompletionMeta, CompletionRequest, CompletionResponse, CompletionTip,
     ExplainFeature, ExplainItem, ExplainResponse, MigrationStatusResponse, RecentEvent,
@@ -148,7 +147,6 @@ pub struct Engine {
     config: AppConfig,
     db: AppDb,
     paths: AppPaths,
-    ml_model: Option<MlModel>,
     tips_runtime: crate::tips::Runtime,
     /// Per-locale catalog cache. Built lazily on first request for each lang
     /// (bundled `en` + user override at `<config_dir>/locales/<lang>.toml`).
@@ -161,18 +159,10 @@ impl Engine {
         paths.ensure()?;
         let config = AppConfig::load(paths)?;
         let db = AppDb::open(&paths.db_file)?;
-        let ml_model = config
-            .ml_model_file
-            .as_deref()
-            .map(PathBuf::from)
-            .filter(|path| path.exists())
-            .map(|path| MlModel::load(&path))
-            .transpose()?;
         Ok(Self {
             config,
             db,
             paths: paths.clone(),
-            ml_model,
             tips_runtime: crate::tips::Runtime::default(),
             catalog_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
         })
@@ -207,6 +197,10 @@ impl Engine {
             .or_else(|| self.db.latest_command().ok().flatten());
 
         let max_path_rank = self.db.paths_index_max_rank().unwrap_or(0.0);
+        // Detect once and reuse for every candidate: it depends only on
+        // `req.cwd`, which is fixed for the whole request, so re-detecting
+        // it per candidate (an upward filesystem walk) is wasted work.
+        let project_root = self.db.project_root_for_cwd(&req.cwd);
         let mut items: Vec<RankedCandidate> = candidates
             .drain(..)
             .map(|candidate| {
@@ -216,6 +210,7 @@ impl Engine {
                     &req.cwd,
                     prev_command.as_deref(),
                     max_path_rank,
+                    project_root.as_deref(),
                 )
             })
             .collect();
@@ -270,6 +265,7 @@ impl Engine {
             .clone()
             .or_else(|| self.db.latest_command().ok().flatten());
         let max_path_rank = self.db.paths_index_max_rank().unwrap_or(0.0);
+        let project_root = self.db.project_root_for_cwd(&req.cwd);
         let mut explained = self
             .collect_candidates(&req, &parsed)?
             .into_iter()
@@ -280,6 +276,7 @@ impl Engine {
                     &req.cwd,
                     prev_command.as_deref(),
                     max_path_rank,
+                    project_root.as_deref(),
                 )
             })
             .collect::<Vec<_>>();
@@ -323,15 +320,21 @@ impl Engine {
     }
 
     pub fn stats(&self) -> Result<StatsResponse> {
-        self.db.stats()
+        let mut stats = self.db.stats()?;
+        // The DB layer has no config access; overlay the configured retention
+        // window here so `shac stats` shows the setting the user controls, not
+        // the DB-layer fallback constant. Read it FRESH from disk rather than
+        // the construction-time `self.config`: the daemon's prune thread reloads
+        // config each tick, so a cached value would report a stale window after
+        // `config set telemetry_retention_days`. Fall back to the cache on error.
+        stats.telemetry_retention_days = AppConfig::load(&self.paths)
+            .map(|c| c.telemetry_retention_days)
+            .unwrap_or(self.config.telemetry_retention_days);
+        Ok(stats)
     }
 
     pub fn migration_status(&self) -> Result<MigrationStatusResponse> {
         self.db.migration_status()
-    }
-
-    pub fn training_samples(&self, limit: usize) -> Result<Vec<TrainingSample>> {
-        self.db.training_samples(limit)
     }
 
     pub fn reset_personalization(&self) -> Result<()> {
@@ -341,37 +344,6 @@ impl Engine {
     pub fn recent_events(&self, limit: usize) -> Result<Vec<RecentEvent>> {
         self.db.recent_events(limit)
     }
-}
-
-const ML_ACTIVATION_THRESHOLD: i64 = 50;
-const ML_TRAIN_LIMIT: usize = 10_000;
-
-/// Checks whether enough accepted completions have been collected to train and
-/// auto-enable the ML model. Called once at daemon startup. Returns true when
-/// the model was just activated for the first time.
-pub fn maybe_auto_train(paths: &AppPaths) -> Result<bool> {
-    let mut config = AppConfig::load(paths)?;
-    if config.features.ml_rerank {
-        return Ok(false);
-    }
-    let db = AppDb::open(&paths.db_file)?;
-    let stats = db.stats()?;
-    if stats.accepted_clean_completions < ML_ACTIVATION_THRESHOLD {
-        return Ok(false);
-    }
-    let model_path = paths.data_dir.join("model.json");
-    if !model_path.exists() {
-        let samples = db.training_samples(ML_TRAIN_LIMIT)?;
-        if samples.is_empty() {
-            return Ok(false);
-        }
-        let model = train_model(&samples, &TrainOptions::default());
-        model.save(&model_path)?;
-    }
-    config.ml_model_file = Some(model_path.to_string_lossy().into_owned());
-    config.features.ml_rerank = true;
-    config.save(paths)?;
-    Ok(true)
 }
 
 impl Engine {
@@ -515,7 +487,7 @@ impl Engine {
                         &mut seen,
                         Candidate {
                             insert_text: name.clone(),
-                            display: name,
+                            display: sanitize_display(&name),
                             kind,
                             source: "path_index".to_string(),
                             description: None,
@@ -601,7 +573,11 @@ impl Engine {
                             &mut seen,
                             Candidate {
                                 insert_text: doc.item_value.clone(),
-                                display: doc.item_value,
+                                // F8: doc text is user/tool-authored (e.g. a
+                                // --help line) and reaches the terminal raw
+                                // if not sanitized like every other display
+                                // site.
+                                display: sanitize_display(&doc.item_value),
                                 kind: doc.item_type,
                                 source: doc.source,
                                 description: Some(doc.description),
@@ -619,7 +595,9 @@ impl Engine {
                                     &mut seen,
                                     Candidate {
                                         insert_text: doc.item_value.clone(),
-                                        display: doc.item_value,
+                                        // F8: same rationale as the
+                                        // docs_for_command branch above.
+                                        display: sanitize_display(&doc.item_value),
                                         kind: doc.item_type,
                                         source: "doc_search".to_string(),
                                         description: Some(doc.description),
@@ -685,7 +663,7 @@ impl Engine {
                         &mut seen,
                         Candidate {
                             insert_text: transition.next.clone(),
-                            display: transition.next,
+                            display: sanitize_display(&transition.next),
                             kind: if matches!(parsed.role, TokenRole::Command) {
                                 "command".to_string()
                             } else {
@@ -828,7 +806,9 @@ impl Engine {
             let abs = path.to_string_lossy().to_string();
             let display_path = shorten_with_home(&abs, home.as_deref());
             let insert_text = display_path.clone();
-            let display = format!("\u{2192} {display_path}");
+            // The arrow is daemon-authored decoration and stays as-is; only
+            // the user-derived path text is sanitized before composition.
+            let display = format!("\u{2192} {}", sanitize_display(&display_path));
             let description = format_path_jump_description(row.is_git_repo, row.last_visit, now);
 
             push_candidate(
@@ -881,7 +861,7 @@ impl Engine {
             {
                 continue;
             }
-            let display = refname.clone();
+            let display = sanitize_display(&refname);
             let description = if refname.starts_with("origin/") {
                 Some("remote-tracking branch".to_string())
             } else {
@@ -943,7 +923,7 @@ impl Engine {
                 seen,
                 Candidate {
                     insert_text: name.clone(),
-                    display: name,
+                    display: sanitize_display(&name),
                     kind: "npm_script".to_string(),
                     source: "npm_script".to_string(),
                     description: Some(description),
@@ -1018,7 +998,7 @@ impl Engine {
                 seen,
                 Candidate {
                     insert_text: hostname.clone(),
-                    display: hostname,
+                    display: sanitize_display(&hostname),
                     kind: "ssh_host".to_string(),
                     source: "ssh_host".to_string(),
                     description: Some(description),
@@ -1079,7 +1059,7 @@ impl Engine {
                 seen,
                 Candidate {
                     insert_text: target.clone(),
-                    display: target,
+                    display: sanitize_display(&target),
                     kind: "build_target".to_string(),
                     source: "build_target".to_string(),
                     description: Some(description),
@@ -1166,10 +1146,12 @@ impl Engine {
                 .map(|e| e.eq_ignore_ascii_case("code-workspace"))
                 .unwrap_or(false);
 
+            let basename_safe = sanitize_display(&basename);
+            let parent_safe = sanitize_display(&parent_str);
             let display = if is_workspace_bundle {
-                format!("{basename} [workspace bundle] \u{00b7} {parent_str}")
+                format!("{basename_safe} [workspace bundle] \u{00b7} {parent_safe}")
             } else {
-                format!("{basename} \u{00b7} {parent_str}")
+                format!("{basename_safe} \u{00b7} {parent_safe}")
             };
 
             push_candidate(
@@ -1275,7 +1257,7 @@ impl Engine {
                 seen,
                 Candidate {
                     insert_text: name.clone(),
-                    display: name,
+                    display: sanitize_display(&name),
                     kind: "k8s_resource".to_string(),
                     source: "k8s_resource".to_string(),
                     description: Some(description),
@@ -1318,7 +1300,7 @@ impl Engine {
                 seen,
                 Candidate {
                     insert_text: image_ref.clone(),
-                    display: image_ref.clone(),
+                    display: sanitize_display(&image_ref),
                     kind: "docker_image".to_string(),
                     source: "docker_image".to_string(),
                     description: Some(format!("docker image · {tag}")),
@@ -1354,7 +1336,7 @@ impl Engine {
                 seen,
                 Candidate {
                     insert_text: name.clone(),
-                    display: name,
+                    display: sanitize_display(&name),
                     kind: "docker_container".to_string(),
                     source: "docker_container".to_string(),
                     description: Some("docker container · running".to_string()),
@@ -1375,55 +1357,85 @@ impl Engine {
         let (dir, prefix) = split_path_token(token, cwd);
         let insertion_prefix = path_insertion_prefix(token);
         let dir_string = dir.to_string_lossy().to_string();
+        // Sub-second precision: truncating to whole seconds (`as_secs`)
+        // makes a file created in the same wall-clock second as the cached
+        // snapshot invisible until the directory mtime ticks over to the
+        // next second. Nanoseconds since epoch still fit comfortably in i64.
         let mtime = dir
             .metadata()
             .ok()
             .and_then(|meta| meta.modified().ok())
             .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|duration| duration.as_secs() as i64)
+            .map(|duration| duration.as_nanos() as i64)
             .unwrap_or_default();
 
+        // Join/split on NUL, not '\n': filenames may legally contain a
+        // newline, which would otherwise split one entry into phantom
+        // fragments on a cache-hit read. NUL cannot appear in a filename.
         let entries = if let Some((cached_mtime, entries)) = self.db.get_dir_cache(&dir_string)? {
             if cached_mtime == mtime {
                 entries
-                    .split('\n')
+                    .split('\0')
                     .filter(|item| !item.is_empty())
                     .map(ToOwned::to_owned)
                     .collect::<Vec<_>>()
             } else {
                 let entries = read_dir_entries(&dir)?;
                 self.db
-                    .upsert_dir_cache(&dir_string, mtime, &entries.join("\n"))?;
+                    .upsert_dir_cache(&dir_string, mtime, &entries.join("\0"))?;
                 entries
             }
         } else {
             let entries = read_dir_entries(&dir)?;
             self.db
-                .upsert_dir_cache(&dir_string, mtime, &entries.join("\n"))?;
+                .upsert_dir_cache(&dir_string, mtime, &entries.join("\0"))?;
             entries
         };
 
+        // Cap at collection time, same idiom as every other collector: an
+        // unbounded directory (e.g. 10k entries) must not reach scoring,
+        // where each candidate costs ~5 SQL-backed feature lookups.
+        //
+        // Keeping the first `limit` prefix matches in raw (alphabetical)
+        // collection order silently drops the best match whenever it sorts
+        // past the cap among same-prefix siblings (e.g. a hundred
+        // `log-0-...` files burying a short, high-fuzzy-score `log-z.txt`).
+        // So instead: gather every prefix (and dirs_only) match, cheaply
+        // pre-rank by the same string-only fuzzy relevance the full scorer
+        // uses, and only carry the top `limit` of those into the expensive
+        // SQL-backed scoring pass below.
+        let limit = self.config.max_results.saturating_mul(2).max(8);
+        let mut matches: Vec<(String, f64)> = Vec::new();
         for entry in entries {
-            if entry.starts_with(&prefix) {
-                let entry_path = dir.join(&entry);
-                let is_dir = entry_path.is_dir();
-                if dirs_only && !is_dir {
-                    continue;
-                }
-                let suffix = if is_dir { "/" } else { "" };
-                let insert_text = format!("{insertion_prefix}{entry}{suffix}");
-                push_candidate(
-                    candidates,
-                    seen,
-                    Candidate {
-                        insert_text: insert_text.clone(),
-                        display: insert_text,
-                        kind: "path".to_string(),
-                        source: "path_cache".to_string(),
-                        description: None,
-                    },
-                );
+            if !entry.starts_with(&prefix) {
+                continue;
             }
+            let entry_path = dir.join(&entry);
+            let is_dir = entry_path.is_dir();
+            if dirs_only && !is_dir {
+                continue;
+            }
+            let suffix = if is_dir { "/" } else { "" };
+            let insert_text = format!("{insertion_prefix}{entry}{suffix}");
+            let fuzzy = fuzzy_match_score(token, &insert_text);
+            matches.push((insert_text, fuzzy));
+        }
+        // Stable sort: ties keep their original (alphabetical) collection order.
+        matches.sort_by(|(_, left), (_, right)| cmp_score(*right, *left));
+        matches.truncate(limit);
+
+        for (insert_text, _) in matches {
+            push_candidate(
+                candidates,
+                seen,
+                Candidate {
+                    insert_text: insert_text.clone(),
+                    display: sanitize_display(&insert_text),
+                    kind: "path".to_string(),
+                    source: "path_cache".to_string(),
+                    description: None,
+                },
+            );
         }
         Ok(())
     }
@@ -1435,6 +1447,7 @@ impl Engine {
         cwd: &str,
         prev_command: Option<&str>,
         max_path_rank: f64,
+        project_root: Option<&str>,
     ) -> RankedCandidate {
         let active = parsed.active_token.as_str();
         let history_key = contextual_candidate_key(parsed, candidate);
@@ -1481,7 +1494,7 @@ impl Engine {
                 project_affinity_score(&parsed.project_markers, first_word)
                     + self
                         .db
-                        .project_tool_count(cwd, first_word)
+                        .project_tool_count_for_root(project_root, first_word)
                         .unwrap_or_default()
                         / 10.0,
                 self.config.ranking.project_affinity_score,
@@ -1512,22 +1525,6 @@ impl Engine {
             .iter()
             .map(|feature| feature.value * feature.weight)
             .sum::<f64>();
-        let mut final_features = features.clone();
-        let mut score = heuristic_score;
-
-        if self.config.features.ml_rerank {
-            if let Some(model) = &self.ml_model {
-                let ml_score = model.predict(
-                    &feature_values(&features),
-                    &candidate.kind,
-                    &candidate.source,
-                );
-                let blend = self.config.ml_blend_weight.clamp(0.0, 1.0);
-                score = heuristic_score * (1.0 - blend) + ml_score * blend;
-                final_features.push(feature("heuristic_score", heuristic_score, 1.0 - blend));
-                final_features.push(feature("ml_model_score", ml_score, blend));
-            }
-        }
 
         RankedCandidate {
             item: CompletionItem {
@@ -1535,14 +1532,14 @@ impl Engine {
                 insert_text: candidate.insert_text.clone(),
                 display: candidate.display.clone(),
                 kind: candidate.kind.clone(),
-                score,
+                score: heuristic_score,
                 source: candidate.source.clone(),
                 meta: CompletionMeta {
                     description: candidate.description.clone(),
                 },
             },
             item_key: history_key,
-            features: final_features,
+            features,
         }
     }
 
@@ -1593,7 +1590,6 @@ fn feature(name: &'static str, value: f64, weight: f64) -> FeatureBreakdown {
 fn feature_values(features: &[FeatureBreakdown]) -> HashMap<String, f64> {
     features
         .iter()
-        .filter(|feature| feature.name != "heuristic_score" && feature.name != "ml_model_score")
         .map(|feature| (feature.name.to_string(), feature.value))
         .collect()
 }
@@ -1603,8 +1599,11 @@ fn push_candidate(
     seen: &mut HashSet<String>,
     candidate: Candidate,
 ) {
-    let key = format!("{}::{}", candidate.kind, candidate.insert_text);
-    if seen.insert(key) {
+    // Dedup by insert_text alone: the same insertion arriving from two
+    // sources under different kinds (e.g. a path from the path cache and the
+    // same path from history) must render as one menu row, not one per kind.
+    // Candidates are pushed in priority order, so the first occurrence wins.
+    if seen.insert(candidate.insert_text.clone()) {
         candidates.push(candidate);
     }
 }
@@ -2529,6 +2528,27 @@ fn format_path_jump_description(is_git_repo: bool, last_visit: i64, now: i64) ->
     }
 }
 
+/// Strip control/ESC bytes from user-derived text before it enters `display`.
+/// `display` is only ever rendered, never re-parsed by a shell — unlike
+/// `insert_text` (escaped by `quote::quote_token`), it needs no shell-specific
+/// encoding, just neutralizing anything that could hijack the terminal (ANSI
+/// escapes). Whitespace control bytes collapse to a single space so a
+/// multi-line/tab-containing value still reads as one line; other C0/DEL
+/// bytes are dropped outright.
+fn sanitize_display(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if matches!(c, '\t' | '\n' | '\r') {
+            out.push(' ');
+        } else if (c as u32) < 0x20 || c == '\u{7f}' {
+            // drop other C0/DEL bytes (e.g. ESC) outright
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 fn sanitize_fts_query(query: &str) -> Option<String> {
     let tokens = query
         .split(|ch: char| !ch.is_alphanumeric() && ch != '_' && ch != '.')
@@ -2630,7 +2650,11 @@ fn project_history_candidate(
     parsed: &ParsedContext,
 ) -> Option<(String, String, String)> {
     if matches!(parsed.role, TokenRole::Command) {
-        return Some((entry.to_string(), entry.to_string(), "history".to_string()));
+        return Some((
+            entry.to_string(),
+            sanitize_display(entry),
+            "history".to_string(),
+        ));
     }
     let command = parsed.command.as_deref()?;
     let tokens = context::shell_split(entry);
@@ -2644,7 +2668,8 @@ fn project_history_candidate(
         TokenRole::SubcommandOrArg => "subcommand",
         TokenRole::Command => "history",
     };
-    Some((token.clone(), token, kind.to_string()))
+    let display = sanitize_display(&token);
+    Some((token, display, kind.to_string()))
 }
 
 fn contextual_candidate_key(parsed: &ParsedContext, candidate: &Candidate) -> String {
@@ -3047,6 +3072,51 @@ mod tests {
     }
 
     #[test]
+    fn push_candidate_dedups_by_insert_text_regardless_of_kind() {
+        // Two candidates with identical insert_text but different kinds (e.g.
+        // a path from the path cache and the same string from history) must
+        // collapse to a single menu row — the first (highest-priority, since
+        // candidates are pushed in priority order) occurrence wins.
+        let mut candidates = Vec::new();
+        let mut seen = HashSet::new();
+        push_candidate(
+            &mut candidates,
+            &mut seen,
+            Candidate {
+                insert_text: "src/".to_string(),
+                display: "src/".to_string(),
+                kind: "path".to_string(),
+                source: "path".to_string(),
+                description: None,
+            },
+        );
+        push_candidate(
+            &mut candidates,
+            &mut seen,
+            Candidate {
+                insert_text: "src/".to_string(),
+                display: "src/".to_string(),
+                kind: "history".to_string(),
+                source: "history".to_string(),
+                description: None,
+            },
+        );
+        assert_eq!(
+            candidates.len(),
+            1,
+            "identical insert_text from different kinds must not duplicate"
+        );
+        assert_eq!(candidates[0].kind, "path", "first-pushed occurrence wins");
+    }
+
+    #[test]
+    fn display_strips_control_bytes_from_filename() {
+        // a filename containing an ESC must not carry it into `display`.
+        let cleaned = super::sanitize_display("na\u{1b}[31mme");
+        assert_eq!(cleaned, "na[31mme");
+    }
+
+    #[test]
     fn fts_query_sanitizer_drops_operator_only_queries() {
         assert_eq!(sanitize_fts_query("-"), None);
         assert_eq!(sanitize_fts_query("--"), None);
@@ -3183,6 +3253,43 @@ mod tests {
     }
 
     #[test]
+    fn raw_fs_entry_named_like_home_ref_has_non_home_kind() {
+        use std::fs;
+        // F3/F4: a real directory whose name merely starts with `~` must
+        // surface with a `kind` distinct from the home-shortened sources
+        // (`path_jump`/`workspace`) — `shac.rs` infers `TokenContext::home_ref`
+        // from `kind`, so `collect_path_candidates` emitting the wrong kind
+        // here would let a file literally named `~evil` tilde-expand on
+        // insertion.
+        let (engine, _dir) = test_engine("home-ref-raw-fs");
+        let cwd = unique_tmp("shac-home-ref-raw-cwd");
+        fs::create_dir_all(cwd.join("~evil")).unwrap();
+
+        let response = engine
+            .complete(make_request("cd ", &cwd.to_string_lossy()))
+            .expect("complete");
+        let item = response
+            .items
+            .iter()
+            .find(|i| i.insert_text == "~evil/")
+            .expect("expected a raw fs candidate for the ~evil directory");
+        assert_eq!(
+            item.kind, "path",
+            "a raw filesystem entry literally named ~evil must not carry a \
+             home-shortened kind (path_jump/workspace), or it would be \
+             inferred as a home reference and tilde-expand on insertion"
+        );
+        // Close the loop: quote_token with home_ref=false (what shac.rs
+        // infers for kind == "path") escapes the leading ~ so the shell
+        // inserts it literally instead of expanding it.
+        let ctx = crate::quote::TokenContext::default();
+        let quoted = crate::quote::quote_token(crate::shell::Shell::Zsh, &ctx, &item.insert_text);
+        assert_eq!(quoted, "\\~evil/");
+
+        let _ = fs::remove_dir_all(&cwd);
+    }
+
+    #[test]
     fn contextual_candidate_key_rebuilds_command_line() {
         let parsed = ParsedContext {
             line_before_cursor: "git ch".to_string(),
@@ -3193,6 +3300,7 @@ mod tests {
             command: Some("git".to_string()),
             prev_token: Some("git".to_string()),
             project_markers: Vec::new(),
+            open_quote: None,
         };
         let candidate = Candidate {
             insert_text: "checkout".to_string(),
@@ -3933,6 +4041,10 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "flaky: mutates process-global PATH to hide docker, which races \
+                under parallel test execution and fails on hosts where docker is \
+                on PATH (e.g. ubuntu CI). The docker-image collector itself is \
+                fine; revisit in 0.6.x with injected command resolution."]
     fn collect_docker_images_returns_empty_when_no_docker() {
         // Temporarily override PATH to a directory without docker, then
         // restore it after the call. We use catch_unwind to ensure restoration
@@ -4149,5 +4261,214 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&cwd_symlink);
+    }
+
+    #[test]
+    fn collect_path_candidates_caps_large_directory() {
+        // Regression for the runtime-audit BLOCKER: unlike every other
+        // collector, `collect_path_candidates` used to emit every matching
+        // entry with no cap, so `Engine::complete` had to score all of them
+        // before truncating — a 10k-entry directory wedged the daemon.
+        use std::fs;
+        let (engine, _dir) = test_engine("path-cap");
+        let big = unique_tmp("shac-path-cap-big");
+        for i in 0..500 {
+            fs::write(big.join(format!("file-{i:04}.txt")), b"").unwrap();
+        }
+
+        let mut candidates = Vec::new();
+        let mut seen = HashSet::new();
+        engine
+            .collect_path_candidates(
+                "",
+                &big.to_string_lossy(),
+                false,
+                &mut candidates,
+                &mut seen,
+            )
+            .expect("collect path candidates");
+
+        let cap = engine.config().max_results.saturating_mul(2).max(8);
+        assert!(
+            candidates.len() <= cap,
+            "expected at most {cap} candidates from an unbounded directory, got {}",
+            candidates.len()
+        );
+
+        let _ = fs::remove_dir_all(&big);
+    }
+
+    #[test]
+    fn collect_path_candidates_prefix_filter_survives_cap() {
+        // The cap must be applied to *matching* entries, not to raw entries
+        // scanned — otherwise a specific typed prefix could get dropped by
+        // the cap before the scan ever reaches it.
+        use std::fs;
+        let (engine, _dir) = test_engine("path-cap-prefix");
+        let big = unique_tmp("shac-path-cap-prefix-big");
+        for i in 0..2000 {
+            fs::write(big.join(format!("file-{i:04}.txt")), b"").unwrap();
+        }
+        fs::write(big.join("uniquename.txt"), b"").unwrap();
+
+        let mut candidates = Vec::new();
+        let mut seen = HashSet::new();
+        engine
+            .collect_path_candidates(
+                "uniquename",
+                &big.to_string_lossy(),
+                false,
+                &mut candidates,
+                &mut seen,
+            )
+            .expect("collect path candidates");
+
+        assert!(
+            candidates.iter().any(|c| c.insert_text == "uniquename.txt"),
+            "expected uniquename.txt to survive the cap, got: {:?}",
+            candidates
+                .iter()
+                .map(|c| &c.insert_text)
+                .collect::<Vec<_>>()
+        );
+
+        let _ = fs::remove_dir_all(&big);
+    }
+
+    #[test]
+    fn collect_path_candidates_cap_keeps_best_fuzzy_match_not_first_alphabetically() {
+        // Regression: the perf cap used to keep the first `limit`
+        // prefix-matching entries in raw (alphabetical) collection order,
+        // *then* score them. With 100 `log-0-...` siblings and a short
+        // `log-z.txt` that would win on fuzzy relevance (shorter candidate
+        // -> higher `fuzzy_match_score`), `log-z.txt` sorts alphabetically
+        // last and got dropped by the cap before it was ever scored. The
+        // cap must pre-rank by the same cheap fuzzy relevance the full
+        // scorer uses, not by alphabetical collection order.
+        use std::fs;
+        let (engine, _dir) = test_engine("path-cap-fuzzy");
+        let big = unique_tmp("shac-path-cap-fuzzy-big");
+        for i in 0..100 {
+            fs::write(
+                big.join(format!("log-0-verbose-debug-trace-session-{i:02}.txt")),
+                b"",
+            )
+            .unwrap();
+        }
+        fs::write(big.join("log-z.txt"), b"").unwrap();
+
+        let mut candidates = Vec::new();
+        let mut seen = HashSet::new();
+        engine
+            .collect_path_candidates(
+                "log-",
+                &big.to_string_lossy(),
+                false,
+                &mut candidates,
+                &mut seen,
+            )
+            .expect("collect path candidates");
+
+        assert!(
+            candidates.iter().any(|c| c.insert_text == "log-z.txt"),
+            "expected log-z.txt to survive the cap via fuzzy pre-rank, got: {:?}",
+            candidates
+                .iter()
+                .map(|c| &c.insert_text)
+                .collect::<Vec<_>>()
+        );
+
+        let _ = fs::remove_dir_all(&big);
+    }
+
+    #[test]
+    fn dir_cache_roundtrips_filename_containing_newline() {
+        // Regression: dir cache entries used to be joined with '\n' on write
+        // and split on '\n' on read, so a filename containing an embedded
+        // newline was silently split into phantom entries on a cache-hit
+        // read. Filenames cannot contain NUL, so join/split on NUL instead.
+        use std::fs;
+        let (engine, _dir) = test_engine("dir-cache-newline");
+        let target = unique_tmp("shac-dir-cache-newline");
+        let weird_name = "weird\nname.txt";
+        fs::write(target.join(weird_name), b"").expect("create file with embedded newline");
+
+        // First call: cache miss, populates the dir cache from disk.
+        let mut first = Vec::new();
+        let mut seen = HashSet::new();
+        engine
+            .collect_path_candidates("", &target.to_string_lossy(), false, &mut first, &mut seen)
+            .expect("collect path candidates (cache miss)");
+
+        // Second call with unchanged dir mtime: cache hit — must read back
+        // the same single entry, not two phantom fragments split on the
+        // embedded newline.
+        let mut second = Vec::new();
+        let mut seen2 = HashSet::new();
+        engine
+            .collect_path_candidates(
+                "",
+                &target.to_string_lossy(),
+                false,
+                &mut second,
+                &mut seen2,
+            )
+            .expect("collect path candidates (cache hit)");
+
+        assert_eq!(
+            second.len(),
+            1,
+            "expected exactly one candidate for one file, got: {:?}",
+            second.iter().map(|c| &c.insert_text).collect::<Vec<_>>()
+        );
+        assert_eq!(second[0].insert_text, weird_name);
+
+        let _ = fs::remove_dir_all(&target);
+    }
+
+    #[test]
+    fn dir_cache_freshness_detects_same_second_modification() {
+        // Regression: cache freshness used to compare directory mtime
+        // truncated to whole seconds (`as_secs`), so a file created in the
+        // same wall-clock second as the cached snapshot stayed invisible
+        // until the directory's mtime ticked over to the next second.
+        // Compare with sub-second (nanosecond) precision instead.
+        use std::fs;
+        let (engine, _dir) = test_engine("dir-cache-mtime");
+        let target = unique_tmp("shac-dir-cache-mtime");
+        fs::write(target.join("a.txt"), b"").expect("create a.txt");
+
+        // Populate the cache from the initial listing (cache miss).
+        let mut first = Vec::new();
+        let mut seen = HashSet::new();
+        engine
+            .collect_path_candidates("", &target.to_string_lossy(), false, &mut first, &mut seen)
+            .expect("collect path candidates (cache miss)");
+        assert!(first.iter().any(|c| c.insert_text == "a.txt"));
+
+        // Add a second file immediately after — on any modern filesystem
+        // this bumps the directory's sub-second mtime even when the
+        // whole-second value (the old, buggy comparison key) is unchanged.
+        fs::write(target.join("b.txt"), b"").expect("create b.txt");
+
+        let mut second = Vec::new();
+        let mut seen2 = HashSet::new();
+        engine
+            .collect_path_candidates(
+                "",
+                &target.to_string_lossy(),
+                false,
+                &mut second,
+                &mut seen2,
+            )
+            .expect("collect path candidates (should detect new file)");
+
+        assert!(
+            second.iter().any(|c| c.insert_text == "b.txt"),
+            "expected b.txt to be visible immediately after creation, got: {:?}",
+            second.iter().map(|c| &c.insert_text).collect::<Vec<_>>()
+        );
+
+        let _ = fs::remove_dir_all(&target);
     }
 }

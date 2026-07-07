@@ -150,6 +150,12 @@ pub struct StatsResponse {
     pub time_to_first_accept_seconds: Option<i64>,
     #[serde(default)]
     pub import_coverage_pct: f64,
+    /// Configured `telemetry_retention_days` — how long completion
+    /// telemetry (`completion_requests`/`completion_items`, counted above)
+    /// is kept before the background prune deletes it. Filled in from
+    /// `AppConfig` by `Engine::stats`, not derived from the DB itself.
+    #[serde(default)]
+    pub telemetry_retention_days: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

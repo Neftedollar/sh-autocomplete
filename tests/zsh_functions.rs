@@ -181,20 +181,29 @@ _shac_ui_show_kind=0
 _shac_ui_show_source=0
 _shac_ui_show_description=0
 _shac_render_menu
-assert_contains "$POSTDISPLAY" $'\e[36m[path_jump/path_jump]\e[0m' "debug render tints path_jump label cyan"
-assert_contains "$POSTDISPLAY" $'\e[36m\xe2\x86\x92\e[0m' "menu render tints path_jump arrow cyan"
+# POSTDISPLAY must never contain raw ANSI -- zle renders it literally, so an
+# embedded escape shows as caret-notation garbage. The label/arrow text is
+# plain; the cyan tint lives in region_highlight instead.
+assert_not_contains "$POSTDISPLAY" $'\e' "path_jump render has no raw escapes in POSTDISPLAY"
+assert_contains "$POSTDISPLAY" "[path_jump/path_jump]" "debug render still shows path_jump label"
+assert_contains "$POSTDISPLAY" $'\xe2\x86\x92' "menu render still shows path_jump arrow"
+assert_eq "${#region_highlight[@]}" "2" "path_jump render adds arrow + label highlight spans"
+assert_eq "${region_highlight[1]}" "12 13 fg=6" "arrow span is cyan-tinted via region_highlight"
+assert_eq "${region_highlight[2]}" "46 67 fg=6" "label span is cyan-tinted via region_highlight"
 
-# SHAC_NO_COLOR opt-out: no ANSI escapes anywhere in POSTDISPLAY.
+# SHAC_NO_COLOR opt-out: no highlight spans, and still no raw ANSI.
 SHAC_NO_COLOR=1 _shac_render_menu
-assert_not_contains "$POSTDISPLAY" $'\e[36m' "SHAC_NO_COLOR disables cyan tint"
+assert_not_contains "$POSTDISPLAY" $'\e' "SHAC_NO_COLOR render has no raw escapes"
+assert_eq "${#region_highlight[@]}" "0" "SHAC_NO_COLOR disables the cyan tint spans"
 
-# Non-path_jump kinds remain uncolored even when color is on.
+# Non-path_jump kinds remain untinted even when color is on.
 unset SHAC_NO_COLOR
 _shac_menu_kinds=("subcommand")
 _shac_menu_sources=("builtin-index")
 _shac_menu_displays=("checkout")
 _shac_render_menu
-assert_not_contains "$POSTDISPLAY" $'\e[36m' "non-path_jump kind is not tinted"
+assert_not_contains "$POSTDISPLAY" $'\e' "non-path_jump render has no raw escapes"
+assert_eq "${#region_highlight[@]}" "0" "non-path_jump kind adds no highlight spans"
 "#,
     );
 }

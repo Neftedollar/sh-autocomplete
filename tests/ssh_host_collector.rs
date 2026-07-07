@@ -24,7 +24,7 @@ fn write_known_hosts(env: &support::TestEnv, content: &str) {
     fs::write(ssh_dir.join("known_hosts"), content).expect("write known_hosts");
 }
 
-/// Parse shell-tsv-v2 output from a `complete` invocation, returning
+/// Parse shell-tsv-v3 output from a `complete` invocation, returning
 /// `(insert_text, kind, source)` triples for every non-meta data line.
 fn parse_candidates(output: &str) -> Vec<(String, String, String)> {
     let mut out = Vec::new();
@@ -62,7 +62,7 @@ fn complete(env: &support::TestEnv, line: &str) -> Vec<(String, String, String)>
             "--cwd",
             "/tmp",
             "--format",
-            "shell-tsv-v2",
+            "shell-tsv-v3",
         ],
     );
     parse_candidates(&output)
