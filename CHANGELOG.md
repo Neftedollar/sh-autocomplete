@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.6.3 — 2026-07-08
+
+### Fixed
+- **The `shac-macos-universal` asset is now a genuine universal binary.** It was
+  built with a plain `cargo build` on an Apple Silicon runner, so it was
+  arm64-only despite the name — fine on Apple Silicon, but the v0.6.2 binary
+  formula would hand that arm64 binary to Intel Macs, where it cannot run.
+  Release CI now builds both `aarch64-apple-darwin` and `x86_64-apple-darwin`
+  and `lipo`-merges them into one fat binary, so `brew install` works on both
+  Apple Silicon and Intel Macs.
+
 ## v0.6.2 — 2026-07-08
 
 ### Fixed

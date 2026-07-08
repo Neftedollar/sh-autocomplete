@@ -14,13 +14,13 @@ class Shac < Formula
   # The url/sha256 committed here are the last-released values and serve as the
   # rendering template; they are not consumed by a normal tap install.
   on_macos do
-    url "https://github.com/Neftedollar/sh-autocomplete/releases/download/v0.6.1/shac-macos-universal.tar.gz"
-    sha256 "5ef3e6d43e568b0fd539ceb538cc78f1873739ba8572a29a5cbc3f722e7ee297"
+    url "https://github.com/Neftedollar/sh-autocomplete/releases/download/v0.6.2/shac-macos-universal.tar.gz"
+    sha256 "1798f39474a7c722142b8437a6870836ee391f35997bf92f89469ba3b1c85810"
   end
 
   on_linux do
-    url "https://github.com/Neftedollar/sh-autocomplete/releases/download/v0.6.1/shac-linux-x86_64.tar.gz"
-    sha256 "a836577e6686f217a189376b9cadbf2b81299b2cd0184993ec64d5d6b6378263"
+    url "https://github.com/Neftedollar/sh-autocomplete/releases/download/v0.6.2/shac-linux-x86_64.tar.gz"
+    sha256 "6519a5d619f4b2d62319169fcfbf59edf712a91bdc08e725f7a82df68006633d"
   end
 
   # `brew install --HEAD shac` still builds from source; only that opt-in path

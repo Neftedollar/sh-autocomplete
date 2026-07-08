@@ -35,7 +35,26 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Build release binaries
-        run: cargo build --release --bins
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ matrix.os }}" = "macos-latest" ]; then
+            # macos-latest is Apple Silicon; a plain build is arm64-only. Build
+            # both Apple targets and lipo them into one genuinely universal
+            # binary so the shac-macos-universal asset runs on Intel Macs too.
+            rustup target add aarch64-apple-darwin x86_64-apple-darwin
+            cargo build --release --bins --target aarch64-apple-darwin
+            cargo build --release --bins --target x86_64-apple-darwin
+            mkdir -p target/release
+            for b in shac shacd; do
+              lipo -create -output "target/release/$b" \
+                "target/aarch64-apple-darwin/release/$b" \
+                "target/x86_64-apple-darwin/release/$b"
+            done
+            file target/release/shac target/release/shacd
+          else
+            cargo build --release --bins
+          fi
 
       - name: Package
         shell: bash
