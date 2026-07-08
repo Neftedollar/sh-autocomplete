@@ -2662,11 +2662,19 @@ fn project_history_candidate(
         return None;
     }
     let token = tokens.get(parsed.active_index)?.to_string();
-    let kind = match parsed.role {
-        TokenRole::Option => "option",
-        TokenRole::Path => "path",
-        TokenRole::SubcommandOrArg => "subcommand",
-        TokenRole::Command => "history",
+    // A flag the user typed as an argument (e.g. `bash --help`) lands in
+    // SubcommandOrArg position, but a real subcommand never starts with `-`.
+    // Classify it as an option so it inserts bare instead of getting the
+    // leading-dash `./` path guard (which would yield the broken `bash ./--help`).
+    let kind = if token.starts_with('-') {
+        "option"
+    } else {
+        match parsed.role {
+            TokenRole::Option => "option",
+            TokenRole::Path => "path",
+            TokenRole::SubcommandOrArg => "subcommand",
+            TokenRole::Command => "history",
+        }
     };
     let display = sanitize_display(&token);
     Some((token, display, kind.to_string()))
@@ -3313,6 +3321,35 @@ mod tests {
             contextual_candidate_key(&parsed, &candidate),
             "git checkout"
         );
+    }
+
+    #[test]
+    fn project_history_candidate_classifies_flag_arg_as_option() {
+        let parsed = ParsedContext {
+            line_before_cursor: "bash ".to_string(),
+            tokens: vec!["bash".to_string(), String::new()],
+            active_token: String::new(),
+            active_index: 1,
+            role: TokenRole::SubcommandOrArg,
+            command: Some("bash".to_string()),
+            prev_token: Some("bash".to_string()),
+            project_markers: Vec::new(),
+            open_quote: None,
+        };
+
+        // `bash --help` from history: --help is a flag, not a subcommand, so it
+        // must be kind "option" -- otherwise the leading-dash `./` path guard
+        // turns it into the broken `bash ./--help` on accept.
+        let (token, _display, kind) =
+            project_history_candidate("bash --help", &parsed).expect("flag candidate");
+        assert_eq!(token, "--help");
+        assert_eq!(kind, "option");
+
+        // A non-flag argument keeps its role-based classification.
+        let (token, _display, kind) =
+            project_history_candidate("bash script.sh", &parsed).expect("arg candidate");
+        assert_eq!(token, "script.sh");
+        assert_eq!(kind, "subcommand");
     }
 
     fn unique_tmp(prefix: &str) -> std::path::PathBuf {
