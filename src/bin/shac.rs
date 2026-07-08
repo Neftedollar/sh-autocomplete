@@ -850,6 +850,7 @@ fn doctor(paths: &AppPaths, args: DoctorArgs) -> Result<()> {
             daemon_is_running(paths),
             daemon_detail(paths),
         ),
+        daemon_version_check(paths),
         doctor_check(
             "zsh_adapter",
             paths.shell_dir.join("shac.zsh").exists(),
@@ -941,6 +942,79 @@ fn daemon_detail(paths: &AppPaths) -> String {
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "unknown".to_string());
     format!("socket={} pid={pid}", paths.socket_file.display())
+}
+
+/// Doctor check: the running daemon must be the same version as this client
+/// binary. A `brew upgrade` swaps the on-disk binary but leaves the old
+/// long-running daemon in memory, so completions are served by stale code with
+/// no visible symptom until behavior drifts. The daemon reports its version in
+/// every `complete` response (since the earliest released daemon), so a live
+/// probe catches the skew regardless of shell state.
+fn daemon_version_check(paths: &AppPaths) -> serde_json::Value {
+    let client = env!("CARGO_PKG_VERSION");
+    if !daemon_is_running(paths) {
+        return doctor_check(
+            "daemon_version",
+            true,
+            format!("client v{client}; daemon not running"),
+        );
+    }
+    let daemon = probe_daemon_version(paths);
+    let (ok, detail) = version_skew_detail(client, daemon.as_deref());
+    doctor_check("daemon_version", ok, detail)
+}
+
+/// Compare the client binary version to the running daemon's reported version.
+/// Split from I/O so the messaging is unit-testable. Only a *confirmed*
+/// mismatch is a failure; an unreadable version (probe error/timeout) stays OK
+/// so a transient hiccup doesn't cry wolf — `daemon_running` already covers
+/// connectivity.
+fn version_skew_detail(client: &str, daemon: Option<&str>) -> (bool, String) {
+    match daemon {
+        Some(d) if d == client => (true, format!("client and daemon both v{client}")),
+        Some(d) => (
+            false,
+            format!(
+                "daemon v{d} still running but client is v{client} — run `shac daemon restart` \
+                 (`brew upgrade` leaves the old daemon in memory)"
+            ),
+        ),
+        None => (
+            true,
+            format!("client v{client}; could not read running daemon version"),
+        ),
+    }
+}
+
+/// Ask the running daemon for its version via a minimal read-only `complete`
+/// probe (the only action whose response carries `daemon_version`). Returns
+/// None on any connect/timeout/parse error.
+fn probe_daemon_version(paths: &AppPaths) -> Option<String> {
+    let req = CompletionRequest {
+        shell: "zsh".to_string(),
+        line: String::new(),
+        cursor: 0,
+        cwd: ".".to_string(),
+        env: std::collections::HashMap::new(),
+        session: SessionInfo {
+            tty: None,
+            pid: None,
+        },
+        history_hint: shac::protocol::HistoryHint {
+            prev_command: None,
+            runtime_commands: Vec::new(),
+        },
+    };
+    let payload = serde_json::to_value(req).ok()?;
+    // A generous one-shot timeout: unlike a live completion this is a manual
+    // diagnostic, and the production `daemon_timeout_ms` (tens of ms) is too
+    // tight for the empty-line probe, which triggers a full candidate compute.
+    let response =
+        send_request_with_timeout(paths, "complete", payload, Duration::from_millis(1000)).ok()?;
+    response
+        .get("daemon_version")
+        .and_then(|value| value.as_str())
+        .map(|value| value.to_string())
 }
 
 fn zsh_doctor_checks(paths: &AppPaths) -> Result<Vec<serde_json::Value>> {
@@ -1631,6 +1705,17 @@ fn tilde_user_part(token: &str) -> Option<String> {
 /// of `TokenContext::home_ref` (F3/F4).
 const HOME_SHORTENED_KINDS: &[&str] = &["path_jump", "workspace"];
 
+/// Completion `source` values that carry the user's own command text — their
+/// real shell history and learned transitions. A leading `~`/`$HOME` in one of
+/// these is a genuine home reference the user themselves wrote, never a raw
+/// filesystem entry that merely happens to start with `~` (the F3/F4 hazard,
+/// which only arises for filesystem-scanned `path_cache` candidates). They are
+/// therefore trusted to keep a bare home prefix (signal (c) of `home_ref`) even
+/// though their `kind` (e.g. `subcommand`) is not one of HOME_SHORTENED_KINDS —
+/// otherwise a learned `cd ~/proj/` transition would insert as `cd \~/proj/`,
+/// which cd's into a literal `~` directory instead of expanding home.
+const HOME_AUTHORED_SOURCES: &[&str] = &["transition", "history", "runtime_history"];
+
 /// Build the per-item `TokenContext` from the shared base context (see
 /// [`active_token_base_context`]) plus the item's own `kind`. Split out from
 /// `print_completion_response` (which is I/O — println! — and awkward to
@@ -1653,15 +1738,23 @@ fn item_token_context(
     // (a) the daemon assigned a home-shortened kind (path_jump/workspace, always
     // the user's OWN home, unforgeable by a filename), or (b) the candidate's
     // home reference denotes the SAME home target the user actually typed
-    // (equal user parts). Comparing user parts -- not a coarse "typed some
-    // tilde" bool -- stops a bare typed `~` from licensing a different
-    // `~otheruser` the fs collector introduced.
+    // (equal user parts) -- comparing user parts, not a coarse "typed some
+    // tilde" bool, stops a bare typed `~` from licensing a different
+    // `~otheruser` the fs collector introduced -- or (c) the candidate comes
+    // from a HOME_AUTHORED_SOURCE (the user's own history/transitions) and
+    // carries a genuine home prefix. Signal (c) is what a raw `path_cache`
+    // filesystem entry can never satisfy, preserving the F3/F4 guard.
     let candidate_home_user = item
         .get("insert_text")
         .and_then(|value| value.as_str())
         .and_then(tilde_user_part);
+    let source = item
+        .get("source")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default();
     let home_ref = HOME_SHORTENED_KINDS.contains(&kind)
-        || (typed_home_user.is_some() && candidate_home_user.as_deref() == typed_home_user);
+        || (typed_home_user.is_some() && candidate_home_user.as_deref() == typed_home_user)
+        || (HOME_AUTHORED_SOURCES.contains(&source) && candidate_home_user.is_some());
     TokenContext {
         is_option,
         home_ref,
@@ -1747,6 +1840,14 @@ fn print_completion_response(
         if let Some(dv) = response.get("daemon_version").and_then(|v| v.as_str()) {
             println!("__shac_daemon_version\t{}", encode_field(dv));
         }
+        // Emit the client's own version on every response so the widget can
+        // detect a stale daemon live, without depending on `shac shell-env`
+        // having been re-sourced after an upgrade (a bare `brew upgrade` in an
+        // existing shell would otherwise leave _shac_client_version empty).
+        println!(
+            "__shac_client_version\t{}",
+            encode_field(env!("CARGO_PKG_VERSION"))
+        );
     } else {
         let items = response
             .get("items")
@@ -1937,6 +2038,15 @@ fn send_request(
         .map(|config| config.daemon_timeout_ms)
         .unwrap_or_else(|_| AppConfig::default().daemon_timeout_ms);
     let timeout = request_timeout_for_action(action, timeout_ms);
+    send_request_with_timeout(paths, action, payload, timeout)
+}
+
+fn send_request_with_timeout(
+    paths: &AppPaths,
+    action: &str,
+    payload: serde_json::Value,
+    timeout: Duration,
+) -> Result<serde_json::Value> {
     let mut stream = connect_with_retry(&paths.socket_file, timeout)?;
     stream.set_read_timeout(Some(timeout)).ok();
     stream.set_write_timeout(Some(timeout)).ok();
@@ -2338,6 +2448,63 @@ mod completion_response_tests {
         let ctx = TokenContext::default();
         let item = json!({"kind": "path", "insert_text": "~/Documents/"});
         assert!(item_token_context(&ctx, Some(""), &item).home_ref);
+    }
+
+    #[test]
+    fn item_token_context_marks_home_ref_for_home_authored_source_tilde() {
+        // A learned transition (`source == "transition"`) for `cd ~/Korat/`
+        // arrives with `kind == "subcommand"` (not a HOME_SHORTENED_KIND) and
+        // an empty typed token, so signals (a) and (b) both miss. Signal (c)
+        // must recognize it as the user's own home reference and keep the
+        // tilde bare -- otherwise quote_token escapes it to `\~/Korat/`, which
+        // cd's into a literal `~` directory. Covers history/runtime_history too.
+        let ctx = TokenContext::default();
+        for source in ["transition", "history", "runtime_history"] {
+            let item = json!({
+                "kind": "subcommand",
+                "source": source,
+                "insert_text": "~/Korat/",
+            });
+            assert!(
+                item_token_context(&ctx, None, &item).home_ref,
+                "home-authored source {source} with a ~/ value must be home_ref"
+            );
+        }
+    }
+
+    #[test]
+    fn item_token_context_keeps_path_cache_tilde_guarded() {
+        // The F3/F4 guard must survive signal (c): a raw filesystem entry
+        // (`source == "path_cache"`) that merely happens to start with `~`
+        // must NOT be treated as a home reference, or a file literally named
+        // `~evil` would tilde-expand to another user's home on insertion.
+        let ctx = TokenContext::default();
+        let item = json!({
+            "kind": "path",
+            "source": "path_cache",
+            "insert_text": "~evil",
+        });
+        assert!(!item_token_context(&ctx, None, &item).home_ref);
+    }
+
+    #[test]
+    fn version_skew_detail_flags_only_confirmed_mismatch() {
+        // Matching versions: ok, no alarm.
+        let (ok, _) = version_skew_detail("0.6.4", Some("0.6.4"));
+        assert!(ok);
+
+        // Confirmed mismatch (stale daemon after brew upgrade): fail, and the
+        // detail must tell the user exactly how to fix it.
+        let (ok, detail) = version_skew_detail("0.6.4", Some("0.5.3"));
+        assert!(!ok);
+        assert!(detail.contains("0.5.3"));
+        assert!(detail.contains("0.6.4"));
+        assert!(detail.contains("shac daemon restart"));
+
+        // Unreadable version (probe timeout/error): stays OK so a transient
+        // hiccup doesn't cry wolf.
+        let (ok, _) = version_skew_detail("0.6.4", None);
+        assert!(ok);
     }
 
     #[test]

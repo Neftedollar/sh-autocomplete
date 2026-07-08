@@ -1,5 +1,28 @@
 # Changelog
 
+## v0.6.4 — 2026-07-08
+
+### Fixed
+- **Stale-daemon detection.** A `brew upgrade` swaps the binary on disk but
+  leaves the old long-running `shacd` in memory, so completions keep being
+  served by outdated code with no visible symptom until behavior drifts (a
+  0.6.3 client talking to a 0.5.3 daemon produced confusing multi-Tab behavior).
+  Two safety nets now catch this:
+  - `shac doctor` gains a `daemon_version` check that live-probes the running
+    daemon and flags a version mismatch with the exact fix (`shac daemon
+    restart`).
+  - The completion response now carries the client version on every request, so
+    the zsh widget's version-mismatch tip fires even when `shac shell-env` was
+    not re-sourced after the upgrade (previously the client version was only
+    learned at shell startup, so a bare `brew upgrade` in an existing shell left
+    it blank and the warning silent).
+- **Tilde no longer escaped in learned path transitions.** A learned `cd ~/proj/`
+  transition (`source: transition`, `kind: subcommand`) was quoted as
+  `cd \~/proj/`, which cd's into a literal `~` directory instead of expanding
+  home. Candidates from the user's own history/transitions now keep a genuine
+  bare `~`/`$HOME` prefix, while raw filesystem entries stay guarded against the
+  `~root` masquerade (F3/F4).
+
 ## v0.6.3 — 2026-07-08
 
 ### Fixed
