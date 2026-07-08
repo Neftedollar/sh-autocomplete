@@ -1,15 +1,41 @@
 class Shac < Formula
   desc "Local shell autocomplete engine for bash, zsh, and fish"
   homepage "https://github.com/Neftedollar/sh-autocomplete"
-  url "https://github.com/Neftedollar/sh-autocomplete/archive/refs/tags/v0.5.1.tar.gz"
-  sha256 "3f769526bfbc0ce17efda8198b3998eb4a990eb7923fbaae0a45a76e99467171"
+  version "0.6.2"
   license "MIT"
-  head "https://github.com/Neftedollar/sh-autocomplete.git", branch: "main"
 
-  depends_on "rust" => :build
+  # Binary-install formula: downloads the prebuilt release tarball and installs
+  # the binaries directly — no Rust/LLVM build toolchain is pulled for a normal
+  # `brew install`. The macOS asset is a universal binary (arm64 + x86_64), so a
+  # single url covers both Apple Silicon and Intel.
+  #
+  # CI (`.github/scripts/render_tap_formula.py`, run by release.yml) injects the
+  # release-specific url + sha256 into the tap copy of this formula at tag time.
+  # The url/sha256 committed here are the last-released values and serve as the
+  # rendering template; they are not consumed by a normal tap install.
+  on_macos do
+    url "https://github.com/Neftedollar/sh-autocomplete/releases/download/v0.6.1/shac-macos-universal.tar.gz"
+    sha256 "5ef3e6d43e568b0fd539ceb538cc78f1873739ba8572a29a5cbc3f722e7ee297"
+  end
+
+  on_linux do
+    url "https://github.com/Neftedollar/sh-autocomplete/releases/download/v0.6.1/shac-linux-x86_64.tar.gz"
+    sha256 "a836577e6686f217a189376b9cadbf2b81299b2cd0184993ec64d5d6b6378263"
+  end
+
+  # `brew install --HEAD shac` still builds from source; only that opt-in path
+  # needs the Rust toolchain.
+  head do
+    url "https://github.com/Neftedollar/sh-autocomplete.git", branch: "main"
+    depends_on "rust" => :build
+  end
 
   def install
-    system "cargo", "install", *std_cargo_args(path: ".")
+    if build.head?
+      system "cargo", "install", *std_cargo_args(path: ".")
+    else
+      bin.install "bin/shac", "bin/shacd"
+    end
     pkgshare.install "shell"
   end
 

@@ -1,5 +1,27 @@
 # Changelog
 
+## v0.6.2 — 2026-07-08
+
+### Fixed
+- **Homebrew installs no longer build from source.** The v0.6.1 bottle pipeline
+  never actually delivered a usable bottle (a glob missed `.bottle.1.tar.gz`
+  files and the bottle was built from the tap before the tap url was bumped, so
+  it carried the wrong version), so `brew install/upgrade shac` still fell back
+  to `cargo install` and pulled the entire Rust + LLVM toolchain (~600 MB) just
+  to compile a binary that is already published in the release.
+- The tap formula is now a **binary-install formula**: it downloads the prebuilt
+  release tarball (`shac-macos-universal` — a universal arm64+Intel binary — or
+  `shac-linux-x86_64`) and runs `bin.install`, with **no `depends_on "rust"`**
+  and no build step. A normal `brew install neftedollar/shac/shac` pulls zero
+  compiler dependencies. `brew install --HEAD shac` still builds from source.
+
+### Changed
+- Release CI renders the tap formula from the repo's canonical
+  `Formula/shac.rb` at tag time (`.github/scripts/render_tap_formula.py`),
+  injecting each platform's release url + sha256 with block-scoped substitution.
+- Removed the bottle-publish workflow (`bottle.yml`) and `merge_bottle.py`; they
+  are obsolete now that installs use the release tarball directly.
+
 ## v0.6.1 — 2026-07-06
 
 ### Fixed

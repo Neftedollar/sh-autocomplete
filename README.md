@@ -45,7 +45,8 @@ cargo build
 
 ## Homebrew
 
-The formula always points to a stable tag.
+The formula installs a prebuilt release binary — no Rust/LLVM build toolchain is
+pulled. The macOS asset is a universal binary (Apple Silicon + Intel).
 
 ```bash
 brew install Neftedollar/shac/shac
@@ -53,10 +54,17 @@ brew install Neftedollar/shac/shac
 
 [Leave beta feedback →](https://github.com/Neftedollar/sh-autocomplete/discussions)
 
-For local formula testing from this checkout:
+For local formula testing from this checkout (installs the prebuilt binary named
+in the formula):
 
 ```bash
-brew install --build-from-source ./Formula/shac.rb
+brew install ./Formula/shac.rb
+```
+
+To build from source instead (needs the Rust toolchain):
+
+```bash
+brew install --HEAD Neftedollar/shac/shac
 ```
 
 ## Beta quickstart
