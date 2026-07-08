@@ -58,12 +58,31 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - name: Compute sha256 of source tarball
-        id: sha256
+      - name: Checkout source (formula template + render script)
+        uses: actions/checkout@v6
+
+      - name: Compute sha256 of release binaries
+        id: sha
         run: |
-          URL="https://github.com/Neftedollar/sh-autocomplete/archive/refs/tags/${{ github.ref_name }}.tar.gz"
-          SHA=$(curl -sL "$URL" | sha256sum | cut -d' ' -f1)
-          echo "value=$SHA" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          base="https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}"
+          # `needs: build` guarantees both assets were uploaded, but the release
+          # CDN can lag the API by a few seconds — retry until each is fetchable.
+          fetch_sha() {
+            name="$1"
+            for i in $(seq 1 18); do
+              if curl -fsSL -o "/tmp/${name}" "${base}/${name}"; then
+                sha256sum "/tmp/${name}" | cut -d' ' -f1
+                return 0
+              fi
+              echo "waiting for asset ${name} ($i/18)..." >&2
+              sleep 10
+            done
+            echo "asset ${name} never became available" >&2
+            return 1
+          }
+          echo "macos=$(fetch_sha shac-macos-universal.tar.gz)" >> "$GITHUB_OUTPUT"
+          echo "linux=$(fetch_sha shac-linux-x86_64.tar.gz)" >> "$GITHUB_OUTPUT"
 
       - name: Checkout homebrew-shac tap
         uses: actions/checkout@v6
@@ -72,15 +91,18 @@ jobs:
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           path: homebrew-shac
 
-      - name: Patch formula
+      - name: Render tap formula
+        env:
+          TAG: ${{ github.ref_name }}
+          MACOS_SHA: ${{ steps.sha.outputs.macos }}
+          LINUX_SHA: ${{ steps.sha.outputs.linux }}
         run: |
           set -euo pipefail
-          VERSION="${{ github.ref_name }}"
-          SHA="${{ steps.sha256.outputs.value }}"
-          FORMULA="homebrew-shac/Formula/shac.rb"
-          sed -i "s|url \".*\"|url \"https://github.com/Neftedollar/sh-autocomplete/archive/refs/tags/${VERSION}.tar.gz\"|" "$FORMULA"
-          sed -i "s|sha256 \".*\"|sha256 \"${SHA}\"|" "$FORMULA"
-          echo "=== patched formula ===" && cat "$FORMULA"
+          export VERSION="${TAG#v}"
+          export SRC="Formula/shac.rb"
+          export OUT="homebrew-shac/Formula/shac.rb"
+          python3 .github/scripts/render_tap_formula.py
+          echo "=== rendered tap formula ===" && cat "$OUT"
 
       - name: Commit and push
         run: |
