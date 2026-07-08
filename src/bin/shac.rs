@@ -856,6 +856,7 @@ fn doctor(paths: &AppPaths, args: DoctorArgs) -> Result<()> {
             paths.shell_dir.join("shac.zsh").exists(),
             paths.shell_dir.join("shac.zsh").display().to_string(),
         ),
+        adapter_currency_check(paths),
         doctor_check(
             "bash_adapter",
             paths.shell_dir.join("shac.bash").exists(),
@@ -1069,6 +1070,33 @@ fn adapter_contains_owned_widget(path: &Path) -> bool {
             content.contains("_shac_tab_widget") && content.contains("_shac_space_widget")
         })
         .unwrap_or(false)
+}
+
+/// Doctor check: the installed zsh adapter must match the one embedded in this
+/// binary. `brew upgrade` refreshes the binary but not the adapter that
+/// `shac install` wrote to the config dir, so a stale adapter can mis-parse a
+/// newer binary's output (e.g. render an unrecognized control line as a blank
+/// phantom candidate). Only a present-but-outdated adapter fails; a missing one
+/// is left to the `zsh_adapter` existence check.
+fn adapter_currency_check(paths: &AppPaths) -> serde_json::Value {
+    let path = paths.shell_dir.join("shac.zsh");
+    if !path.exists() {
+        return doctor_check(
+            "zsh_adapter_current",
+            true,
+            "no zsh adapter installed".to_string(),
+        );
+    }
+    let current = fs::read_to_string(&path)
+        .map(|content| content == ZSH_COMPLETION)
+        .unwrap_or(false);
+    let detail = if current {
+        "matches installed binary".to_string()
+    } else {
+        "stale — run `shac install --shell zsh` (a `brew upgrade` does not refresh the adapter)"
+            .to_string()
+    };
+    doctor_check("zsh_adapter_current", current, detail)
 }
 
 fn command_available(command: &str) -> bool {
@@ -1840,14 +1868,6 @@ fn print_completion_response(
         if let Some(dv) = response.get("daemon_version").and_then(|v| v.as_str()) {
             println!("__shac_daemon_version\t{}", encode_field(dv));
         }
-        // Emit the client's own version on every response so the widget can
-        // detect a stale daemon live, without depending on `shac shell-env`
-        // having been re-sourced after an upgrade (a bare `brew upgrade` in an
-        // existing shell would otherwise leave _shac_client_version empty).
-        println!(
-            "__shac_client_version\t{}",
-            encode_field(env!("CARGO_PKG_VERSION"))
-        );
     } else {
         let items = response
             .get("items")
