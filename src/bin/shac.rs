@@ -285,26 +285,38 @@ struct IndexArgs {
 
 #[derive(Debug, Subcommand)]
 enum IndexAction {
+    /// Index a command's flags and subcommands from its `--help` output
     AddCommand {
+        /// Command name to index (e.g. git, cargo, docker)
         cmd: String,
     },
+    /// Index a directory's paths so they complete for `cd` and friends
     AddPath {
+        /// Directory to index
         path: String,
+        /// Also index one level of subdirectories
         #[arg(long)]
         subpath: bool,
+        /// Index the full recursive tree (may be slow for large trees)
         #[arg(long)]
         full: bool,
+        /// Recursion depth when indexing subdirectories (0 = unlimited)
         #[arg(long, default_value_t = 0)]
         deep: usize,
     },
+    /// Show what has been indexed (commands, paths, docs)
     Status,
 }
 
 #[derive(Debug, Subcommand)]
 enum DaemonAction {
+    /// Start the background daemon
     Start,
+    /// Stop the running daemon
     Stop,
+    /// Restart the daemon (reload the current binary)
     Restart,
+    /// Show whether the daemon is running
     Status,
 }
 

@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.6.7 — 2026-07-08
+
+### Fixed
+- **A flag typed as an argument no longer completes as `./--flag`.** A history
+  entry like `bash --help` was offered for `bash <Tab>` as a `subcommand`
+  candidate, and since a real subcommand never starts with `-`, the leading-dash
+  path guard rewrote it to `bash ./--help` (which fails). Flag-shaped history/
+  transition arguments are now classified as options, so they insert bare.
+- **`shac index`/`shac daemon` subcommands were undocumented.** `shac index
+  --help` listed `add-command` / `add-path` / `status` with blank descriptions;
+  those (and the `daemon` start/stop/restart/status verbs) now carry help text.
+
 ## v0.6.6 — 2026-07-08
 
 ### Fixed
