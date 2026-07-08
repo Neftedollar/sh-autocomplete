@@ -212,28 +212,85 @@ fn upsert_docs_with_help_shellout(db: &AppDb, command: &str) -> Result<()> {
     Ok(())
 }
 
+/// Split a help/man flags column ("-h, --help", "-m, --message <MSG>",
+/// "--color=<WHEN>") into its individual flag tokens ("-h", "--help"). Stops at
+/// the first metavar so a value placeholder never leaks into an inserted flag,
+/// and drops any attached "=VALUE". Each flag becomes its own candidate so a
+/// user typing either the short or the long form gets a prefix match.
+fn flag_tokens(column: &str) -> Vec<String> {
+    let mut flags = Vec::new();
+    for token in column
+        .split([',', ' ', '\t'])
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+    {
+        if token.starts_with('-') && token.len() > 1 {
+            let flag = token.split('=').next().unwrap_or(token);
+            flags.push(flag.to_string());
+        } else {
+            // A metavar (<MSG>, WHEN, ...) — the flag tokens are done.
+            break;
+        }
+    }
+    flags
+}
+
+/// A help line's first column names a subcommand only when it is a single
+/// lowercase token (letters, digits, hyphens). This rejects prose, `Usage:`
+/// lines, section headers and wrapped descriptions that are not real
+/// subcommands.
+fn is_subcommand_name(token: &str) -> bool {
+    token.len() >= 2
+        && token.starts_with(|c: char| c.is_ascii_lowercase())
+        && token
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
 fn parse_help_output(command: &str) -> Option<Vec<StoredDoc>> {
     let output = run_help_with_timeout(command, HELP_TIMEOUT)?;
     if !output.status.success() && output.stdout.is_empty() {
         return None;
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
+    Some(parse_help_text(command, &stdout))
+}
+
+/// Pure parser for `<command> --help` output. Split from the shellout so it can
+/// be unit-tested against real help text. Extracts option rows (one candidate
+/// per flag) and subcommand rows (indented single-token names under a group
+/// header).
+fn parse_help_text(command: &str, stdout: &str) -> Vec<StoredDoc> {
     let mut docs = Vec::new();
     for line in stdout.lines() {
+        let indented = line.starts_with(' ') || line.starts_with('\t');
         let trimmed = line.trim();
-        if trimmed.starts_with('-') {
-            let mut parts = trimmed.splitn(2, "  ");
-            let item = parts.next()?.trim();
-            let description = parts.next().unwrap_or("").trim();
-            if !item.is_empty() && !description.is_empty() {
-                docs.push(doc(command, "option", item, description, "help"));
+        let mut parts = trimmed.splitn(2, "  ");
+        let head = parts.next().unwrap_or("").trim();
+        let description = parts.next().unwrap_or("").trim();
+        if description.is_empty() {
+            continue;
+        }
+        if head.starts_with('-') {
+            // Option row: "-h, --help  Print help" -> one candidate per flag.
+            for flag in flag_tokens(head) {
+                docs.push(doc(command, "option", &flag, description, "help"));
                 if docs.len() >= MAX_DOCS_PER_COMMAND {
-                    break;
+                    return docs;
                 }
+            }
+        } else if indented && is_subcommand_name(head) {
+            // Subcommand row under a group header ("  install   Add ...").
+            // clap groups subcommands under custom headers (Setup:, Index:, ...)
+            // rather than a single "Commands:" section, so key off the row
+            // shape, not the header name.
+            docs.push(doc(command, "subcommand", head, description, "help"));
+            if docs.len() >= MAX_DOCS_PER_COMMAND {
+                return docs;
             }
         }
     }
-    Some(docs)
+    docs
 }
 
 fn run_help_with_timeout(command: &str, timeout: Duration) -> Option<std::process::Output> {
@@ -337,12 +394,14 @@ fn parse_man_sections(text: &str, command: &str) -> Option<Vec<StoredDoc>> {
         let trimmed = line.trim();
         if trimmed.starts_with('-') {
             let mut parts = trimmed.splitn(2, "  ");
-            if let Some(item) = parts.next().map(str::trim).filter(|s| !s.is_empty()) {
+            if let Some(column) = parts.next().map(str::trim).filter(|s| !s.is_empty()) {
                 let description = parts.next().unwrap_or("").trim();
                 if !description.is_empty() {
-                    docs.push(doc(command, "option", item, description, "man"));
-                    if docs.len() >= MAX_DOCS_PER_COMMAND {
-                        break;
+                    for flag in flag_tokens(column) {
+                        docs.push(doc(command, "option", &flag, description, "man"));
+                        if docs.len() >= MAX_DOCS_PER_COMMAND {
+                            break;
+                        }
                     }
                 }
             }
@@ -609,6 +668,86 @@ mod tests {
 
     fn test_db() -> AppDb {
         AppDb::open(std::path::Path::new(":memory:")).unwrap()
+    }
+
+    #[test]
+    fn flag_tokens_extracts_individual_flags_without_metavars() {
+        assert_eq!(flag_tokens("-h, --help"), vec!["-h", "--help"]);
+        assert_eq!(flag_tokens("-V, --version"), vec!["-V", "--version"]);
+        // Metavar terminates the flag list; never leaks into an inserted flag.
+        assert_eq!(flag_tokens("-m, --message <MSG>"), vec!["-m", "--message"]);
+        // Attached =VALUE is stripped.
+        assert_eq!(flag_tokens("--color=<WHEN>"), vec!["--color"]);
+        assert_eq!(flag_tokens("--long-only"), vec!["--long-only"]);
+    }
+
+    #[test]
+    fn is_subcommand_name_accepts_names_rejects_prose() {
+        assert!(is_subcommand_name("install"));
+        assert!(is_subcommand_name("reset-personalization"));
+        assert!(is_subcommand_name("net0"));
+        assert!(!is_subcommand_name("Usage:")); // header / colon / capital
+        assert!(!is_subcommand_name("Print")); // capital (a wrapped desc word)
+        assert!(!is_subcommand_name("--help")); // an option, not a subcommand
+        assert!(!is_subcommand_name("a")); // too short
+        assert!(!is_subcommand_name(""));
+    }
+
+    #[test]
+    fn parse_help_text_extracts_subcommands_and_single_flags() {
+        // A realistic clap grouped-help layout (as `shac --help` emits): custom
+        // group headers instead of a single "Commands:" section, plus Options.
+        let help = "\
+Shell autocomplete engine CLI
+
+Usage: shac <COMMAND>
+
+Setup:
+  install                Add shac integration to your shell rc file
+  daemon                 Manage the background daemon
+
+Diagnostics:
+  doctor                 Check that the daemon is healthy
+  reset-personalization  Clear all learned preferences
+
+Options:
+  -h, --help     Print help
+  -V, --version  Print version
+
+Run 'shac help <COMMAND>' for more information on a specific command.
+";
+        let docs = parse_help_text("shac", help);
+
+        let subs: Vec<&str> = docs
+            .iter()
+            .filter(|d| d.item_type == "subcommand")
+            .map(|d| d.item_value.as_str())
+            .collect();
+        assert!(subs.contains(&"install"), "subcommands: {subs:?}");
+        assert!(subs.contains(&"daemon"));
+        assert!(subs.contains(&"doctor"));
+        assert!(subs.contains(&"reset-personalization"));
+
+        let opts: Vec<&str> = docs
+            .iter()
+            .filter(|d| d.item_type == "option")
+            .map(|d| d.item_value.as_str())
+            .collect();
+        // Individual flags, never the comma-joined column.
+        assert!(
+            opts.contains(&"-h") && opts.contains(&"--help"),
+            "opts: {opts:?}"
+        );
+        assert!(opts.contains(&"-V") && opts.contains(&"--version"));
+        assert!(
+            docs.iter().all(|d| !d.item_value.contains(", ")),
+            "no candidate may carry the raw '-h, --help' column"
+        );
+
+        // Prose, usage and the footer must not become subcommands.
+        assert!(!subs.contains(&"usage"));
+        assert!(!subs.contains(&"run"));
+        assert!(!subs.contains(&"shell"));
     }
 
     /// Verify that skip_existing=false (default mode) always calls maybe_upsert_docs —

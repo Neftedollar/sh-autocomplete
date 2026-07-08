@@ -1,5 +1,24 @@
 # Changelog
 
+## v0.6.6 — 2026-07-08
+
+### Fixed
+- **Options completed as a whole flags column.** A `--help`/man row like
+  `-h, --help  Print help` was indexed with the entire `-h, --help` string as
+  the insert value, so accepting it typed `cmd -h,\ --help`. Each flag is now a
+  separate candidate (`-h`, `--help`), with any metavar (`<MSG>`, `=<WHEN>`)
+  stripped, so short- and long-form prefixes both complete correctly.
+- **Subcommands were never indexed.** The help parser only read option rows, so
+  `shac <Tab>` (and any CLI's subcommands) fell through to history/path noise.
+  It now also extracts subcommand rows — indented single-token names under a
+  group header — which clap emits under custom sections (`Setup:`, `Index:`,
+  …) rather than a single `Commands:` block.
+
+### Note
+- The background indexer never re-shells `--help` for already-indexed commands,
+  so existing help/man docs keep the old parsing until refreshed with
+  `shac index add-command <cmd>`.
+
 ## v0.6.5 — 2026-07-08
 
 ### Fixed
