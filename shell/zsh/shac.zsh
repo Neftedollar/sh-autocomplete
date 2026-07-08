@@ -702,6 +702,13 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
         local -a dv_fields
         dv_fields=("${(ps:\t:)line}")
         _shac_daemon_version="${dv_fields[2]:-}"
+      elif [[ "$line" == __shac_client_version$'\t'* ]]; then
+        # Refresh the client version from the live binary on every fetch so a
+        # stale daemon is detected even when `shac shell-env` was not re-sourced
+        # after an upgrade (see _shac_check_version_mismatch).
+        local -a cv_fields
+        cv_fields=("${(ps:\t:)line}")
+        _shac_client_version="${cv_fields[2]:-}"
       else
         local -a fields
         fields=("${(ps:\t:)line}")
