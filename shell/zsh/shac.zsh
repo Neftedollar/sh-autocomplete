@@ -702,13 +702,13 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
         local -a dv_fields
         dv_fields=("${(ps:\t:)line}")
         _shac_daemon_version="${dv_fields[2]:-}"
-      elif [[ "$line" == __shac_client_version$'\t'* ]]; then
-        # Refresh the client version from the live binary on every fetch so a
-        # stale daemon is detected even when `shac shell-env` was not re-sourced
-        # after an upgrade (see _shac_check_version_mismatch).
-        local -a cv_fields
-        cv_fields=("${(ps:\t:)line}")
-        _shac_client_version="${cv_fields[2]:-}"
+      elif [[ "$line" == __shac_*$'\t'* ]]; then
+        # Unknown control line from a newer binary (an added __shac_* protocol
+        # line). Ignore it: the else branch below would otherwise treat it as a
+        # completion candidate and surface a blank phantom item whose insert_text
+        # is the control payload. Forward compatibility -- a newer binary may add
+        # __shac_* lines without this adapter mis-rendering them.
+        continue
       else
         local -a fields
         fields=("${(ps:\t:)line}")

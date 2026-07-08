@@ -1,5 +1,24 @@
 # Changelog
 
+## v0.6.5 — 2026-07-08
+
+### Fixed
+- **Phantom blank completion after upgrade.** v0.6.4 made `shac complete` emit a
+  new `__shac_client_version` protocol line, but `brew upgrade` refreshes the
+  binary without re-running `shac install`, so the still-installed older zsh
+  adapter did not recognize the line and mis-parsed it as a completion candidate
+  — a blank menu entry whose insertion was the version string (`cd 0.6.4`).
+  - Reverted the `__shac_client_version` emission and the widget's live parse of
+    it; stale-daemon detection already lives in the `shac doctor daemon_version`
+    check (v0.6.4), which needs no protocol change.
+  - The zsh adapter now **ignores any unrecognized `__shac_*` control line**
+    instead of rendering it as a candidate, so a future binary can add protocol
+    lines without breaking an older adapter.
+- **Stale-adapter detection.** `shac doctor` gains a `zsh_adapter_current` check
+  that compares the installed adapter against the one embedded in this binary
+  and tells you to run `shac install --shell zsh` when a `brew upgrade` left it
+  outdated (the adapter counterpart to the `daemon_version` check).
+
 ## v0.6.4 — 2026-07-08
 
 ### Fixed
