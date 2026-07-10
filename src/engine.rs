@@ -480,20 +480,45 @@ impl Engine {
         let cd_empty_path_context = is_cd_path_context(parsed) && active.is_empty();
 
         if matches!(parsed.role, TokenRole::Command) {
+            // A short prefix like `c` fuzzy-matches almost all ~1700 indexed
+            // commands; pushing and ranking that many blows the completion
+            // budget, so the daemon times out and the widget shows nothing.
+            // Cheap-rank here (prefix beats fuzzy, shorter beats longer) and cap
+            // before the expensive downstream scoring.
+            let cap = self.config.max_results.saturating_mul(4).max(24);
+            // Fuzzy on a 0-1 char prefix matches nearly every command, and even
+            // building that pre-cap list blows the budget. Take prefix matches
+            // only until the user has typed at least two characters.
+            let fuzzy_ok = active.chars().count() >= 2;
+            let mut ranked: Vec<(f64, String, String)> = Vec::new();
             for (name, kind) in self.db.list_commands()? {
-                if name.starts_with(active) || fuzzy_match_score(active, &name) > 0.0 {
-                    push_candidate(
-                        &mut candidates,
-                        &mut seen,
-                        Candidate {
-                            insert_text: name.clone(),
-                            display: sanitize_display(&name),
-                            kind,
-                            source: "path_index".to_string(),
-                            description: None,
-                        },
-                    );
-                }
+                let score = if name.starts_with(active) {
+                    2.0 - (name.len() as f64) * 0.01
+                } else if !fuzzy_ok {
+                    continue;
+                } else {
+                    let fuzzy = fuzzy_match_score(active, &name);
+                    if fuzzy <= 0.0 {
+                        continue;
+                    }
+                    fuzzy
+                };
+                ranked.push((score, name, kind));
+            }
+            ranked.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+            ranked.truncate(cap);
+            for (_score, name, kind) in ranked {
+                push_candidate(
+                    &mut candidates,
+                    &mut seen,
+                    Candidate {
+                        insert_text: name.clone(),
+                        display: sanitize_display(&name),
+                        kind,
+                        source: "path_index".to_string(),
+                        description: None,
+                    },
+                );
             }
         }
 
@@ -502,9 +527,13 @@ impl Engine {
                 if let Some((insert_text, display, kind)) =
                     project_history_candidate(command, parsed)
                 {
-                    if insert_text.starts_with(active)
-                        || fuzzy_match_score(active, &insert_text) > 0.0
-                        || active.is_empty()
+                    let stale_cd_path = kind == "path"
+                        && is_cd_path_context(parsed)
+                        && !cd_history_path_exists(&insert_text, &req.cwd);
+                    if !stale_cd_path
+                        && (insert_text.starts_with(active)
+                            || fuzzy_match_score(active, &insert_text) > 0.0
+                            || active.is_empty())
                     {
                         push_candidate(
                             &mut candidates,
@@ -528,6 +557,13 @@ impl Engine {
             {
                 let history_candidate = project_history_candidate(&entry.command, parsed);
                 if let Some((insert_text, display, kind)) = history_candidate {
+                    // Drop a cd-path suggestion whose directory no longer exists.
+                    if kind == "path"
+                        && is_cd_path_context(parsed)
+                        && !cd_history_path_exists(&insert_text, &req.cwd)
+                    {
+                        continue;
+                    }
                     push_candidate(
                         &mut candidates,
                         &mut seen,
@@ -639,9 +675,13 @@ impl Engine {
                 if let Some((insert_text, display, kind)) =
                     project_history_candidate(&transition.next, parsed)
                 {
-                    if insert_text.starts_with(active)
-                        || fuzzy_match_score(active, &insert_text) > 0.0
-                        || active.is_empty()
+                    let stale_cd_path = kind == "path"
+                        && is_cd_path_context(parsed)
+                        && !cd_history_path_exists(&insert_text, &req.cwd);
+                    if !stale_cd_path
+                        && (insert_text.starts_with(active)
+                            || fuzzy_match_score(active, &insert_text) > 0.0
+                            || active.is_empty())
                     {
                         push_candidate(
                             &mut candidates,
@@ -1727,6 +1767,28 @@ fn position_score(parsed: &ParsedContext, candidate: &Candidate) -> f64 {
 fn is_cd_path_context(parsed: &ParsedContext) -> bool {
     matches!(parsed.command.as_deref(), Some("cd"))
         || matches!(parsed.prev_token.as_deref(), Some("cd"))
+}
+
+/// True if a cd-path candidate resurrected from history still resolves to an
+/// existing directory. Relative tokens resolve against `cwd`; `~/` expands via
+/// `$HOME`. Used to drop stale suggestions like `cd dev/sh-autocomplete/` after
+/// the folder was deleted. An unresolvable `~` (no `$HOME`) is treated as
+/// existing so we never over-filter a path we cannot check.
+fn cd_history_path_exists(token: &str, cwd: &str) -> bool {
+    if token == "~" {
+        return true;
+    }
+    let path = if let Some(rest) = token.strip_prefix("~/") {
+        match std::env::var_os("HOME") {
+            Some(home) => PathBuf::from(home).join(rest),
+            None => return true,
+        }
+    } else if Path::new(token).is_absolute() {
+        PathBuf::from(token)
+    } else {
+        Path::new(cwd).join(token)
+    };
+    path.exists()
 }
 
 fn source_prior(source: &str, kind: &str) -> f64 {
@@ -3350,6 +3412,30 @@ mod tests {
             project_history_candidate("bash script.sh", &parsed).expect("arg candidate");
         assert_eq!(token, "script.sh");
         assert_eq!(kind, "subcommand");
+    }
+
+    #[test]
+    fn cd_history_path_exists_filters_deleted_dirs() {
+        let base = unique_tmp("cd-exists");
+        fs::create_dir_all(base.join("real")).unwrap();
+        let cwd = base.to_string_lossy().to_string();
+
+        // Existing relative dir (with and without trailing slash) is kept.
+        assert!(cd_history_path_exists("real", &cwd));
+        assert!(cd_history_path_exists("real/", &cwd));
+        // A deleted / never-existed relative dir is filtered out.
+        assert!(!cd_history_path_exists("gone/", &cwd));
+        assert!(!cd_history_path_exists("real/nope/", &cwd));
+        // Absolute existing / missing.
+        assert!(cd_history_path_exists(
+            base.join("real").to_str().unwrap(),
+            &cwd
+        ));
+        assert!(!cd_history_path_exists("/definitely/not/here/xyzzy", &cwd));
+        // Bare `~` is treated as existing (never over-filter home).
+        assert!(cd_history_path_exists("~", &cwd));
+
+        let _ = fs::remove_dir_all(&base);
     }
 
     fn unique_tmp(prefix: &str) -> std::path::PathBuf {
