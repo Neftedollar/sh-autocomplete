@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.6.8 — 2026-07-08
+
+### Fixed
+- **Command completion no longer times out on a short prefix.** `c<Tab>` (and
+  any 1-2 char prefix) fuzzy-matched almost all ~1700 indexed commands; ranking
+  that many candidates blew the 80 ms daemon budget, so the request timed out
+  and the widget showed nothing. Command candidates are now cheap-ranked
+  (prefix beats fuzzy, shorter beats longer) and capped before the expensive
+  scoring, and fuzzy matching is skipped for 0-1 char prefixes (where it only
+  ever produced noise).
+- **`cd` no longer suggests a deleted directory.** A `cd dev/sh-autocomplete/`
+  resurrected from history/transitions was offered even after the folder was
+  removed, so accepting it failed with "no such file or directory". cd-path
+  candidates from history and transitions are now dropped when the target
+  directory no longer exists (a cheap stat, cd-context only).
+
 ## v0.6.7 — 2026-07-08
 
 ### Fixed
