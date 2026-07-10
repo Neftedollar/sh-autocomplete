@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.6.9 — 2026-07-08
+
+### Fixed
+- **Duplicate rows in completion menus.** A history line stored with trailing
+  whitespace (e.g. `clr `) produced a candidate whose `insert_text` differed
+  from the clean `clr` only by an invisible space, so dedup-by-insert_text let
+  both through and the menu showed two identical-looking rows (one "Provided by
+  current shell context", one "Previously executed command"). History,
+  runtime-history and transition candidates are now trimmed before dedup.
+
 ## v0.6.8 — 2026-07-08
 
 ### Fixed
