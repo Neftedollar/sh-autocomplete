@@ -2711,6 +2711,10 @@ fn project_history_candidate(
     entry: &str,
     parsed: &ParsedContext,
 ) -> Option<(String, String, String)> {
+    // Trailing/leading whitespace in a stored history line (e.g. `clr `) would
+    // otherwise yield a candidate distinct from `clr`, escaping dedup-by-
+    // insert_text and rendering as an invisible duplicate menu row.
+    let entry = entry.trim();
     if matches!(parsed.role, TokenRole::Command) {
         return Some((
             entry.to_string(),
@@ -3412,6 +3416,28 @@ mod tests {
             project_history_candidate("bash script.sh", &parsed).expect("arg candidate");
         assert_eq!(token, "script.sh");
         assert_eq!(kind, "subcommand");
+    }
+
+    #[test]
+    fn project_history_candidate_trims_whitespace_so_dupes_dedup() {
+        let parsed = ParsedContext {
+            line_before_cursor: "clr".to_string(),
+            tokens: vec!["clr".to_string()],
+            active_token: "clr".to_string(),
+            active_index: 0,
+            role: TokenRole::Command,
+            command: None,
+            prev_token: None,
+            project_markers: Vec::new(),
+            open_quote: None,
+        };
+        // A stored history line with a trailing space must produce the same
+        // insert_text as the clean form, so both collapse to one row under
+        // dedup-by-insert_text (no invisible duplicate `clr ` vs `clr`).
+        let (with_space, _, _) = project_history_candidate("clr ", &parsed).unwrap();
+        let (clean, _, _) = project_history_candidate("clr", &parsed).unwrap();
+        assert_eq!(with_space, "clr");
+        assert_eq!(with_space, clean);
     }
 
     #[test]
