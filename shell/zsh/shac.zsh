@@ -710,6 +710,11 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
         # __shac_* lines without this adapter mis-rendering them.
         continue
       else
+        # A candidate row always has tab-separated fields; a tab-less line
+        # (e.g. a stray daemon status message that leaked onto stdout) is not a
+        # candidate and must never be rendered as a phantom row that erases the
+        # typed token (F1).
+        [[ "$line" != *$'\t'* ]] && continue
         local -a fields
         fields=("${(ps:\t:)line}")
         _shac_decode "${fields[1]:-}"

@@ -135,6 +135,9 @@ if [[ -z "${_SHAC_BASH_LOADED:-}" ]]; then
         # show a tip in, and they must not be mistaken for a candidate row.
         continue
       else
+        # A candidate row always has tab-separated fields; a tab-less line (a
+        # stray daemon status message on stdout) is not a candidate (F1).
+        [[ "$resp_line" != *$'\t'* ]] && continue
         local -a fields
         IFS=$'\t' read -r -a fields <<< "$resp_line"
         _shac_decode "${fields[1]:-}"

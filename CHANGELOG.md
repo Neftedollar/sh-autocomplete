@@ -1,5 +1,26 @@
 # Changelog
 
+## v0.6.11 — 2026-07-11
+
+Wire-protocol hardening from the holistic Fable review (the seam three focused
+reviews each assumed the other owned).
+
+### Fixed
+- **A daemon-start status line no longer erases your typed token (F1).** When the
+  daemon was down (first shell after boot, after a crash, or `shac daemon stop`),
+  `complete` auto-started it and printed `started`/`running` to **stdout — the
+  same stream the widgets parse as completion rows** — so `cd sr<Tab>` opened a
+  menu whose blank first row was applied, deleting the `sr`. The auto-start path
+  is now silent (`ensure_daemon` never prints); interactive `shac daemon start`
+  still reports status. All three adapters additionally ignore any tab-less line
+  as a non-candidate (defense in depth).
+- **Empty `request_id` field no longer shifts wire parsing (F2).** A
+  zero-candidate response emitted an empty field; zsh's `${(ps:\t:)}` elides
+  empty elements and bash's `IFS=$'\t' read -a` collapses consecutive tabs, so
+  both misread the following field — in bash that produced a non-numeric
+  `--accepted-request-id` and **silently dropped the recorded command**. The id
+  now defaults to `0` (a non-empty, non-matching sentinel).
+
 ## v0.6.10 — 2026-07-11
 
 Fixes from a three-lens Fable review (engine, release pipeline, usability).
