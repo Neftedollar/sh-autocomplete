@@ -5,8 +5,7 @@ use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::Result;
 
@@ -197,14 +196,24 @@ fn upsert_static_docs(db: &AppDb, command: &str) -> Result<()> {
     Ok(())
 }
 
-/// Upsert docs by running `<cmd> --help`. Caller MUST verify that `command`
-/// is not a GUI app via `is_gui_app` first — this function will happily
-/// shell out to anything. Falls back to static_docs if help parse yields
-/// nothing (covers tools that print help to a man page or stderr).
+/// Upsert docs for `command`, preferring the cleanest source for flag/subcommand
+/// completion. Caller MUST verify that `command` is not a GUI app via
+/// `is_gui_app` first — this function will happily shell out to anything.
+///
+/// Priority: bundled `static_docs` (curated, highest quality) → `<cmd> --help`
+/// (concise, structured flag list — ideal for completion) → `man` (fallback for
+/// tools whose `--help` is empty or prints only to a man page). `--help` is
+/// primary because its terse per-flag rows parse far more cleanly than man's
+/// prose; man is the safety net, not the default.
+///
+/// NB: before F10 fixed the shellout pipe-buffer deadlock, `man` silently
+/// timed out on any page over ~64 KiB, so `--help` was the de-facto primary
+/// source regardless of ordering. Making the order explicit here keeps that
+/// observed behavior stable now that `man` actually works.
 fn upsert_docs_with_help_shellout(db: &AppDb, command: &str) -> Result<()> {
     let docs = static_docs(command)
-        .or_else(|| parse_man_output(command))
         .or_else(|| parse_help_output(command))
+        .or_else(|| parse_man_output(command))
         .unwrap_or_default();
     if !docs.is_empty() {
         db.replace_docs_for_command(command, &docs)?;
@@ -253,7 +262,7 @@ fn is_subcommand_name(token: &str) -> bool {
 
 fn parse_help_output(command: &str) -> Option<Vec<StoredDoc>> {
     let output = run_help_with_timeout(command, HELP_TIMEOUT)?;
-    if !output.status.success() && output.stdout.is_empty() {
+    if !output.success && output.stdout.is_empty() {
         return None;
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -302,58 +311,27 @@ fn parse_help_text(command: &str, stdout: &str) -> Vec<StoredDoc> {
     docs
 }
 
-fn run_help_with_timeout(command: &str, timeout: Duration) -> Option<std::process::Output> {
-    let mut child = Command::new(command)
-        .arg("--help")
+fn run_help_with_timeout(command: &str, timeout: Duration) -> Option<crate::proc::CapturedOutput> {
+    let mut cmd = Command::new(command);
+    cmd.arg("--help")
         .stdin(Stdio::null())
-        .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .env("TERM", "dumb")
         .env("NO_COLOR", "1")
         .env_remove("DISPLAY")
-        .env_remove("WAYLAND_DISPLAY")
-        .spawn()
-        .ok()?;
-    let start = Instant::now();
-    loop {
-        if child.try_wait().ok()?.is_some() || start.elapsed() >= timeout {
-            break;
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
-    if start.elapsed() >= timeout {
-        let _ = child.kill();
-    }
-    child.wait_with_output().ok()
+        .env_remove("WAYLAND_DISPLAY");
+    crate::proc::run_capture(cmd, timeout)
 }
 
 fn parse_man_output(command: &str) -> Option<Vec<StoredDoc>> {
-    let mut child = Command::new("man")
-        .args(["-P", "cat", command])
+    let mut cmd = Command::new("man");
+    cmd.args(["-P", "cat", command])
         .stdin(Stdio::null())
-        .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .env("MANWIDTH", "200")
-        .env("MANPAGER", "cat")
-        .spawn()
-        .ok()?;
-    let start = Instant::now();
-    let timed_out = loop {
-        if child.try_wait().ok()?.is_some() {
-            break false;
-        }
-        if start.elapsed() >= MAN_TIMEOUT {
-            break true;
-        }
-        thread::sleep(Duration::from_millis(10));
-    };
-    if timed_out {
-        let _ = child.kill();
-        let _ = child.wait();
-        return None;
-    }
-    let output = child.wait_with_output().ok()?;
-    if !output.status.success() || output.stdout.is_empty() {
+        .env("MANPAGER", "cat");
+    let output = crate::proc::run_capture(cmd, MAN_TIMEOUT)?;
+    if !output.success || output.stdout.is_empty() {
         return None;
     }
     let raw = String::from_utf8_lossy(&output.stdout);

@@ -124,6 +124,12 @@ pub struct AppConfig {
     /// diagnostics. There is no learner reading this data anymore, so the
     /// only trade-off is diagnostics depth vs. how long local data lingers.
     pub telemetry_retention_days: u32,
+    /// How many days of recorded shell-command history (`history_events`) the
+    /// background prune keeps. This is the corpus that powers history-based
+    /// completion and learned command transitions, so it defaults high (one
+    /// year) to keep suggestions useful; `0` prunes everything each cycle for
+    /// users who don't want persistent history at all.
+    pub history_retention_days: u32,
 }
 
 impl Default for AppConfig {
@@ -136,6 +142,7 @@ impl Default for AppConfig {
             max_results: 12,
             daemon_timeout_ms: 150,
             telemetry_retention_days: 30,
+            history_retention_days: 365,
         }
     }
 }
@@ -181,10 +188,22 @@ impl AppPaths {
     }
 
     pub fn ensure(&self) -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
         fs::create_dir_all(&self.config_dir).context("create config dir")?;
         fs::create_dir_all(&self.data_dir).context("create data dir")?;
         fs::create_dir_all(&self.state_dir).context("create state dir")?;
         fs::create_dir_all(&self.shell_dir).context("create shell dir")?;
+        // These dirs hold the command-history DB and the control socket. A
+        // world-traversable dir would let another local user read the entire
+        // shell history or connect to the unauthenticated socket (F5). chmod is
+        // best-effort — ignore on filesystems that don't support unix modes.
+        for dir in [&self.config_dir, &self.data_dir, &self.state_dir] {
+            let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
+        }
+        // The history DB itself, 0600 (defense in depth beyond the 0700 dir).
+        if self.db_file.exists() {
+            let _ = fs::set_permissions(&self.db_file, fs::Permissions::from_mode(0o600));
+        }
         Ok(())
     }
 }
@@ -215,6 +234,7 @@ impl AppConfig {
             "max_results" => Some(self.max_results.to_string()),
             "daemon_timeout_ms" => Some(self.daemon_timeout_ms.to_string()),
             "telemetry_retention_days" => Some(self.telemetry_retention_days.to_string()),
+            "history_retention_days" => Some(self.history_retention_days.to_string()),
             "ranking.prefix_score" => Some(self.ranking.prefix_score.to_string()),
             "ranking.fuzzy_score" => Some(self.ranking.fuzzy_score.to_string()),
             "ranking.global_usage_score" => Some(self.ranking.global_usage_score.to_string()),
@@ -253,6 +273,7 @@ impl AppConfig {
             "max_results" => self.max_results = value.parse()?,
             "daemon_timeout_ms" => self.daemon_timeout_ms = value.parse()?,
             "telemetry_retention_days" => self.telemetry_retention_days = value.parse()?,
+            "history_retention_days" => self.history_retention_days = value.parse()?,
             "ranking.prefix_score" => self.ranking.prefix_score = value.parse()?,
             "ranking.fuzzy_score" => self.ranking.fuzzy_score = value.parse()?,
             "ranking.global_usage_score" => self.ranking.global_usage_score = value.parse()?,
@@ -303,6 +324,55 @@ mod tests {
     use super::*;
 
     #[test]
+    fn ensure_sets_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let base = tmp.path();
+        let config_dir = base.join("config");
+        let data_dir = base.join("data");
+        let state_dir = base.join("state");
+        let paths = AppPaths {
+            config_file: config_dir.join("config.toml"),
+            db_file: data_dir.join("shac.db"),
+            socket_file: state_dir.join("shacd.sock"),
+            pid_file: state_dir.join("shacd.pid"),
+            shell_dir: config_dir.join("shell"),
+            config_dir: config_dir.clone(),
+            data_dir: data_dir.clone(),
+            state_dir: state_dir.clone(),
+        };
+
+        // First ensure: dirs are created 0700. The db doesn't exist yet, so
+        // its chmod is skipped without error.
+        paths.ensure().expect("ensure creates dirs");
+        for dir in [&config_dir, &data_dir, &state_dir] {
+            let mode = fs::metadata(dir)
+                .expect("dir metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(
+                mode,
+                0o700,
+                "{} should be 0700, got {mode:o}",
+                dir.display()
+            );
+        }
+
+        // Simulate a pre-existing history DB with loose perms, then re-run
+        // ensure: it must tighten the db to 0600 (F5 defense in depth).
+        fs::write(&paths.db_file, b"x").expect("seed db");
+        fs::set_permissions(&paths.db_file, fs::Permissions::from_mode(0o644)).expect("loosen db");
+        paths.ensure().expect("ensure tightens db perms");
+        let db_mode = fs::metadata(&paths.db_file)
+            .expect("db metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(db_mode, 0o600, "db file should be 0600, got {db_mode:o}");
+    }
+
+    #[test]
     fn telemetry_retention_days_defaults_to_30() {
         assert_eq!(AppConfig::default().telemetry_retention_days, 30);
     }
@@ -344,5 +414,45 @@ mod tests {
         let raw = toml::to_string_pretty(&config).expect("serialize config");
         let parsed: AppConfig = toml::from_str(&raw).expect("parse config");
         assert_eq!(parsed.telemetry_retention_days, 7);
+    }
+
+    #[test]
+    fn history_retention_days_defaults_to_365() {
+        assert_eq!(AppConfig::default().history_retention_days, 365);
+    }
+
+    #[test]
+    fn history_retention_days_get_set_roundtrip() {
+        let mut config = AppConfig::default();
+        assert_eq!(
+            config.get_key("history_retention_days").as_deref(),
+            Some("365")
+        );
+
+        config
+            .set_key("history_retention_days", "0")
+            .expect("set to 0 (no persistent history)");
+        assert_eq!(config.history_retention_days, 0);
+
+        config
+            .set_key("history_retention_days", "730")
+            .expect("set to 730");
+        assert_eq!(config.history_retention_days, 730);
+
+        assert!(
+            config.set_key("history_retention_days", "-5").is_err(),
+            "negative retention must be rejected"
+        );
+    }
+
+    #[test]
+    fn history_retention_days_survives_toml_roundtrip() {
+        let config = AppConfig {
+            history_retention_days: 90,
+            ..AppConfig::default()
+        };
+        let raw = toml::to_string_pretty(&config).expect("serialize config");
+        let parsed: AppConfig = toml::from_str(&raw).expect("parse config");
+        assert_eq!(parsed.history_retention_days, 90);
     }
 }

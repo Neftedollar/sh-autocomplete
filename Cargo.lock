@@ -610,12 +610,13 @@ dependencies = [
 
 [[package]]
 name = "shac"
-version = "0.6.11"
+version = "0.6.12"
 dependencies = [
  "anyhow",
  "blake3",
  "clap",
  "dirs",
+ "libc",
  "regex",
  "rusqlite",
  "serde",

@@ -28,6 +28,12 @@ const TRANSITION_MAX_GAP_SECS: i64 = 600;
 /// other pruning, so inline mode can write tens of MB/day without this cap.
 pub const COMPLETION_TELEMETRY_RETENTION_DAYS: i64 = 30;
 
+/// Default retention window for recorded shell-command history
+/// (`history_events`). This is the corpus behind history completion and
+/// learned transitions, so it defaults to a full year — long enough for
+/// suggestions to stay useful, but still bounded so the DB can't grow forever.
+pub const HISTORY_RETENTION_DAYS: i64 = 365;
+
 #[derive(Debug, Clone)]
 pub struct StoredDoc {
     pub command: String,
@@ -108,6 +114,12 @@ impl AppDb {
         let conn = Connection::open(path).context("open sqlite db")?;
         conn.busy_timeout(Duration::from_millis(1_000))
             .context("set sqlite busy timeout")?;
+        // The command-history DB must not be world-readable (F5). Best-effort
+        // (no-op for the `:memory:` test db, which has no backing file).
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        }
         let db = Self { conn };
         db.init()?;
         Ok(db)
@@ -607,11 +619,17 @@ impl AppDb {
             }
 
             let _ = self.mark_completion_accepted(&request.command, &request.cwd, &classified);
-        }
 
-        // Hybrid-cd: extract `cd <path>` events into paths_index for global frecency.
-        if let Some(target) = extract_cd_target(&request.command) {
-            let _ = self.upsert_path_index(&target, "cwd_event", false, None);
+            // Hybrid-cd: extract `cd <path>` events into paths_index for
+            // global frecency. Gated on the same clean-personalization signal
+            // as transitions/profiles (F4) so pasted or legacy/imported `cd`s
+            // don't seed path-jump suggestions from directories the user never
+            // actually navigated to interactively. Bulk import seeds
+            // paths_index through its own path (see import.rs), so cold-start
+            // frecency is unaffected.
+            if let Some(target) = extract_cd_target(&request.command) {
+                let _ = self.upsert_path_index(&target, "cwd_event", false, None);
+            }
         }
 
         Ok(classified)
@@ -1467,6 +1485,34 @@ impl AppDb {
                 params![cutoff],
             )
             .context("prune completion telemetry")?;
+        Ok(deleted)
+    }
+
+    /// Deletes `history_events` rows older than `retention_days` (the
+    /// configured `history_retention_days`, default [`HISTORY_RETENTION_DAYS`]).
+    /// This is the recorded shell-command corpus behind history completion and
+    /// learned transitions. `retention_days <= 0` prunes everything on the next
+    /// cycle, for users who don't want persistent history at all. Returns the
+    /// number of rows pruned.
+    ///
+    /// Retention is measured from whichever clock is more recent: the command's
+    /// own timestamp (live rows) or when it entered our DB (`imported_at`, for
+    /// imported rows). Plain (non-`EXTENDED_HISTORY`) zsh history — the zsh
+    /// default — carries no timestamps, so `import` stores `ts = 0` and keeps
+    /// the real clock in `imported_at`. Pruning on `ts` alone would delete the
+    /// entire imported corpus on the first tick (and re-arm on every re-import,
+    /// since the `import_hash` rows vanish with it). A row survives while
+    /// EITHER clock is inside the window.
+    pub fn prune_history_events(&self, retention_days: i64) -> Result<usize> {
+        let cutoff = unix_ts() - retention_days.max(0) * 86_400;
+        let deleted = self
+            .conn
+            .execute(
+                "DELETE FROM history_events
+                 WHERE ts < ?1 AND (imported_at IS NULL OR imported_at < ?1)",
+                params![cutoff],
+            )
+            .context("prune history events")?;
         Ok(deleted)
     }
 
@@ -2507,6 +2553,95 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM completion_requests", [], |r| r.get(0))
             .unwrap();
         assert_eq!(remaining_requests, 0);
+    }
+
+    #[test]
+    fn prune_history_events_removes_old_keeps_recent() {
+        let db = test_db();
+        let now = unix_ts();
+        // One row older than the 365-day default window, one recent.
+        for (ts, cmd) in [(now - 400 * 86_400, "ls -old"), (now - 1, "ls -recent")] {
+            db.conn
+                .execute(
+                    "INSERT INTO history_events(ts, cwd, command) VALUES (?1, '/tmp', ?2)",
+                    params![ts, cmd],
+                )
+                .expect("insert history");
+        }
+
+        let deleted = db.prune_history_events(365).expect("prune history");
+        assert_eq!(deleted, 1, "only the 400-day-old row is pruned");
+
+        let surviving: Vec<String> = db
+            .conn
+            .prepare("SELECT command FROM history_events ORDER BY ts")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(surviving, vec!["ls -recent".to_string()]);
+    }
+
+    /// Plain (non-EXTENDED) zsh history imports store `ts = 0` with the real
+    /// clock in `imported_at`. Retention must key off `imported_at` for those,
+    /// or a single prune tick wipes the whole imported corpus. Recently-imported
+    /// zero-ts rows survive; a stale import (imported > window ago) is pruned.
+    #[test]
+    fn prune_history_events_keeps_recently_imported_zero_ts() {
+        let db = test_db();
+        let now = unix_ts();
+        for (ts, imported_at, cmd) in [
+            (0_i64, now - 1, "imported-fresh"), // zero ts, just imported
+            (0_i64, now - 400 * 86_400, "imported-stale"), // imported > 365d ago
+        ] {
+            db.conn
+                .execute(
+                    "INSERT INTO history_events(ts, cwd, command, imported_at)
+                     VALUES (?1, '/tmp', ?2, ?3)",
+                    params![ts, cmd, imported_at],
+                )
+                .expect("insert imported history");
+        }
+
+        let deleted = db.prune_history_events(365).expect("prune history");
+        assert_eq!(deleted, 1, "only the stale import is pruned");
+
+        let surviving: Vec<String> = db
+            .conn
+            .prepare("SELECT command FROM history_events")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            surviving,
+            vec!["imported-fresh".to_string()],
+            "a freshly imported zero-ts row must survive retention"
+        );
+    }
+
+    /// `history_retention_days = 0` prunes everything on the next cycle, for
+    /// users who don't want any persistent shell history.
+    #[test]
+    fn prune_history_events_zero_retention_prunes_everything() {
+        let db = test_db();
+        let now = unix_ts();
+        db.conn
+            .execute(
+                "INSERT INTO history_events(ts, cwd, command) VALUES (?1, '/tmp', 'ls')",
+                params![now - 1],
+            )
+            .expect("insert history");
+
+        let deleted = db.prune_history_events(0).expect("prune");
+        assert_eq!(deleted, 1);
+        let remaining: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM history_events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(remaining, 0);
     }
 
     #[test]

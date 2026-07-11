@@ -77,20 +77,41 @@ if [[ -z "${_SHAC_BASH_LOADED:-}" ]]; then
   }
 
   _shac_bash_active_region() {
-    # Whitespace-delimited word spanning the cursor: everything before it
-    # goes in _shac_bash_before, everything from the next whitespace onward
-    # goes in _shac_bash_after, so an accept replaces the whole active token
-    # (not just the part left of the cursor). Naive/not quote-aware -- same
-    # heuristic the zsh widget uses; context::parse's quote-awareness governs
-    # what insert_text itself looks like, not where widgets splice it in.
+    # Word spanning the cursor, honoring shell quoting: whitespace inside a
+    # quoted (`"`/`'`) or backslash-escaped region does NOT split the token, so
+    # `cat "my fi<Tab>` completes the whole `"my fi` span rather than just the
+    # trailing `fi` and mangling the quote on splice (F6). Everything left of
+    # the token goes in _shac_bash_before, everything from the token's end
+    # onward in _shac_bash_after, so an accept replaces the whole active token.
+    # Mirrors the zsh widget's _shac_active_token_span.
     local base_line="$1" base_point="$2"
-    local left right token_prefix token_suffix
-    left="${base_line:0:base_point}"
-    right="${base_line:base_point}"
-    token_prefix="${left##*[[:space:]]}"
-    _shac_bash_before="${left:0:$(( ${#left} - ${#token_prefix} ))}"
-    token_suffix="${right%%[[:space:]]*}"
-    _shac_bash_after="${right#"$token_suffix"}"
+    local -i len=${#base_line} i=0 start=0 end=${#base_line} escaped=0
+    local quote="" c
+    while (( i < len )); do
+      c="${base_line:i:1}"
+      if (( escaped )); then
+        escaped=0
+      elif [[ "$c" == "\\" ]]; then
+        escaped=1
+      elif [[ "$c" == '"' || "$c" == "'" ]]; then
+        if [[ "$quote" == "$c" ]]; then
+          quote=""
+        elif [[ -z "$quote" ]]; then
+          quote="$c"
+        fi
+      elif [[ -z "$quote" && "$c" == [[:space:]] ]]; then
+        if (( i < base_point )); then
+          # Whitespace left of the cursor: the token starts after it.
+          start=$(( i + 1 ))
+        elif (( end == len )); then
+          # First whitespace at/after the cursor closes the token.
+          end=$i
+        fi
+      fi
+      i+=1
+    done
+    _shac_bash_before="${base_line:0:start}"
+    _shac_bash_after="${base_line:end}"
   }
 
   _shac_bash_byte_length() {
@@ -129,6 +150,12 @@ if [[ -z "${_SHAC_BASH_LOADED:-}" ]]; then
         local -a header
         IFS=$'\t' read -r -a header <<< "$resp_line"
         _shac_decode "${header[1]:-}"
+        # "0" is the daemon's no-traceable-request sentinel (a zero-candidate
+        # response keeps the TSV field non-empty for wire alignment — F2).
+        # Treat it as "no request" so the 30s accept heuristic below never
+        # sends --accepted-request-id 0 for a no-match Tab, which the server
+        # would mis-attribute to an unrelated recent request (codex/#40).
+        [[ "$REPLY" == "0" ]] && REPLY=""
         request_id="$REPLY"
       elif [[ "$resp_line" == __shac_*$'\t'* ]]; then
         # Skip other sentinel rows (e.g. __shac_tip) -- bash has no menu to
@@ -149,7 +176,67 @@ if [[ -z "${_SHAC_BASH_LOADED:-}" ]]; then
       _shac_last_request_id="$request_id"
       _shac_last_completion_line="$line"
       _shac_last_completion_ts="$(date +%s)"
+    else
+      # A no-request (zero-candidate, "0" sentinel) response: clear any stale
+      # accept-tracking so a later command can't be attributed to an unrelated
+      # earlier completion, matching the zsh adapter's unconditional reset.
+      _shac_last_request_id=""
+      _shac_last_completion_line=""
+      _shac_last_completion_ts=""
     fi
+  }
+
+  _shac_bash_default_fallback() {
+    # readline's own Tab is unreachable from a bind -x handler, so when shac
+    # has no candidate (daemon down/disabled/timed out, or no match) Tab would
+    # otherwise be a dead key (codex/#28). Emulate the default filesystem
+    # completion for the active token so Tab keeps working. Scope guard: only
+    # SIMPLE tokens (no quoting/escaping, no `~`) — for those we can't safely
+    # reconstruct the user's intent, so leave them a no-op rather than risk a
+    # wrong splice. Multi-match LISTING is out of scope (a bind -x handler
+    # can't cleanly redraw the completion list); we still insert the longest
+    # common prefix, which is the useful part.
+    local token="$1"
+    case "$token" in
+      *[\'\"\\~]*) return ;;
+    esac
+    # At the command position (nothing but whitespace before the token) real
+    # readline completes command NAMES, not filenames; elsewhere it completes
+    # files. Match that so a down-daemon `git<Tab>` at the prompt doesn't turn
+    # into a filename prefix (codex/#28 follow-up).
+    local genflag="-f" is_cmd_position=0
+    if [[ "$_shac_bash_before" =~ ^[[:space:]]*$ ]]; then
+      genflag="-c"
+      is_cmd_position=1
+    fi
+    # NB: a filename containing a literal newline fractures into two "matches"
+    # here (compgen is newline-delimited), so the common-prefix may splice a
+    # path that doesn't exist — a harmless no-op on the next Tab. Not worth the
+    # complexity of NUL-delimited parsing for so pathological an input.
+    local -a matches=()
+    local m
+    while IFS= read -r m; do matches+=("$m"); done < <(compgen "$genflag" -- "$token" 2>/dev/null)
+    (( ${#matches[@]} == 0 )) && return
+    local completion="${matches[0]}"
+    if (( ${#matches[@]} == 1 )); then
+      # Trailing slash only makes sense for a uniquely-completed directory.
+      (( is_cmd_position == 0 )) && [[ -d "$completion" ]] && completion="${completion%/}/"
+    else
+      # Longest common prefix across all matches.
+      for m in "${matches[@]:1}"; do
+        while [[ "$m" != "$completion"* ]]; do
+          completion="${completion%?}"
+          [[ -z "$completion" ]] && return
+        done
+      done
+    fi
+    # Only act if it actually extends what's typed.
+    [[ "$completion" == "$token" ]] && return
+    local escaped
+    printf -v escaped '%q' "$completion"
+    READLINE_LINE="${_shac_bash_before}${escaped}${_shac_bash_after}"
+    _shac_bash_byte_length "${_shac_bash_before}${escaped}"
+    READLINE_POINT=$REPLY
   }
 
   _shac_bash_complete() {
@@ -165,16 +252,27 @@ if [[ -z "${_SHAC_BASH_LOADED:-}" ]]; then
       return
     fi
 
-    _shac_bash_active_region "$line" "$point"
-    _shac_bash_cycle_index=0
-
-    # READLINE_POINT is a byte offset; --cursor wants characters (F9).
+    # READLINE_POINT is a BYTE offset; both the daemon (--cursor) and the
+    # quote-aware region walker index CHARACTERS, so convert once up front and
+    # feed the char offset to both. Passing the raw byte point to
+    # active_region selected the wrong token when multibyte text sat before a
+    # mid-line cursor, e.g. `mv Café tmp` cursor after `Café` grabbed `tmp` (F9).
     local cursor_chars
     _shac_bash_char_point "$line" "$point"
     cursor_chars="$REPLY"
+
+    _shac_bash_active_region "$line" "$cursor_chars"
+    _shac_bash_cycle_index=0
+
     _shac_bash_request "$line" "$cursor_chars"
 
-    [[ ${#_shac_bash_candidates[@]} -eq 0 ]] && return
+    if [[ ${#_shac_bash_candidates[@]} -eq 0 ]]; then
+      # The active token is the region between the before/after splice points.
+      local token="${line:${#_shac_bash_before}}"
+      token="${token%"$_shac_bash_after"}"
+      _shac_bash_default_fallback "$token"
+      return
+    fi
     _shac_bash_splice_candidate
   }
 

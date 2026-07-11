@@ -307,6 +307,35 @@ shac config set telemetry_retention_days 0    # max privacy: prune everything on
 A running daemon picks up the new value on its next prune tick — no restart
 needed.
 
+### Command-history retention
+
+Recorded shell commands (`history_events`) are the corpus behind history-based
+completion and learned command transitions. The daemon prunes rows older than
+`history_retention_days` (default 365) on the same tick as telemetry, so the
+database stays bounded over months of use without throwing away suggestions
+you still benefit from.
+
+```bash
+shac config set history_retention_days 90   # keep three months
+shac config set history_retention_days 0    # prune history_events every tick
+```
+
+Retention prunes the `history_events` table. Aggregates derived from it —
+learned `transitions` and the `cd` frecency index (`paths_index`) — are not
+time-stamped and are **not** cleared by retention, so `0` bounds the raw log
+but is not a privacy wipe. To erase all learned personalization, run
+`shac reset-personalization`.
+
+Two commands are never recorded in the first place:
+
+- Anything typed with a **leading space** — so a one-off ` export TOKEN=…` or
+  ` cd /private` leaves no trace in history, transitions, or the `cd` frecency
+  index. On zsh/fish this is enforced by shac directly (the record hook sees
+  the raw line). On bash, shac records via `history`, which drops the leading
+  space, so this relies on bash's own `HISTCONTROL=ignorespace` (which then
+  never stores the command for shac to see) — set it if you want the marker.
+- Everything, while shac is disabled (`shac config set enabled false`).
+
 ## Trust-aware migration
 
 When this version starts on an existing database, old personalization data is kept and marked as `legacy`.

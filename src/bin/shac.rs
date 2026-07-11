@@ -500,6 +500,16 @@ fn main() -> Result<()> {
             CompletionArgs::from_arg_matches(sub).unwrap_or_else(|e| e.exit()),
         ),
         Some(("record-command", sub)) => {
+            // Honor the kill-switch client-side: when shac is disabled, record
+            // nothing and don't even `ensure_daemon` (starting a daemon just to
+            // drop the record). The daemon caches `enabled` at startup, so
+            // relying on its gate alone left `config set enabled false`
+            // ineffective on a running daemon until restart — while completions
+            // went quiet client-side, so the user reasonably believed shac was
+            // off yet recording continued (review P1).
+            if shac_disabled(&paths)? {
+                return Ok(());
+            }
             ensure_daemon(&paths)?;
             let a = RecordArgs::from_arg_matches(sub).unwrap_or_else(|e| e.exit());
             send_request(
@@ -1910,27 +1920,37 @@ fn print_completion_response(
                 .and_then(|value| value.as_str())
                 .unwrap_or_default();
             let item_ctx = item_token_context(&ctx, typed_home_user, &item);
-            // A whole command line resurrected from history/transitions (kind
-            // `history`/`command`, multi-word) replaces the buffer and is
-            // already valid shell — per-token escaping would turn `cd ..` into
-            // `cd\ ..` (one broken word that executes as "command not found: cd
-            // .."). Single-token candidates (paths, options, subcommands) are
-            // still escaped. Mirrors the widget's `_shac_selected_is_full_line`.
-            let is_full_line_command =
-                matches!(kind, "history" | "command") && item_key.contains(' ');
-            let quoted_insert = if is_full_line_command {
+            // Two daemon-computed bits, kept separate to avoid the drift F7/F8
+            // set out to kill. `verbatim`: the candidate is already a whole
+            // valid shell line (a multi-word history/transition entry at any
+            // command position — buffer start OR after `&&`/`|`/`;`), so
+            // per-token escaping (which turns `cd ..` into `cd\ ..`, one broken
+            // word) must be skipped. `full_line`: Enter may run it — only when
+            // it replaces the whole buffer — and is emitted as field 7 so every
+            // widget keys Enter/insert off the same bit. Single-token candidates
+            // (paths, options, subcommands) get neither and are escaped.
+            let verbatim = item
+                .get("verbatim")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let full_line = item
+                .get("full_line")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let quoted_insert = if verbatim {
                 insert_text.to_string()
             } else {
                 quote_token(shell, &item_ctx, insert_text)
             };
             println!(
-                "{}\t{}\t{}\t{}\t{}\t{}",
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}",
                 encode_field(item_key),
                 encode_field(&quoted_insert),
                 encode_field(display),
                 encode_field(kind),
                 encode_field(source),
-                encode_field(description)
+                encode_field(description),
+                if full_line { "1" } else { "0" }
             );
         }
         if let Some(tip) = response.get("tip").and_then(|v| v.as_object()) {
@@ -2116,7 +2136,15 @@ fn shac_disabled(paths: &AppPaths) -> Result<bool> {
 
 fn request_timeout_for_action(action: &str, base_timeout_ms: u64) -> Duration {
     let timeout_ms = match action {
-        "reindex" => base_timeout_ms.max(1_500),
+        // `reindex` rescans every PATH command and rebuilds the doc index
+        // synchronously in the daemon; on a machine with a large PATH — or a
+        // slow CI runner — that legitimately takes several seconds. It is an
+        // explicit, occasional command, not a keystroke-latency path, so give
+        // the client a generous ceiling. A too-tight one makes the client
+        // report a "read daemon response" failure while the daemon is still
+        // working and actually finishing the reindex (the recurring CI flake
+        // in reindex_default_flags_succeeds / cli_daemon_records_*).
+        "reindex" => base_timeout_ms.max(30_000),
         "stats" | "migration-status" => base_timeout_ms.max(500),
         _ => base_timeout_ms.max(1),
     };
@@ -2372,6 +2400,27 @@ mod first_run_ux_tests {
         assert_eq!(fmt_count(1_000), "1,000");
         assert_eq!(fmt_count(12_847), "12,847");
         assert_eq!(fmt_count(1_234_567), "1,234,567");
+    }
+
+    #[test]
+    fn reindex_gets_a_generous_timeout_floor() {
+        // A tiny daemon_timeout_ms (the keystroke-latency default) must not
+        // bound a full-PATH reindex: the client would give up while the daemon
+        // is still working. reindex floors at 30s regardless.
+        assert_eq!(
+            request_timeout_for_action("reindex", 150),
+            Duration::from_millis(30_000)
+        );
+        // A larger configured timeout still wins if it exceeds the floor.
+        assert_eq!(
+            request_timeout_for_action("reindex", 45_000),
+            Duration::from_millis(45_000)
+        );
+        // Latency-sensitive actions keep their small ceilings.
+        assert_eq!(
+            request_timeout_for_action("complete", 150),
+            Duration::from_millis(150)
+        );
     }
 
     #[test]

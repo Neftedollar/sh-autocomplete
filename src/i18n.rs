@@ -38,8 +38,27 @@ impl Catalog {
 
     /// Build catalog: bundled `en` + bundled `<lang>` (none yet) + user override at
     /// `<config_dir>/locales/<lang>.toml` and/or `<config_dir>/locales/en.toml`.
+    /// A safe locale token: 2–16 chars of ASCII alphanumerics plus `-`/`_`
+    /// (e.g. `en`, `en-US`, `zh_CN`). Rejects anything path-shaped (`/`, `.`,
+    /// `..`, absolute) — see `build`.
+    pub fn is_safe_lang_check(lang: &str) -> bool {
+        (2..=16).contains(&lang.len())
+            && lang
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    }
+
     pub fn build(config_dir: &Path, lang: &str) -> Self {
         let mut catalog = Self::bundled_en();
+        // `lang` can come from the untrusted `SHAC_LOCALE` request env. A `/`,
+        // `..`, or absolute path would make `Path::join` read an arbitrary
+        // `.toml` (F5); an unbounded string would also bloat the catalog cache.
+        // Restrict to a plain locale token (e.g. `en`, `pt-BR`); else fall back.
+        let lang = if Self::is_safe_lang_check(lang) {
+            lang
+        } else {
+            "en"
+        };
         let user_lang = config_dir.join("locales").join(format!("{lang}.toml"));
         if lang != "en" && user_lang.exists() {
             match fs::read_to_string(&user_lang) {

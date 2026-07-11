@@ -9,7 +9,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use clap::Parser;
 use shac::config::{AppConfig, AppPaths};
-use shac::db::{AppDb, COMPLETION_TELEMETRY_RETENTION_DAYS};
+use shac::db::{AppDb, COMPLETION_TELEMETRY_RETENTION_DAYS, HISTORY_RETENTION_DAYS};
 use shac::engine::Engine;
 use shac::indexer;
 use shac::protocol::RecordCommandRequest;
@@ -60,6 +60,26 @@ fn main() -> Result<()> {
         fs::remove_file(&paths.socket_file).ok();
     }
     let listener = UnixListener::bind(&paths.socket_file).context("bind unix socket")?;
+    // The control socket is unauthenticated (any local peer can `complete`,
+    // `stats`, or poison learning via `record-command`), so restrict it to the
+    // owner (F5). Best-effort chmod right after bind, then verify the ACTUAL
+    // mode once at startup: if the chmod silently failed (exotic FS) and the
+    // 0700 state dir didn't shield it either, warn rather than leaving the
+    // channel quietly reachable by other local users.
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&paths.socket_file, fs::Permissions::from_mode(0o600));
+        if let Ok(meta) = fs::metadata(&paths.socket_file) {
+            let mode = meta.permissions().mode() & 0o777;
+            if mode & 0o077 != 0 {
+                eprintln!(
+                    "shac: warning: control socket {} is group/other-accessible (mode {mode:o}); \
+                     other local users may be able to reach the daemon",
+                    paths.socket_file.display()
+                );
+            }
+        }
+    }
     // Only claim the pid-file after a successful bind, so a bind failure
     // never leaves an orphaned pid-file pointing at a process that's about
     // to exit.
@@ -125,11 +145,25 @@ fn main() -> Result<()> {
                     // takes effect without restarting the daemon — this is
                     // the user-facing privacy control, it should be
                     // responsive.
-                    let retention_days = AppConfig::load(&config_paths)
+                    let config = AppConfig::load(&config_paths).ok();
+                    let telemetry_days = config
+                        .as_ref()
                         .map(|c| c.telemetry_retention_days as i64)
                         .unwrap_or(COMPLETION_TELEMETRY_RETENTION_DAYS);
-                    if let Err(e) = db.prune_completion_telemetry(retention_days) {
+                    if let Err(e) = db.prune_completion_telemetry(telemetry_days) {
                         eprintln!("shac: telemetry prune error: {e}");
+                    }
+                    // Also cap the recorded shell-command history so the DB
+                    // can't grow without bound over months of use. Same
+                    // reload-per-tick rationale as telemetry: `shac config set
+                    // history_retention_days ...` takes effect without a
+                    // daemon restart.
+                    let history_days = config
+                        .as_ref()
+                        .map(|c| c.history_retention_days as i64)
+                        .unwrap_or(HISTORY_RETENTION_DAYS);
+                    if let Err(e) = db.prune_history_events(history_days) {
+                        eprintln!("shac: history prune error: {e}");
                     }
                     // bg indexer never shells out to `<cmd> --help`; only
                     // records names + paths and seeds bundled static_docs.

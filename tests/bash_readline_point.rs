@@ -1,6 +1,8 @@
 mod support;
 
+use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// MINOR fix: on the bash>=4 `bind -x` accept path, `_shac_bash_splice_candidate`
 /// (shell/bash/shac.bash) must set `READLINE_POINT` to a BYTE offset -- that's
@@ -95,5 +97,289 @@ fn splice_candidate_matches_byte_offset_for_ascii_only_prefix() {
     assert_eq!(
         point.parse::<usize>().expect("numeric READLINE_POINT"),
         before.len() + insert.len()
+    );
+}
+
+/// Drive `_shac_bash_active_region LINE POINT` and return the (before, after)
+/// splice regions it assigns. Like `run_splice`, this exercises the function
+/// directly by sourcing the script and reading the plain globals it sets.
+fn run_active_region(line: &str, point: usize) -> (String, String) {
+    let script_path = format!("{}/shell/bash/shac.bash", env!("CARGO_MANIFEST_DIR"));
+    let script = format!(
+        r#"
+source "{script_path}"
+_shac_bash_active_region {line:?} {point}
+printf '%s\n%s\n' "$_shac_bash_before" "$_shac_bash_after"
+"#,
+    );
+    let output = Command::new("bash")
+        .arg("-c")
+        .arg(&script)
+        .output()
+        .expect("run bash");
+    assert!(
+        output.status.success(),
+        "bash script failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // Two `printf %s\n` lines; a trailing empty region yields an empty line, so
+    // don't let `lines()` swallow it — index positionally.
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let parts: Vec<&str> = stdout.splitn(2, '\n').collect();
+    let before = parts.first().copied().unwrap_or_default().to_string();
+    let after = parts
+        .get(1)
+        .map(|rest| rest.strip_suffix('\n').unwrap_or(rest))
+        .unwrap_or_default()
+        .to_string();
+    (before, after)
+}
+
+#[test]
+fn active_region_splits_on_plain_whitespace() {
+    if !support::command_available("bash") {
+        eprintln!("skipping: bash unavailable");
+        return;
+    }
+
+    // Cursor at end of the last word: `foo` is the active token, `cat ` is the
+    // untouched prefix.
+    assert_eq!(run_active_region("cat foo", 7), ("cat ".into(), "".into()));
+    // Cursor inside a middle word: the trailing ` bar` is preserved in `after`.
+    assert_eq!(
+        run_active_region("cat foo bar", 5),
+        ("cat ".into(), " bar".into())
+    );
+}
+
+#[test]
+fn active_region_is_quote_and_escape_aware() {
+    if !support::command_available("bash") {
+        eprintln!("skipping: bash unavailable");
+        return;
+    }
+
+    // Whitespace inside double quotes must NOT split the token: the whole
+    // `"my fi` span is active, so a splice replaces it wholesale (F6).
+    assert_eq!(
+        run_active_region("cat \"my fi", 10),
+        ("cat ".into(), "".into())
+    );
+    // Same for single quotes...
+    assert_eq!(
+        run_active_region("echo 'a b", 9),
+        ("echo ".into(), "".into())
+    );
+    // ...and for a backslash-escaped space.
+    assert_eq!(
+        run_active_region("cat My\\ fi", 9),
+        ("cat ".into(), "".into())
+    );
+}
+
+#[test]
+fn active_region_uses_character_offsets_for_multibyte() {
+    if !support::command_available("bash") {
+        eprintln!("skipping: bash unavailable");
+        return;
+    }
+
+    // `mv Café tmp` — `Café` is 4 chars but 5 bytes. The cursor after `Café`
+    // is CHAR offset 7. `_shac_bash_complete` now converts READLINE_POINT
+    // (bytes) to chars before calling this, so the walker selects `Café`, not
+    // `tmp` — the F9 mid-line multibyte bug.
+    assert_eq!(
+        run_active_region("mv Café tmp", 7),
+        ("mv ".into(), " tmp".into())
+    );
+}
+
+/// Drive `_shac_bash_request` against a fake `shac` on PATH that emits
+/// `header_response`, and return the resulting `_shac_last_request_id`.
+fn last_request_id_after(header_response: &str) -> String {
+    let script_path = format!("{}/shell/bash/shac.bash", env!("CARGO_MANIFEST_DIR"));
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("shac-reqid-{}-{}", std::process::id(), nanos));
+    std::fs::create_dir_all(&dir).expect("mk fake bin dir");
+    let respfile = dir.join("resp.txt");
+    std::fs::write(&respfile, header_response).expect("write canned response");
+    let fake = dir.join("shac");
+    std::fs::write(
+        &fake,
+        format!("#!/bin/sh\ncat {:?}\n", respfile.to_string_lossy()),
+    )
+    .expect("write fake shac");
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).expect("chmod fake");
+
+    let script = format!(
+        r#"
+export PATH="{dir}:$PATH"
+source "{script_path}"
+# Preset a STALE id so the "0"/no-request path is verified to CLEAR it, not
+# merely leave it unset.
+_shac_last_request_id="STALE"
+_shac_bash_request "foobar" 6
+printf '%s' "$_shac_last_request_id"
+"#,
+        dir = dir.display(),
+        script_path = script_path,
+    );
+    let output = Command::new("bash")
+        .arg("-c")
+        .arg(&script)
+        .output()
+        .expect("run bash");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        output.status.success(),
+        "bash script failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).to_string()
+}
+
+/// Create a temp dir with the given entries (name, is_dir), then run
+/// `_shac_bash_default_fallback token` with `before`/`after` splice regions,
+/// returning the resulting (READLINE_LINE, READLINE_POINT). READLINE_LINE is
+/// preset to "PRESET" so a no-op (guarded token) is observable as unchanged.
+fn run_default_fallback(
+    entries: &[(&str, bool)],
+    before: &str,
+    after: &str,
+    token: &str,
+) -> (String, String) {
+    let script_path = format!("{}/shell/bash/shac.bash", env!("CARGO_MANIFEST_DIR"));
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("shac-fallback-{}-{}", std::process::id(), nanos));
+    std::fs::create_dir_all(&dir).expect("mk fallback dir");
+    for (name, is_dir) in entries {
+        if *is_dir {
+            std::fs::create_dir_all(dir.join(name)).expect("mk entry dir");
+        } else {
+            std::fs::write(dir.join(name), "").expect("touch entry");
+        }
+    }
+    let script = format!(
+        r#"
+cd "{dir}" || exit 1
+source "{script_path}"
+_shac_bash_before={before:?}
+_shac_bash_after={after:?}
+READLINE_LINE="PRESET"
+READLINE_POINT="99"
+_shac_bash_default_fallback {token:?}
+printf '%s\n%s' "$READLINE_LINE" "$READLINE_POINT"
+"#,
+        dir = dir.display(),
+        script_path = script_path,
+    );
+    let output = Command::new("bash")
+        .arg("-c")
+        .arg(&script)
+        .output()
+        .expect("run bash");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        output.status.success(),
+        "bash script failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let mut parts = stdout.splitn(2, '\n');
+    (
+        parts.next().unwrap_or_default().to_string(),
+        parts.next().unwrap_or_default().to_string(),
+    )
+}
+
+#[test]
+fn default_fallback_completes_unique_and_common_prefix() {
+    if !support::command_available("bash") {
+        eprintln!("skipping: bash unavailable");
+        return;
+    }
+
+    // Unique dir match gets completed with a trailing slash, spliced between
+    // the before/after regions.
+    let (line, point) = run_default_fallback(&[("Documents", true)], "cat ", "", "Doc");
+    assert_eq!(line, "cat Documents/");
+    assert_eq!(point, "14"); // byte length of "cat Documents/"
+
+    // Two matches: insert only the longest common prefix ("Do"), no slash.
+    let (line, _) =
+        run_default_fallback(&[("Documents", true), ("Downloads", true)], "cat ", "", "D");
+    assert_eq!(line, "cat Do");
+
+    // No match: leave the line untouched.
+    let (line, point) = run_default_fallback(&[("Documents", true)], "cat ", "", "zzz");
+    assert_eq!(line, "PRESET");
+    assert_eq!(point, "99");
+}
+
+#[test]
+fn default_fallback_completes_commands_not_files_at_command_position() {
+    if !support::command_available("bash") {
+        eprintln!("skipping: bash unavailable");
+        return;
+    }
+
+    // At the command position (empty `before`), a token that matches only a
+    // FILE in cwd must NOT be completed to that filename — readline completes
+    // command names there. `zzqx` matches the cwd file but no command, so the
+    // fallback is a no-op (line untouched).
+    let (line, _) = run_default_fallback(&[("zzqxfile.txt", false)], "", "", "zzqx");
+    assert_eq!(
+        line, "PRESET",
+        "a file match must not complete at the command position"
+    );
+
+    // Control: the same token DOES complete as a filename in an argument slot.
+    let (line, _) = run_default_fallback(&[("zzqxfile.txt", false)], "cat ", "", "zzqx");
+    assert_eq!(line, "cat zzqxfile.txt");
+}
+
+#[test]
+fn default_fallback_skips_quoted_and_tilde_tokens() {
+    if !support::command_available("bash") {
+        eprintln!("skipping: bash unavailable");
+        return;
+    }
+
+    // Tokens carrying quoting/escapes/tilde are left a no-op (can't safely
+    // reconstruct intent) — READLINE_LINE stays untouched.
+    for token in ["\"Doc", "~/Doc", "My\\ D"] {
+        let (line, _) = run_default_fallback(&[("Documents", true)], "cat ", "", token);
+        assert_eq!(line, "PRESET", "token {token:?} must be a no-op");
+    }
+}
+
+#[test]
+fn request_id_zero_sentinel_is_treated_as_no_request() {
+    if !support::command_available("bash") {
+        eprintln!("skipping: bash unavailable");
+        return;
+    }
+
+    // A zero-candidate response keeps the TSV request-id field non-empty for
+    // wire alignment (F2), sending the sentinel "0". The adapter must NOT adopt
+    // it as a live request id, else a no-match Tab followed by running the line
+    // records --accepted-request-id 0 and the server mis-attributes it (codex/#40).
+    assert_eq!(
+        last_request_id_after("__shac_request_id\t0\treplace_token\t0\n"),
+        "",
+        "the \"0\" sentinel must be neutralized to no-request"
+    );
+
+    // A genuine positive request id is still adopted normally.
+    assert_eq!(
+        last_request_id_after("__shac_request_id\t42\treplace_token\t0\n"),
+        "42",
+        "a real request id must still be recorded"
     );
 }

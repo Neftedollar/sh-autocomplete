@@ -61,6 +61,29 @@ pub struct CompletionItem {
     pub score: f64,
     pub source: String,
     pub meta: CompletionMeta,
+    /// True when this candidate is a whole command line that replaces the
+    /// entire buffer (resurrected from history/transitions while the user is
+    /// typing the first token), rather than a single token spliced into the
+    /// active position. The daemon is the single source of truth for this: it
+    /// alone knows the source, the multi-word shape, and the line/cursor
+    /// context. Widgets key their insert-vs-replace and Enter-runs-vs-inserts
+    /// behavior off this one flag instead of re-deriving it from `kind`/`source`
+    /// heuristics that used to drift apart (F3/F7/F8). `#[serde(default)]`
+    /// keeps parsing an older daemon's response (no field) safe — it reads as
+    /// `false`, the conservative "treat as a plain token" default.
+    #[serde(default)]
+    pub full_line: bool,
+    /// True when `insert_text` is a whole shell line that is already valid
+    /// syntax and must be inserted VERBATIM, not per-token escaped (escaping
+    /// would turn `git commit -m wip` into `git\ commit\ -m\ wip`, one broken
+    /// word). This is the escaping counterpart of `full_line` and a strict
+    /// SUPERSET of it: a resurrected history/transition line is verbatim at
+    /// *any* command position (buffer start or after `&&`/`|`/`;`), whereas
+    /// `full_line` (Enter-runs-it) holds only when it also replaces the whole
+    /// buffer. Keeping the two separate is what fixes the chained-command
+    /// escaping regression. Drives the CLI's quoting decision.
+    #[serde(default)]
+    pub verbatim: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

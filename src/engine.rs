@@ -1,11 +1,10 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// Hard timeout on the `git for-each-ref` invocation that backs
 /// `collect_git_branch_candidates`. Branch completion is best-effort —
@@ -217,6 +216,32 @@ impl Engine {
 
         items.sort_by(|left, right| cmp_score(right.item.score, left.item.score));
         items.truncate(self.config.max_results);
+
+        // Mark whole-line candidates (F3/F7/F8). Two distinct facts, computed
+        // once by the daemon so client and widgets can't drift:
+        //   * `verbatim` — the candidate is a whole shell line already, so the
+        //     CLI must NOT per-token escape it. `project_history_candidate`
+        //     returns the whole entry whenever the active token is at COMMAND
+        //     position, which recurs after every `&&`/`|`/`;`, not just at
+        //     buffer start.
+        //   * `full_line` — Enter may RUN it, which is only safe when it also
+        //     replaces the entire buffer (active token spans the whole trimmed
+        //     line, cursor at end). Strict subset of `verbatim`.
+        // Erring toward `false` is safe on both: no escaping change / Enter
+        // inserts. A false `full_line` (run a half-command) is the only
+        // dangerous direction, and it can't happen — it requires the whole
+        // buffer to be the single history token.
+        let command_role = matches!(parsed.role, TokenRole::Command);
+        let whole_line = whole_line_replacement_context(&req, &parsed);
+        for item in &mut items {
+            let whole_entry = matches!(
+                item.item.source.as_str(),
+                "history" | "runtime_history" | "transition"
+            ) && item.item.insert_text.contains(char::is_whitespace);
+            item.item.verbatim = command_role && whole_entry;
+            item.item.full_line = whole_line && whole_entry;
+        }
+
         let response_sources: Vec<String> = items.iter().map(|i| i.item.source.clone()).collect();
         let tip = self.maybe_pick_tip(&req, &response_sources, items.len());
         let request_id = self.db.record_completion_request(
@@ -307,6 +332,26 @@ impl Engine {
     }
 
     pub fn record_command(&self, request: RecordCommandRequest) -> Result<()> {
+        // Global kill-switch: when the user has disabled shac, persist nothing
+        // — no history, transitions, project profiles, or cd frecency (F4).
+        // Reloaded from disk per record (a tiny TOML read; this path is
+        // fire-and-forget, not keystroke-latency-sensitive) so `config set
+        // enabled false` takes effect on a running daemon without a restart,
+        // and a direct-socket client can't bypass the CLI's own gate (review).
+        let enabled = AppConfig::load(&self.paths)
+            .map(|c| c.enabled)
+            .unwrap_or(self.config.enabled);
+        if !enabled {
+            return Ok(());
+        }
+        // Privacy convention mirroring bash `HISTCONTROL=ignorespace` / zsh
+        // `HIST_IGNORE_SPACE`: a command the user prefixed with a space (or
+        // tab) is intentionally ephemeral. Skip recording it entirely so a
+        // secret-bearing ` export TOKEN=...` or ` cd /private` never lands in
+        // history or the cd index (F4).
+        if request.command.starts_with(' ') || request.command.starts_with('\t') {
+            return Ok(());
+        }
         self.db.record_history(&request)?;
         Ok(())
     }
@@ -362,19 +407,37 @@ impl Engine {
                 .cloned()
                 .or_else(|| std::env::var("LANG").ok()),
         );
-        // Build (or fetch from cache) a catalog for this exact locale so
-        // user overrides at <config_dir>/locales/<lang>.toml are picked up.
+        // Cache/build key: an UNSAFE locale (path-shaped, or absurdly long —
+        // `normalize` bounds neither length nor `/`) collapses to `en`. Without
+        // this, a client spamming distinct hostile `SHAC_LOCALE` values would
+        // fill the cache with up-to-1-MiB keys that each only map to the `en`
+        // fallback anyway (F5 — the count cap bounds entries, not bytes). A
+        // safe token is a real locale (`en`, `pt-BR`) and keys itself.
+        let lang: &str = if crate::i18n::Catalog::is_safe_lang_check(&resolved.lang) {
+            &resolved.lang
+        } else {
+            "en"
+        };
+        // Build (or fetch from cache) a catalog for this locale so user
+        // overrides at <config_dir>/locales/<lang>.toml are picked up.
         // Future work: invalidate when override file mtime changes.
         let catalog = {
+            // Cap distinct cached locales so a client spamming unique locales
+            // can't grow daemon memory without bound (F5). The real working set
+            // is a handful; once full we serve fresh builds without caching.
+            const MAX_CATALOG_CACHE: usize = 64;
             let mut cache = self.catalog_cache.lock().unwrap_or_else(|e| e.into_inner());
-            cache
-                .entry(resolved.lang.clone())
-                .or_insert_with(|| {
-                    crate::i18n::Catalog::build(&self.paths.config_dir, &resolved.lang)
-                })
-                .clone()
+            if let Some(hit) = cache.get(lang) {
+                hit.clone()
+            } else {
+                let built = crate::i18n::Catalog::build(&self.paths.config_dir, lang);
+                if cache.len() < MAX_CATALOG_CACHE {
+                    cache.insert(lang.to_string(), built.clone());
+                }
+                built
+            }
         };
-        crate::i18n::Translator::new(resolved.lang, catalog)
+        crate::i18n::Translator::new(lang.to_string(), catalog)
     }
 
     fn maybe_pick_tip(
@@ -578,6 +641,16 @@ impl Engine {
                     );
                 }
             }
+        }
+
+        // A redirect target (`cat > fi`, `sort < in`) sits alone in its
+        // pipeline segment, so `parsed.command` is None whenever the target is
+        // empty or dash-prefixed (`cat > `, `cat > -n`); the command-gated
+        // dispatch below then never runs, leaving those a dead prompt (review
+        // P2). F3 already classifies a redirect target's active token as a
+        // Path, so offer filesystem completion (files + dirs) for it directly.
+        if parsed.command.is_none() && matches!(parsed.role, TokenRole::Path) {
+            self.collect_path_candidates(active, &req.cwd, false, &mut candidates, &mut seen)?;
         }
 
         if let Some(command) = parsed.command.as_deref() {
@@ -1613,6 +1686,11 @@ impl Engine {
                 meta: CompletionMeta {
                     description: candidate.description.clone(),
                 },
+                // Both filled in by `complete` once the command-position and
+                // whole-line/cursor context are known (see the marking loop and
+                // `whole_line_replacement_context`).
+                full_line: false,
+                verbatim: false,
             },
             item_key: history_key,
             features,
@@ -1937,8 +2015,8 @@ fn find_git_repo_root(start: &Path) -> Option<PathBuf> {
 /// The returned vector is deduped (some refs appear under both heads and
 /// remotes/origin) and capped at [`GIT_REF_MAX`].
 fn list_git_refs(repo_root: &Path, timeout: Duration) -> Option<Vec<String>> {
-    let mut child = Command::new("git")
-        .arg("-C")
+    let mut cmd = Command::new("git");
+    cmd.arg("-C")
         .arg(repo_root)
         .args([
             "for-each-ref",
@@ -1947,41 +2025,13 @@ fn list_git_refs(repo_root: &Path, timeout: Duration) -> Option<Vec<String>> {
             "refs/heads",
             "refs/remotes",
         ])
-        .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .stdin(Stdio::null())
-        .spawn()
-        .ok()?;
-
-    let started = Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                if !status.success() {
-                    return None;
-                }
-                break;
-            }
-            Ok(None) => {
-                if started.elapsed() >= timeout {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return None;
-                }
-                thread::sleep(Duration::from_millis(5));
-            }
-            Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
-        }
+        .stdin(Stdio::null());
+    let output = crate::proc::run_capture(cmd, timeout)?;
+    if !output.success {
+        return None;
     }
-
-    let mut buf = String::new();
-    if let Some(mut out) = child.stdout.take() {
-        out.read_to_string(&mut buf).ok()?;
-    }
+    let buf = String::from_utf8_lossy(&output.stdout);
 
     let mut seen = HashSet::new();
     let mut refs = Vec::new();
@@ -2032,48 +2082,15 @@ fn list_kubectl_resources(timeout: Duration) -> Vec<String> {
         return Vec::new();
     }
 
-    let mut child = match Command::new("kubectl")
-        .args(["api-resources", "--no-headers", "--output=name"])
-        .stdout(Stdio::piped())
+    let mut cmd = Command::new("kubectl");
+    cmd.args(["api-resources", "--no-headers", "--output=name"])
         .stderr(Stdio::null())
-        .stdin(Stdio::null())
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(_) => return Vec::new(),
+        .stdin(Stdio::null());
+    let output = match crate::proc::run_capture(cmd, timeout) {
+        Some(output) if output.success => output,
+        _ => return Vec::new(),
     };
-
-    let started = Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                if !status.success() {
-                    return Vec::new();
-                }
-                break;
-            }
-            Ok(None) => {
-                if started.elapsed() >= timeout {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Vec::new();
-                }
-                thread::sleep(Duration::from_millis(10));
-            }
-            Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Vec::new();
-            }
-        }
-    }
-
-    let mut buf = String::new();
-    if let Some(mut out) = child.stdout.take() {
-        if out.read_to_string(&mut buf).is_err() {
-            return Vec::new();
-        }
-    }
+    let buf = String::from_utf8_lossy(&output.stdout);
 
     buf.lines()
         .map(str::trim)
@@ -2088,48 +2105,16 @@ fn list_kubectl_resources(timeout: Duration) -> Vec<String> {
 /// `<none>` are skipped. Returns an empty `Vec` when docker is unavailable,
 /// the daemon is not running, or the command exits non-zero.
 fn list_docker_images() -> Vec<String> {
-    let mut child = match Command::new("docker")
-        .args(["images", "--format", "{{.Repository}}:{{.Tag}}"])
-        .stdout(Stdio::piped())
+    let mut cmd = Command::new("docker");
+    cmd.args(["images", "--format", "{{.Repository}}:{{.Tag}}"])
         .stderr(Stdio::null())
-        .stdin(Stdio::null())
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(_) => return Vec::new(),
+        .stdin(Stdio::null());
+    let output = match crate::proc::run_capture(cmd, DOCKER_TIMEOUT) {
+        Some(output) if output.success => output,
+        _ => return Vec::new(),
     };
 
-    let started = Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                if !status.success() {
-                    return Vec::new();
-                }
-                break;
-            }
-            Ok(None) => {
-                if started.elapsed() >= DOCKER_TIMEOUT {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Vec::new();
-                }
-                thread::sleep(Duration::from_millis(5));
-            }
-            Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Vec::new();
-            }
-        }
-    }
-
-    let mut buf = String::new();
-    if let Some(mut out) = child.stdout.take() {
-        out.read_to_string(&mut buf).ok();
-    }
-
-    parse_docker_images_output(&buf)
+    parse_docker_images_output(&String::from_utf8_lossy(&output.stdout))
 }
 
 /// Parse raw `docker images` output (one `repo:tag` per line) into a deduplicated
@@ -2164,48 +2149,16 @@ fn parse_docker_images_output(output: &str) -> Vec<String> {
 /// docker is unavailable, the daemon is not running, or the command exits
 /// non-zero.
 fn list_docker_containers() -> Vec<String> {
-    let mut child = match Command::new("docker")
-        .args(["ps", "--format", "{{.Names}}"])
-        .stdout(Stdio::piped())
+    let mut cmd = Command::new("docker");
+    cmd.args(["ps", "--format", "{{.Names}}"])
         .stderr(Stdio::null())
-        .stdin(Stdio::null())
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(_) => return Vec::new(),
+        .stdin(Stdio::null());
+    let output = match crate::proc::run_capture(cmd, DOCKER_TIMEOUT) {
+        Some(output) if output.success => output,
+        _ => return Vec::new(),
     };
 
-    let started = Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                if !status.success() {
-                    return Vec::new();
-                }
-                break;
-            }
-            Ok(None) => {
-                if started.elapsed() >= DOCKER_TIMEOUT {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Vec::new();
-                }
-                thread::sleep(Duration::from_millis(5));
-            }
-            Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Vec::new();
-            }
-        }
-    }
-
-    let mut buf = String::new();
-    if let Some(mut out) = child.stdout.take() {
-        out.read_to_string(&mut buf).ok();
-    }
-
-    parse_docker_containers_output(&buf)
+    parse_docker_containers_output(&String::from_utf8_lossy(&output.stdout))
 }
 
 /// Parse raw `docker ps` output (one container name per line) into a Vec,
@@ -2758,6 +2711,15 @@ fn python_module_candidates() -> &'static [PythonModuleCandidate] {
     ]
 }
 
+/// Whether the completion context is a whole-buffer replacement: the cursor is
+/// at the end of the line and the active token spans the entire (trimmed)
+/// buffer. Only in this context is a multi-word history/transition candidate a
+/// real full command line (see `project_history_candidate`, which returns the
+/// whole entry only in `TokenRole::Command`). `cursor` is a character offset.
+fn whole_line_replacement_context(req: &CompletionRequest, parsed: &ParsedContext) -> bool {
+    req.cursor >= req.line.chars().count() && req.line.trim() == parsed.active_token
+}
+
 fn contextual_history_prefix(parsed: &ParsedContext) -> String {
     if matches!(parsed.role, TokenRole::Command) {
         return parsed.active_token.clone();
@@ -2796,7 +2758,13 @@ fn project_history_candidate(
     // SubcommandOrArg position, but a real subcommand never starts with `-`.
     // Classify it as an option so it inserts bare instead of getting the
     // leading-dash `./` path guard (which would yield the broken `bash ./--help`).
-    let kind = if token.starts_with('-') {
+    //
+    // But NOT in a path context: there a `-notes` history token denotes a file
+    // literally named `-notes`, and must keep kind `path` so `quote_token`
+    // applies the `./` guard (`./-notes`). Marking it `option` would let a
+    // history entry shadow the real path candidate and pass `-notes` to the
+    // command as flags (codex/#35).
+    let kind = if token.starts_with('-') && !matches!(parsed.role, TokenRole::Path) {
         "option"
     } else {
         match parsed.role {
@@ -3303,6 +3271,205 @@ mod tests {
         (engine, dir)
     }
 
+    fn record_req(command: &str, cwd: &str) -> crate::protocol::RecordCommandRequest {
+        // Interactive typed_manual hints so the event classifies as a clean
+        // signal that `latest_command` will return (it filters to
+        // interactive/typed rows), letting the test observe whether recording
+        // happened at all.
+        crate::protocol::RecordCommandRequest {
+            command: command.to_string(),
+            cwd: cwd.to_string(),
+            shell: Some("zsh".to_string()),
+            trust: Some("interactive".to_string()),
+            provenance: Some("typed_manual".to_string()),
+            provenance_source: None,
+            provenance_confidence: None,
+            origin: Some("zsh_precmd".to_string()),
+            tty_present: Some(true),
+            exit_status: Some(0),
+            accepted_request_id: None,
+            accepted_item_key: None,
+            accepted_rank: None,
+        }
+    }
+
+    #[test]
+    fn record_command_skips_leading_space_commands() {
+        let (engine, _dir) = test_engine("rec-ignorespace");
+        // A space-prefixed command is intentionally ephemeral (HISTCONTROL
+        // ignorespace convention) — it must not be persisted.
+        engine
+            .record_command(record_req(" secret --token=abc", "/tmp"))
+            .expect("record");
+        assert_eq!(
+            engine.db.latest_command().expect("latest"),
+            None,
+            "a leading-space command must not be recorded"
+        );
+
+        // A normal command is recorded as usual.
+        engine
+            .record_command(record_req("ls -la", "/tmp"))
+            .expect("record");
+        assert_eq!(
+            engine.db.latest_command().expect("latest").as_deref(),
+            Some("ls -la"),
+            "a normal command is recorded"
+        );
+    }
+
+    #[test]
+    fn record_command_skips_when_disabled() {
+        let (mut engine, _dir) = test_engine("rec-disabled");
+        // `record_command` reloads `enabled` from disk per call so a live
+        // `config set enabled false` takes effect without a daemon restart —
+        // so the disabled state must be persisted, not just set in memory.
+        engine.config.enabled = false;
+        engine
+            .config
+            .save(&engine.paths)
+            .expect("persist disabled config");
+        engine
+            .record_command(record_req("ls -la", "/tmp"))
+            .expect("record");
+        assert_eq!(
+            engine.db.latest_command().expect("latest"),
+            None,
+            "nothing is recorded while shac is disabled"
+        );
+    }
+
+    #[test]
+    fn record_command_honors_disable_written_after_engine_start() {
+        // The daemon caches config at startup; disabling AFTER that must still
+        // stop recording (the review's stale-gate P1). Start enabled, record
+        // one command, then disable on disk and confirm the next is dropped.
+        let (engine, _dir) = test_engine("rec-disable-live");
+        engine
+            .record_command(record_req("ls -la", "/tmp"))
+            .expect("record while enabled");
+        assert_eq!(
+            engine.db.latest_command().expect("latest").as_deref(),
+            Some("ls -la"),
+        );
+
+        let mut disabled = engine.config.clone();
+        disabled.enabled = false;
+        disabled.save(&engine.paths).expect("persist disable");
+
+        engine
+            .record_command(record_req("git status", "/tmp"))
+            .expect("record while disabled");
+        assert_eq!(
+            engine.db.latest_command().expect("latest").as_deref(),
+            Some("ls -la"),
+            "a command recorded after a live disable must be dropped"
+        );
+    }
+
+    #[test]
+    fn full_line_flag_marks_only_whole_line_history() {
+        let (engine, _dir) = test_engine("full-line-flag");
+        engine
+            .record_command(record_req("git commit -m wip", "/tmp"))
+            .expect("record");
+
+        // Completing the whole buffer from the first token ("gi", cursor at
+        // end): the resurrected history line replaces the buffer -> full_line.
+        let whole = engine
+            .complete(make_request("gi", "/tmp"))
+            .expect("complete");
+        let line_item = whole
+            .items
+            .iter()
+            .find(|i| i.insert_text == "git commit -m wip")
+            .expect("whole-line history candidate should be offered");
+        assert!(
+            line_item.full_line,
+            "multi-word history at command position must be a full line"
+        );
+        assert!(
+            line_item.verbatim,
+            "a whole-buffer history line is also verbatim (not escaped)"
+        );
+
+        // Mid-line argument completion offers a single token — nothing here is
+        // a whole-buffer replacement, so no item may be flagged full_line.
+        let mid = engine
+            .complete(make_request("git com", "/tmp"))
+            .expect("complete");
+        for item in &mid.items {
+            assert!(
+                !item.full_line,
+                "mid-line candidate must not be full_line: {item:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn whole_line_history_after_operator_is_verbatim_but_not_full_line() {
+        // A resurrected history line offered at a chained command position
+        // (after `&&`) is still a whole shell line → must insert VERBATIM (not
+        // per-token escaped, which would break it: `git\ commit\ -m\ wip`), but
+        // it does NOT replace the whole buffer → Enter must NOT run it. This is
+        // the chained-command escaping regression the split of verbatim from
+        // full_line fixes.
+        let (engine, _dir) = test_engine("verbatim-chained");
+        engine
+            .record_command(record_req("git commit -m wip", "/tmp"))
+            .expect("record");
+
+        let resp = engine
+            .complete(make_request("cd /tmp && gi", "/tmp"))
+            .expect("complete");
+        let item = resp
+            .items
+            .iter()
+            .find(|i| i.insert_text == "git commit -m wip")
+            .expect("whole-line history candidate should be offered after &&");
+        assert!(
+            item.verbatim,
+            "a whole shell line at any command position must be verbatim"
+        );
+        assert!(
+            !item.full_line,
+            "a non-whole-buffer line must not be Enter-runnable"
+        );
+    }
+
+    #[test]
+    fn redirect_target_offers_file_completion() {
+        let (engine, dir) = test_engine("redirect-target");
+        let cwd = dir.path.to_string_lossy().to_string();
+        std::fs::write(dir.path.join("output.log"), "").expect("seed file");
+
+        // `cat > <Tab>` — empty redirect target, no command in the segment:
+        // must still offer filesystem candidates, not dead air (review P2).
+        let empty = engine
+            .complete(make_request("cat > ", &cwd))
+            .expect("complete");
+        assert!(
+            empty
+                .items
+                .iter()
+                .any(|i| i.insert_text.contains("output.log")),
+            "empty redirect target should offer files: {:?}",
+            empty.items
+        );
+
+        // A typed prefix filters to the matching file.
+        let pref = engine
+            .complete(make_request("cat > o", &cwd))
+            .expect("complete");
+        assert!(
+            pref.items
+                .iter()
+                .any(|i| i.insert_text.contains("output.log")),
+            "prefixed redirect target should offer matching files: {:?}",
+            pref.items
+        );
+    }
+
     fn make_request(line: &str, cwd: &str) -> CompletionRequest {
         CompletionRequest {
             shell: "zsh".to_string(),
@@ -3480,6 +3647,34 @@ mod tests {
             project_history_candidate("bash script.sh", &parsed).expect("arg candidate");
         assert_eq!(token, "script.sh");
         assert_eq!(kind, "subcommand");
+    }
+
+    #[test]
+    fn project_history_candidate_keeps_dash_token_as_path_in_path_context() {
+        // In a Path context (e.g. `vim -notes` where the arg slot is path-like),
+        // a dash-prefixed history token is a filename, not a flag: it must stay
+        // kind "path" so the `./` guard applies on accept (`./-notes`) rather
+        // than being marked "option" and shadowing the real path candidate
+        // (codex/#35).
+        let parsed = ParsedContext {
+            line_before_cursor: "vim ".to_string(),
+            tokens: vec!["vim".to_string(), String::new()],
+            active_token: String::new(),
+            active_index: 1,
+            role: TokenRole::Path,
+            command: Some("vim".to_string()),
+            prev_token: Some("vim".to_string()),
+            project_markers: Vec::new(),
+            open_quote: None,
+        };
+
+        let (token, _display, kind) =
+            project_history_candidate("vim -notes", &parsed).expect("path candidate");
+        assert_eq!(token, "-notes");
+        assert_eq!(
+            kind, "path",
+            "a dash token in a path context stays a path, not an option"
+        );
     }
 
     #[test]

@@ -29,7 +29,7 @@ pub fn parse(line: &str, cursor: usize, cwd: &Path) -> ParsedContext {
     // Only the pipeline/list segment the cursor is in determines the command:
     // completion after `|`, `&&`, `;`, `&`, or a redirection targets the
     // command that starts that segment, not the one at the start of the line.
-    let segment = last_segment(&before);
+    let (segment, redirect_segment) = last_segment(&before);
     let scanned = tokenize(&segment);
     let mut tokens = scanned.tokens;
 
@@ -48,7 +48,7 @@ pub fn parse(line: &str, cursor: usize, cwd: &Path) -> ParsedContext {
     } else {
         None
     };
-    let role = classify_role(&tokens, active_index, cwd);
+    let role = classify_role(&tokens, active_index, cwd, redirect_segment);
     let project_markers = detect_project_markers(cwd);
 
     ParsedContext {
@@ -68,11 +68,17 @@ pub fn parse(line: &str, cursor: usize, cwd: &Path) -> ParsedContext {
 /// pipeline/list operator (`|`, `||`, `&&`, `;`, `&`) or redirection (`<`,
 /// `>`), so callers can restrict tokenization to the segment containing the
 /// cursor. Operators inside an open quote are not boundaries. 0 if none.
-fn last_segment_start(s: &str) -> usize {
+/// Returns the char index in `s` immediately after the last unquoted operator,
+/// plus whether that operator was a redirection (`<`/`>`) rather than a
+/// pipeline/list operator (`|`/`||`/`&&`/`;`/`&`). The redirect flag lets the
+/// caller classify the segment's target token as a filename path instead of a
+/// command (F3).
+fn last_segment_start(s: &str) -> (usize, bool) {
     let chars: Vec<char> = s.chars().collect();
     let mut quote: Option<char> = None;
     let mut escaped = false;
     let mut boundary = 0usize;
+    let mut redirect = false;
     let mut i = 0;
 
     while i < chars.len() {
@@ -91,32 +97,70 @@ fn last_segment_start(s: &str) -> usize {
                     quote = Some(ch);
                 }
             }
-            '|' | '&' | ';' | '<' | '>' if quote.is_none() => {
+            '<' if quote.is_none() => {
+                // `<<` (heredoc) / `<<<` (here-string): the following word is a
+                // delimiter/string, NOT a filename, so don't classify it as a
+                // path. A single `<` is a real input redirection.
+                if chars.get(i + 1) == Some(&'<') {
+                    while chars.get(i + 1) == Some(&'<') {
+                        i += 1;
+                    }
+                    boundary = i + 1;
+                    redirect = false;
+                } else {
+                    boundary = i + 1;
+                    redirect = true;
+                }
+            }
+            '>' if quote.is_none() => {
+                // `>|` (zsh clobber-override) is still a file redirect; consume
+                // the `|` so it isn't later treated as a pipe boundary. `>>`
+                // (append) needs no special-casing — the second `>` re-sets the
+                // boundary and keeps `redirect` true.
+                if chars.get(i + 1) == Some(&'|') {
+                    i += 1;
+                }
+                boundary = i + 1;
+                redirect = true;
+            }
+            '|' | '&' | ';' if quote.is_none() => {
                 // Treat a doubled operator ("||", "&&") as a single boundary.
                 if matches!(ch, '|' | '&') && chars.get(i + 1) == Some(&ch) {
                     i += 1;
                 }
                 boundary = i + 1;
+                redirect = false;
             }
             _ => {}
         }
         i += 1;
     }
-    boundary
+    (boundary, redirect)
 }
 
 /// The trailing pipeline/list segment of `s` (the part after the last
-/// top-level operator), or the whole string if there is none.
-fn last_segment(s: &str) -> String {
-    let start = last_segment_start(s);
-    s.chars().skip(start).collect()
+/// top-level operator), plus whether that operator was a redirection.
+fn last_segment(s: &str) -> (String, bool) {
+    let (start, redirect) = last_segment_start(s);
+    (s.chars().skip(start).collect(), redirect)
 }
 
-fn classify_role(tokens: &[String], active_index: usize, cwd: &Path) -> TokenRole {
+fn classify_role(
+    tokens: &[String],
+    active_index: usize,
+    cwd: &Path,
+    redirect_target: bool,
+) -> TokenRole {
     let token = tokens
         .get(active_index)
         .map(String::as_str)
         .unwrap_or_default();
+    // The first token after a redirection is the file the stream is wired to,
+    // not a command — complete it as a path even though it sits at index 0 of
+    // its segment (F3). `> fi<Tab>` should offer filenames, not commands.
+    if redirect_target && active_index == 0 {
+        return TokenRole::Path;
+    }
     if active_index == 0 {
         return TokenRole::Command;
     }
@@ -218,6 +262,12 @@ fn tokenize(line: &str) -> Tokenized {
             continue;
         }
         match ch {
+            // NB: `\` escapes even inside single quotes here, which POSIX
+            // doesn't (in `'a\'` the quote closes at the second `'`). This is
+            // deliberate: the zsh/bash widget span walkers mirror this exact
+            // rule, so the region a widget replaces always matches the token
+            // the daemon completed. Being self-consistent matters more than
+            // POSIX-strictness for an obscure literal-backslash-in-quotes case.
             '\\' => escaped = true,
             '\'' | '"' => {
                 if quote == Some(ch) {
@@ -299,5 +349,34 @@ mod tests {
         let q = parse("cd \"My ", 7, cwd);
         assert_eq!(q.active_token, "My ");
         assert_eq!(q.open_quote, Some('"'));
+    }
+
+    #[test]
+    fn redirect_target_is_path_not_command() {
+        let cwd = std::path::Path::new("/tmp");
+        // `cat > fi` — the token after `>` is a filename, so it must classify
+        // as Path (offering file completion), not Command (F3).
+        let out = parse("cat > fi", 8, cwd);
+        assert_eq!(out.active_token, "fi");
+        assert_eq!(out.role, TokenRole::Path);
+
+        // Input redirection and append behave the same.
+        assert_eq!(parse("sort < in", 9, cwd).role, TokenRole::Path);
+        assert_eq!(parse("echo hi >> lo", 13, cwd).role, TokenRole::Path);
+
+        // An empty target right after the operator still wants file completion.
+        assert_eq!(parse("cat > ", 6, cwd).role, TokenRole::Path);
+
+        // A pipeline boundary is NOT a redirect: the segment head stays a
+        // command so `... | gr` still completes command names.
+        assert_eq!(parse("cat foo | gr", 12, cwd).role, TokenRole::Command);
+
+        // `>|` (zsh clobber-override) is still a file redirect.
+        assert_eq!(parse("echo hi >| ou", 13, cwd).role, TokenRole::Path);
+
+        // Heredoc `<<` / here-string `<<<` targets are delimiters/words, NOT
+        // files — they must NOT become a Path (no bogus file completion).
+        assert_ne!(parse("cat << EO", 9, cwd).role, TokenRole::Path);
+        assert_ne!(parse("sort <<< wor", 12, cwd).role, TokenRole::Path);
     }
 }

@@ -81,6 +81,10 @@ else if status is-interactive
           # decoded field would fracture and later expand as multiple
           # positional args instead of the single string it decoded to.
           set request_id (__shac_decode $parts[2] | string collect)
+          # "0" is the daemon's no-traceable-request sentinel (zero-candidate
+          # response, kept non-empty for wire alignment — F2). Treat as none so
+          # a later accept never sends --accepted-request-id 0 (codex/#40).
+          test "$request_id" = "0"; and set request_id ""
         else if string match -q '__shac_*' -- $parts[1]
           # Skip any other sentinel rows (e.g. __shac_tip) — inline accept only
           # consumes a real candidate row, mirrors zsh shac.zsh _shac_fetch_inline.

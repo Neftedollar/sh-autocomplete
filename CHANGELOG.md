@@ -1,5 +1,114 @@
 # Changelog
 
+## v0.6.12 — 2026-07-11
+
+The rest of the holistic Fable review, batched: security, resource safety, a
+privacy-respecting history model, and the widget/daemon seam unified behind one
+protocol flag.
+
+### Security & resource safety
+- **State is now owner-only (F5).** The config/data/state dirs are chmod'd
+  `0700`, the history DB `0600`, and the **unauthenticated control socket**
+  `0600` right after bind — previously any local user could `complete`, read
+  `stats`, or poison learning over it. `SHAC_LOCALE` is sanitized before it
+  reaches a path join (no traversal to an arbitrary `.toml`), and the per-locale
+  catalog cache is bounded so a client can't grow daemon memory by spamming
+  distinct locales.
+- **Daemon shellouts can no longer deadlock or truncate (F10).** Every
+  `git`/`kubectl`/`docker`/`--help`/`man` call went "poll for exit, then read
+  stdout" — which deadlocks whenever the child writes more than one pipe buffer
+  (~64 KiB) before exiting, as `man` and large `--help` routinely do: the child
+  blocks on `write()`, the timeout fires, and the output is lost. All six sites
+  now drain stdout on a reader thread concurrently with the timed wait. As a
+  side effect `--help` is now reliably the primary doc source (it had been
+  masked by `man` silently deadlocking), matching the documented intent.
+
+### Privacy & history
+- **Command history retention is configurable (F4).** The daemon prunes
+  `history_events` older than `history_retention_days` (default 365) on its
+  background tick, so the DB stays bounded over months of use. `0` keeps no
+  persistent history.
+- **Two commands are never recorded:** anything typed with a **leading space**
+  (the `HISTCONTROL=ignorespace` / `HIST_IGNORE_SPACE` convention — so a one-off
+  ` export TOKEN=…` or ` cd /private` leaves no trace in history, transitions, or
+  the cd index), and everything while shac is disabled. Inline `cd`-frecency
+  learning is gated on the same clean-interactive signal as transitions, so
+  pasted/imported `cd`s no longer seed path-jump suggestions.
+
+### Fixed — completion correctness
+- **The widget and daemon agree on whole-line completions (F3/F7/F8).** Whether a
+  candidate is a full command line (resurrected from history, replaces the whole
+  buffer, runs on Enter) is now decided once by the daemon and shipped as a
+  `full_line` flag, instead of the CLI keying off `kind` and each widget keying
+  off `source` — two approximations that drifted and could escape a line
+  per-token while treating it as runnable. zsh keys Enter/insert off the flag;
+  bash and fish need no change.
+- **Redirect targets complete as files, not commands (F3).** `cat > fi<Tab>` now
+  offers filenames — the token after `>`/`<`/`>>` is classified as a path.
+- **bash's active-token span is quote-aware (F6).** `cat "my fi<Tab>` completes
+  the whole `"my fi` span instead of just the trailing `fi` and mangling the
+  quote, matching the zsh widget.
+- **`shac reindex` no longer reports a false failure on a large PATH.** The
+  client capped the wait at 1.5 s, so a reindex that legitimately took longer
+  (big PATH, slow CI) surfaced a "read daemon response" error while the daemon
+  was still finishing. The ceiling for this explicit, non-latency-sensitive
+  command is now 30 s.
+
+### Fixed — follow-ups from prior-PR review comments
+- **A no-match Tab no longer mis-attributes the next command.** v0.6.11's F2
+  fix emitted `0` (instead of an empty field) for a zero-candidate response;
+  clients then treated that non-empty sentinel as a live request id, so running
+  the line within 30 s recorded `--accepted-request-id 0` and the server
+  fell back to guessing a recent request. All three adapters now treat `0` as
+  "no request".
+- **A history flag no longer shadows a `-file` path candidate.** In a path
+  context, a dash-prefixed history token (e.g. `vim -notes`) was classified as
+  an option and could win over the real path candidate, dropping the leading-
+  dash `./` guard; it now stays a path (`./-notes`).
+- **bash Tab is no longer a dead key when shac has no candidate.** The bash≥4
+  `bind -x` path returned without deferring to readline (which a `bind -x`
+  handler can't invoke), so a down/disabled daemon left Tab inert. It now
+  emulates default filesystem completion for simple tokens (unique match or
+  longest common prefix), leaving quoted/escaped/`~` tokens untouched; at the
+  command position it completes command names, not filenames.
+
+### Fixed — from an adversarial (Fable) review of this batch
+- **Configuring history retention no longer wipes your imported history.**
+  Plain (non-`EXTENDED_HISTORY`) zsh history imports as `ts = 0` with the real
+  clock in `imported_at`; the new prune keyed only on `ts`, so the first
+  background tick deleted the entire imported corpus (and re-armed on
+  re-import). Retention now keys off whichever of `ts`/`imported_at` is more
+  recent.
+- **The whole-line Enter feature actually works in zsh now.** The candidate
+  TSV split elided the empty description field, shifting the `full_line` flag
+  into the description slot — so Enter on a resurrected history line inserted
+  instead of running it, and a stray `1`/`0` showed as the menu description.
+- **A daemon shellout can no longer wedge completions.** A grandchild that
+  inherited a `git`/`man`/`--help` process's stdout pipe kept the drain from
+  seeing EOF, blocking the single-threaded daemon far past the timeout. Each
+  shellout now runs in its own process group (killed as a unit on timeout) and
+  the collect is bounded, so a stuck descendant can't stall other shells.
+- **Resurrecting a history line after `&&`/`|`/`;` no longer breaks it.** The
+  escape decision was tied to the Enter-runs-it flag, but a whole history line
+  offered at a chained command position isn't a whole-buffer replacement, so it
+  was per-token escaped into `git\ commit\ …`. Escaping now keys off a separate
+  "already valid shell" signal.
+- **`config set enabled false` now stops a running daemon from recording.** The
+  daemon cached `enabled` at startup and the client never re-checked it, so
+  recording continued after a disable while completions went quiet. The client
+  now honors the kill-switch and the daemon reloads `enabled` per record.
+- **Redirect targets complete files again.** `cat > <Tab>` / `cat > -n<Tab>`
+  returned nothing (the path dispatch was gated on a command the redirect
+  segment doesn't have); they now offer filesystem candidates.
+- **bash multibyte cursor fix.** `mv Café tmp` with the cursor after `Café`
+  selected the wrong token (a byte offset fed a character-indexed walker); the
+  offset is now converted first.
+- Locale cache keys are sanitized (a hostile `SHAC_LOCALE` can no longer bloat
+  the per-locale cache); the control socket's actual mode is checked at startup
+  and warned about if not owner-only. Note: a `--help` that prints then hangs
+  past its deadline now indexes nothing from help (previously a truncated
+  parse), with `man` as the fallback.
+
 ## v0.6.11 — 2026-07-11
 
 Wire-protocol hardening from the holistic Fable review (the seam three focused
