@@ -1,5 +1,47 @@
 # Changelog
 
+## v0.6.10 — 2026-07-11
+
+Fixes from a three-lens Fable review (engine, release pipeline, usability).
+
+### Fixed — correctness
+- **Accepting a full command line from history no longer runs broken escaped
+  text.** A row like `cd ..` was inserted token-escaped (`cd\ ..`) and executed
+  as a single word (`command not found: cd ..`), which then re-poisoned the
+  history. Whole command lines (multi-word `history`/`command` candidates) now
+  insert raw; single tokens (paths, options) are still escaped.
+- **`cd <Tab>` no longer suggests deleted directories via a kind hole.** The
+  v0.6.8 existence filter only ran for `kind == "path"`, but single-segment
+  history tokens arrive as `subcommand`; every cd-argument candidate is now
+  existence-checked. The check is also hardened: `$VAR`/`~user`/glob tokens and
+  absolute paths outside `$HOME` (possible dead network mounts) are kept rather
+  than stat'd, and it uses `is_dir`.
+- **`--help`/man option parsing** — a metavar between flags no longer drops the
+  long form (`-o FILE, --output FILE` → both), and `--color[=WHEN]` / `-i[SUFFIX]`
+  no longer produce corrupt `--color[` tokens. The man-page doc cap actually
+  bounds output again (a mis-scoped `break` had disabled it).
+- **`doc_search` is scoped to the current command** — `git c<Tab>` no longer
+  leaks mdfind's `-case_sensitive` etc.; doc `insert_text` is stripped of control
+  bytes (roff overstrike) so accepting never injects them into the buffer.
+- **Release pipeline can't ship an empty checksum** — an asset-sha fetch failure
+  now fails the job (plain assignment vs `echo "$(...)"`), and the tap renderer
+  refuses any sha256 that isn't 64 hex chars.
+- **`shac doctor` version probe** is read-only (`SHAC_NO_TIPS`, so it no longer
+  burns the one-shot first-run greeter) and now flags a pre-0.5.2 daemon that
+  answers without a version field instead of waving it through.
+
+### Fixed — usability (ranking & noise)
+- **Transitions ("what you run after X") only appear at command position** — no
+  more `git c<Tab>` → `clr`, or a once-pasted sentence offered as an argument.
+- **Subcommand indexing** now reads aliased rows (cargo's `build, b` → `build`)
+  and underscore names (`s_client`).
+- **Git branch completion** collapses each `origin/foo` twin when the local
+  `foo` exists and drops the bare `origin` remote name.
+- **Path completion is case-insensitive** — `cd d<Tab>` surfaces
+  `Documents/`/`Desktop/` on a case-insensitive macOS filesystem.
+- Redundant per-row descriptions ("Previously executed command", "Provided by
+  current shell context", "Frequently used after X") are dropped as clutter.
+
 ## v0.6.9 — 2026-07-08
 
 ### Fixed

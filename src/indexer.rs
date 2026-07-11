@@ -212,11 +212,11 @@ fn upsert_docs_with_help_shellout(db: &AppDb, command: &str) -> Result<()> {
     Ok(())
 }
 
-/// Split a help/man flags column ("-h, --help", "-m, --message <MSG>",
-/// "--color=<WHEN>") into its individual flag tokens ("-h", "--help"). Stops at
-/// the first metavar so a value placeholder never leaks into an inserted flag,
-/// and drops any attached "=VALUE". Each flag becomes its own candidate so a
-/// user typing either the short or the long form gets a prefix match.
+/// Split a help/man flags column into its individual flag tokens. Handles the
+/// common shapes: `-h, --help`, `-m, --message <MSG>`, `--color=<WHEN>`,
+/// `--color[=WHEN]`, `-i[SUFFIX]`, and metavars interleaved between flags
+/// (`-o FILE, --output FILE`). Each flag becomes its own candidate so a user
+/// typing either the short or the long form gets a prefix match.
 fn flag_tokens(column: &str) -> Vec<String> {
     let mut flags = Vec::new();
     for token in column
@@ -224,27 +224,31 @@ fn flag_tokens(column: &str) -> Vec<String> {
         .map(str::trim)
         .filter(|t| !t.is_empty())
     {
-        if token.starts_with('-') && token.len() > 1 {
-            let flag = token.split('=').next().unwrap_or(token);
+        // A metavar (FILE, <MSG>, WHEN) between or after flags is skipped, not a
+        // terminator — otherwise `-o FILE, --output FILE` would drop `--output`.
+        if !token.starts_with('-') || token.len() <= 1 {
+            continue;
+        }
+        // Strip an attached value/metavar: `--color=<WHEN>`, `--color[=WHEN]`,
+        // `-i[SUFFIX]` -> `--color` / `-i`.
+        let flag = token.split(['=', '[']).next().unwrap_or(token).trim();
+        if flag.starts_with('-') && flag.len() > 1 {
             flags.push(flag.to_string());
-        } else {
-            // A metavar (<MSG>, WHEN, ...) — the flag tokens are done.
-            break;
         }
     }
     flags
 }
 
 /// A help line's first column names a subcommand only when it is a single
-/// lowercase token (letters, digits, hyphens). This rejects prose, `Usage:`
-/// lines, section headers and wrapped descriptions that are not real
-/// subcommands.
+/// lowercase token (letters, digits, hyphens, underscores — e.g. openssl's
+/// `s_client`). This rejects prose, `Usage:` lines, section headers and wrapped
+/// descriptions that are not real subcommands.
 fn is_subcommand_name(token: &str) -> bool {
     token.len() >= 2
         && token.starts_with(|c: char| c.is_ascii_lowercase())
         && token
             .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
 }
 
 fn parse_help_output(command: &str) -> Option<Vec<StoredDoc>> {
@@ -279,12 +283,17 @@ fn parse_help_text(command: &str, stdout: &str) -> Vec<StoredDoc> {
                     return docs;
                 }
             }
-        } else if indented && is_subcommand_name(head) {
+        } else if indented {
             // Subcommand row under a group header ("  install   Add ...").
             // clap groups subcommands under custom headers (Setup:, Index:, ...)
             // rather than a single "Commands:" section, so key off the row
-            // shape, not the header name.
-            docs.push(doc(command, "subcommand", head, description, "help"));
+            // shape, not the header name. Take the primary name (first token) so
+            // aliased rows like cargo's "build, b   Compile ..." index as `build`.
+            let name = head.split([',', ' ', '\t']).next().unwrap_or(head);
+            if !is_subcommand_name(name) {
+                continue;
+            }
+            docs.push(doc(command, "subcommand", name, description, "help"));
             if docs.len() >= MAX_DOCS_PER_COMMAND {
                 return docs;
             }
@@ -382,7 +391,7 @@ fn parse_man_sections(text: &str, command: &str) -> Option<Vec<StoredDoc>> {
     ];
     let mut docs = Vec::new();
     let mut in_section = false;
-    for line in text.lines() {
+    'lines: for line in text.lines() {
         if !line.starts_with(' ') && !line.starts_with('\t') && !line.is_empty() {
             let upper = line.trim().to_uppercase();
             in_section = SECTION_HEADERS.iter().any(|&h| upper.starts_with(h));
@@ -399,8 +408,10 @@ fn parse_man_sections(text: &str, command: &str) -> Option<Vec<StoredDoc>> {
                 if !description.is_empty() {
                     for flag in flag_tokens(column) {
                         docs.push(doc(command, "option", &flag, description, "man"));
+                        // Break the LINE loop (not just the flag loop) so the cap
+                        // actually bounds total docs.
                         if docs.len() >= MAX_DOCS_PER_COMMAND {
-                            break;
+                            break 'lines;
                         }
                     }
                 }
@@ -674,10 +685,18 @@ mod tests {
     fn flag_tokens_extracts_individual_flags_without_metavars() {
         assert_eq!(flag_tokens("-h, --help"), vec!["-h", "--help"]);
         assert_eq!(flag_tokens("-V, --version"), vec!["-V", "--version"]);
-        // Metavar terminates the flag list; never leaks into an inserted flag.
+        // Trailing metavar never leaks into an inserted flag.
         assert_eq!(flag_tokens("-m, --message <MSG>"), vec!["-m", "--message"]);
-        // Attached =VALUE is stripped.
+        // A metavar BETWEEN flags (old argparse) is skipped, not a terminator:
+        // the long form must survive.
+        assert_eq!(
+            flag_tokens("-o FILE, --output FILE"),
+            vec!["-o", "--output"]
+        );
+        // Attached =VALUE and bracketed optional values are stripped.
         assert_eq!(flag_tokens("--color=<WHEN>"), vec!["--color"]);
+        assert_eq!(flag_tokens("--color[=WHEN]"), vec!["--color"]);
+        assert_eq!(flag_tokens("-i[SUFFIX]"), vec!["-i"]);
         assert_eq!(flag_tokens("--long-only"), vec!["--long-only"]);
     }
 
@@ -709,6 +728,7 @@ Setup:
 Diagnostics:
   doctor                 Check that the daemon is healthy
   reset-personalization  Clear all learned preferences
+  build, b               Aliased row (cargo-style): index the primary name
 
 Options:
   -h, --help     Print help
@@ -727,6 +747,9 @@ Run 'shac help <COMMAND>' for more information on a specific command.
         assert!(subs.contains(&"daemon"));
         assert!(subs.contains(&"doctor"));
         assert!(subs.contains(&"reset-personalization"));
+        // Aliased row indexes the primary name, not the comma-joined column.
+        assert!(subs.contains(&"build"), "cargo-style alias: {subs:?}");
+        assert!(!subs.iter().any(|s| s.contains(',')));
 
         let opts: Vec<&str> = docs
             .iter()

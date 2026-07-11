@@ -24,6 +24,12 @@ REPO = "Neftedollar/sh-autocomplete"
 
 def patch_platform(src: str, os_kw: str, filename: str, tag: str, sha: str) -> str:
     """Replace the url + sha256 inside a single `on_<os_kw> do ... end` block."""
+    # Last gate before the tap: refuse to render an empty/garbage sha256, which
+    # would ship a formula that fails every `brew install` with a checksum error.
+    if not re.fullmatch(r"[0-9a-f]{64}", sha):
+        raise SystemExit(
+            f"render_tap_formula: {os_kw} sha256 is not 64 hex chars: {sha!r}"
+        )
     url = f"https://github.com/{REPO}/releases/download/{tag}/{filename}"
 
     def repl(match: "re.Match[str]") -> str:

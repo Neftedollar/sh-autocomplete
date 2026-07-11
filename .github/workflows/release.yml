@@ -100,8 +100,13 @@ jobs:
             echo "asset ${name} never became available" >&2
             return 1
           }
-          echo "macos=$(fetch_sha shac-macos-universal.tar.gz)" >> "$GITHUB_OUTPUT"
-          echo "linux=$(fetch_sha shac-linux-x86_64.tar.gz)" >> "$GITHUB_OUTPUT"
+          # Plain assignment (not `echo "x=$(...)"`): a command-substitution
+          # failure inside an echo argument does NOT fail the step under
+          # `set -e` — echo's own exit 0 wins — which would ship `sha256 ""`.
+          macos_sha=$(fetch_sha shac-macos-universal.tar.gz)
+          linux_sha=$(fetch_sha shac-linux-x86_64.tar.gz)
+          echo "macos=${macos_sha}" >> "$GITHUB_OUTPUT"
+          echo "linux=${linux_sha}" >> "$GITHUB_OUTPUT"
 
       - name: Checkout homebrew-shac tap
         uses: actions/checkout@v6

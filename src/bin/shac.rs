@@ -973,7 +973,7 @@ fn daemon_version_check(paths: &AppPaths) -> serde_json::Value {
         );
     }
     let daemon = probe_daemon_version(paths);
-    let (ok, detail) = version_skew_detail(client, daemon.as_deref());
+    let (ok, detail) = version_skew_detail(client, &daemon);
     doctor_check("daemon_version", ok, detail)
 }
 
@@ -982,17 +982,38 @@ fn daemon_version_check(paths: &AppPaths) -> serde_json::Value {
 /// mismatch is a failure; an unreadable version (probe error/timeout) stays OK
 /// so a transient hiccup doesn't cry wolf — `daemon_running` already covers
 /// connectivity.
-fn version_skew_detail(client: &str, daemon: Option<&str>) -> (bool, String) {
+/// Outcome of probing the running daemon for its version.
+enum DaemonVersionProbe {
+    /// The daemon reported its version.
+    Version(String),
+    /// The daemon answered but the response carried no `daemon_version` field —
+    /// definitionally a pre-0.5.2 daemon (the field has shipped since v0.5.2),
+    /// i.e. exactly the stale daemon this check exists to catch.
+    MissingField,
+    /// Could not reach or decode the daemon (connect, timeout, or parse error).
+    Unreachable,
+}
+
+fn version_skew_detail(client: &str, daemon: &DaemonVersionProbe) -> (bool, String) {
     match daemon {
-        Some(d) if d == client => (true, format!("client and daemon both v{client}")),
-        Some(d) => (
+        DaemonVersionProbe::Version(d) if d == client => {
+            (true, format!("client and daemon both v{client}"))
+        }
+        DaemonVersionProbe::Version(d) => (
             false,
             format!(
                 "daemon v{d} still running but client is v{client} — run `shac daemon restart` \
                  (`brew upgrade` leaves the old daemon in memory)"
             ),
         ),
-        None => (
+        DaemonVersionProbe::MissingField => (
+            false,
+            format!(
+                "a pre-0.5.2 daemon is still running (client is v{client}) — run \
+                 `shac daemon restart`"
+            ),
+        ),
+        DaemonVersionProbe::Unreachable => (
             true,
             format!("client v{client}; could not read running daemon version"),
         ),
@@ -1000,15 +1021,20 @@ fn version_skew_detail(client: &str, daemon: Option<&str>) -> (bool, String) {
 }
 
 /// Ask the running daemon for its version via a minimal read-only `complete`
-/// probe (the only action whose response carries `daemon_version`). Returns
-/// None on any connect/timeout/parse error.
-fn probe_daemon_version(paths: &AppPaths) -> Option<String> {
+/// probe (the only action whose response carries `daemon_version`). Distinguishes
+/// a genuinely absent version field (old daemon) from an unreachable daemon.
+fn probe_daemon_version(paths: &AppPaths) -> DaemonVersionProbe {
+    let mut env = std::collections::HashMap::new();
+    // Keep the probe read-only: SHAC_NO_TIPS stops the daemon claiming the
+    // one-shot first-run greeter or advancing tip-cooldown state for this
+    // throwaway request (maybe_pick_tip gates on it).
+    env.insert("SHAC_NO_TIPS".to_string(), "1".to_string());
     let req = CompletionRequest {
         shell: "zsh".to_string(),
         line: String::new(),
         cursor: 0,
         cwd: ".".to_string(),
-        env: std::collections::HashMap::new(),
+        env,
         session: SessionInfo {
             tty: None,
             pid: None,
@@ -1018,16 +1044,25 @@ fn probe_daemon_version(paths: &AppPaths) -> Option<String> {
             runtime_commands: Vec::new(),
         },
     };
-    let payload = serde_json::to_value(req).ok()?;
+    let payload = match serde_json::to_value(req) {
+        Ok(payload) => payload,
+        Err(_) => return DaemonVersionProbe::Unreachable,
+    };
     // A generous one-shot timeout: unlike a live completion this is a manual
     // diagnostic, and the production `daemon_timeout_ms` (tens of ms) is too
     // tight for the empty-line probe, which triggers a full candidate compute.
     let response =
-        send_request_with_timeout(paths, "complete", payload, Duration::from_millis(1000)).ok()?;
-    response
+        match send_request_with_timeout(paths, "complete", payload, Duration::from_millis(1000)) {
+            Ok(response) => response,
+            Err(_) => return DaemonVersionProbe::Unreachable,
+        };
+    match response
         .get("daemon_version")
         .and_then(|value| value.as_str())
-        .map(|value| value.to_string())
+    {
+        Some(version) => DaemonVersionProbe::Version(version.to_string()),
+        None => DaemonVersionProbe::MissingField,
+    }
 }
 
 fn zsh_doctor_checks(paths: &AppPaths) -> Result<Vec<serde_json::Value>> {
@@ -1859,7 +1894,19 @@ fn print_completion_response(
                 .and_then(|value| value.as_str())
                 .unwrap_or_default();
             let item_ctx = item_token_context(&ctx, typed_home_user, &item);
-            let quoted_insert = quote_token(shell, &item_ctx, insert_text);
+            // A whole command line resurrected from history/transitions (kind
+            // `history`/`command`, multi-word) replaces the buffer and is
+            // already valid shell — per-token escaping would turn `cd ..` into
+            // `cd\ ..` (one broken word that executes as "command not found: cd
+            // .."). Single-token candidates (paths, options, subcommands) are
+            // still escaped. Mirrors the widget's `_shac_selected_is_full_line`.
+            let is_full_line_command =
+                matches!(kind, "history" | "command") && item_key.contains(' ');
+            let quoted_insert = if is_full_line_command {
+                insert_text.to_string()
+            } else {
+                quote_token(shell, &item_ctx, insert_text)
+            };
             println!(
                 "{}\t{}\t{}\t{}\t{}\t{}",
                 encode_field(item_key),
@@ -2522,20 +2569,28 @@ mod completion_response_tests {
     #[test]
     fn version_skew_detail_flags_only_confirmed_mismatch() {
         // Matching versions: ok, no alarm.
-        let (ok, _) = version_skew_detail("0.6.4", Some("0.6.4"));
+        let (ok, _) =
+            version_skew_detail("0.6.4", &DaemonVersionProbe::Version("0.6.4".to_string()));
         assert!(ok);
 
         // Confirmed mismatch (stale daemon after brew upgrade): fail, and the
         // detail must tell the user exactly how to fix it.
-        let (ok, detail) = version_skew_detail("0.6.4", Some("0.5.3"));
+        let (ok, detail) =
+            version_skew_detail("0.6.4", &DaemonVersionProbe::Version("0.5.3".to_string()));
         assert!(!ok);
         assert!(detail.contains("0.5.3"));
         assert!(detail.contains("0.6.4"));
         assert!(detail.contains("shac daemon restart"));
 
-        // Unreadable version (probe timeout/error): stays OK so a transient
-        // hiccup doesn't cry wolf.
-        let (ok, _) = version_skew_detail("0.6.4", None);
+        // A daemon that answers but omits the version field is a confirmed
+        // pre-0.5.2 daemon — fail, don't wave it through.
+        let (ok, detail) = version_skew_detail("0.6.4", &DaemonVersionProbe::MissingField);
+        assert!(!ok);
+        assert!(detail.contains("shac daemon restart"));
+
+        // Unreachable (probe timeout/error): stays OK so a transient hiccup
+        // doesn't cry wolf.
+        let (ok, _) = version_skew_detail("0.6.4", &DaemonVersionProbe::Unreachable);
         assert!(ok);
     }
 

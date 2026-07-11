@@ -453,19 +453,22 @@ impl AppDb {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
-    pub fn search_docs(&self, query: &str, limit: usize) -> Result<Vec<StoredDoc>> {
+    pub fn search_docs(&self, command: &str, query: &str, limit: usize) -> Result<Vec<StoredDoc>> {
         // FTS5 treats special chars (. * ^ " etc.) as syntax; wrap in double
         // quotes and escape internal quotes so arbitrary prefixes don't error.
         let escaped = query.replace('"', "\"\"");
         let fts_query = format!("\"{escaped}\"*");
+        // Scope to the current command: without the `d.command = ?` filter the
+        // FTS matched every command's docs, so `git c<Tab>` surfaced mdfind's
+        // `-case_sensitive`, another tool's mangled roff, etc.
         let mut stmt = self.conn.prepare(
             "SELECT d.command, d.item_type, d.item_value, d.description, d.source
              FROM command_docs_fts f
              JOIN command_docs d ON d.id = f.rowid
-             WHERE command_docs_fts MATCH ?1
-             LIMIT ?2",
+             WHERE command_docs_fts MATCH ?1 AND d.command = ?2
+             LIMIT ?3",
         )?;
-        let rows = stmt.query_map(params![fts_query, limit as i64], |row| {
+        let rows = stmt.query_map(params![fts_query, command, limit as i64], |row| {
             Ok(StoredDoc {
                 command: row.get(0)?,
                 item_type: row.get(1)?,
