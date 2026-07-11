@@ -272,6 +272,8 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
       if [[ "$line" == __shac_request_id$'\t'* ]]; then
         local -a header=("${(ps:\t:)line}")
         _shac_decode "${header[2]:-}"
+        # "0" is the no-request sentinel, not a real id (see _shac_open_menu).
+        [[ "$REPLY" == "0" ]] && REPLY=""
         request_id="$REPLY"
       elif [[ "$line" == __shac_*$'\t'* ]]; then
         # Skip any other sentinel rows (e.g. __shac_tip) — inline mode only
@@ -684,6 +686,12 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
         local -a header
         header=("${(ps:\t:)line}")
         _shac_decode "${header[2]:-}"
+        # "0" is the daemon's no-traceable-request sentinel (emitted for a
+        # zero-candidate response so the TSV request-id field stays non-empty
+        # and doesn't shift wire parsing — F2). Treat it as "no request" so a
+        # later accept-record never sends --accepted-request-id 0, which the
+        # server would mis-attribute to an unrelated recent request (codex/#40).
+        [[ "$REPLY" == "0" ]] && REPLY=""
         _shac_last_request_id="$REPLY"
       elif [[ "$line" == __shac_tip$'\t'* ]]; then
         if [[ -z "${SHAC_NO_TIPS:-}" ]]; then

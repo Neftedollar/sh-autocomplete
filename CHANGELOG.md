@@ -54,6 +54,23 @@ protocol flag.
   was still finishing. The ceiling for this explicit, non-latency-sensitive
   command is now 30 s.
 
+### Fixed — follow-ups from prior-PR review comments
+- **A no-match Tab no longer mis-attributes the next command.** v0.6.11's F2
+  fix emitted `0` (instead of an empty field) for a zero-candidate response;
+  clients then treated that non-empty sentinel as a live request id, so running
+  the line within 30 s recorded `--accepted-request-id 0` and the server
+  fell back to guessing a recent request. All three adapters now treat `0` as
+  "no request".
+- **A history flag no longer shadows a `-file` path candidate.** In a path
+  context, a dash-prefixed history token (e.g. `vim -notes`) was classified as
+  an option and could win over the real path candidate, dropping the leading-
+  dash `./` guard; it now stays a path (`./-notes`).
+- **bash Tab is no longer a dead key when shac has no candidate.** The bash≥4
+  `bind -x` path returned without deferring to readline (which a `bind -x`
+  handler can't invoke), so a down/disabled daemon left Tab inert. It now
+  emulates default filesystem completion for simple tokens (unique match or
+  longest common prefix), leaving quoted/escaped/`~` tokens untouched.
+
 ## v0.6.11 — 2026-07-11
 
 Wire-protocol hardening from the holistic Fable review (the seam three focused

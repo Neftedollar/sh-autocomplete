@@ -150,6 +150,12 @@ if [[ -z "${_SHAC_BASH_LOADED:-}" ]]; then
         local -a header
         IFS=$'\t' read -r -a header <<< "$resp_line"
         _shac_decode "${header[1]:-}"
+        # "0" is the daemon's no-traceable-request sentinel (a zero-candidate
+        # response keeps the TSV field non-empty for wire alignment — F2).
+        # Treat it as "no request" so the 30s accept heuristic below never
+        # sends --accepted-request-id 0 for a no-match Tab, which the server
+        # would mis-attribute to an unrelated recent request (codex/#40).
+        [[ "$REPLY" == "0" ]] && REPLY=""
         request_id="$REPLY"
       elif [[ "$resp_line" == __shac_*$'\t'* ]]; then
         # Skip other sentinel rows (e.g. __shac_tip) -- bash has no menu to
@@ -171,6 +177,45 @@ if [[ -z "${_SHAC_BASH_LOADED:-}" ]]; then
       _shac_last_completion_line="$line"
       _shac_last_completion_ts="$(date +%s)"
     fi
+  }
+
+  _shac_bash_default_fallback() {
+    # readline's own Tab is unreachable from a bind -x handler, so when shac
+    # has no candidate (daemon down/disabled/timed out, or no match) Tab would
+    # otherwise be a dead key (codex/#28). Emulate the default filesystem
+    # completion for the active token so Tab keeps working. Scope guard: only
+    # SIMPLE tokens (no quoting/escaping, no `~`) — for those we can't safely
+    # reconstruct the user's intent, so leave them a no-op rather than risk a
+    # wrong splice. Multi-match LISTING is out of scope (a bind -x handler
+    # can't cleanly redraw the completion list); we still insert the longest
+    # common prefix, which is the useful part.
+    local token="$1"
+    case "$token" in
+      *[\'\"\\~]*) return ;;
+    esac
+    local -a matches=()
+    local m
+    while IFS= read -r m; do matches+=("$m"); done < <(compgen -f -- "$token" 2>/dev/null)
+    (( ${#matches[@]} == 0 )) && return
+    local completion="${matches[0]}"
+    if (( ${#matches[@]} == 1 )); then
+      [[ -d "$completion" ]] && completion="${completion%/}/"
+    else
+      # Longest common prefix across all matches.
+      for m in "${matches[@]:1}"; do
+        while [[ "$m" != "$completion"* ]]; do
+          completion="${completion%?}"
+          [[ -z "$completion" ]] && return
+        done
+      done
+    fi
+    # Only act if it actually extends what's typed.
+    [[ "$completion" == "$token" ]] && return
+    local escaped
+    printf -v escaped '%q' "$completion"
+    READLINE_LINE="${_shac_bash_before}${escaped}${_shac_bash_after}"
+    _shac_bash_byte_length "${_shac_bash_before}${escaped}"
+    READLINE_POINT=$REPLY
   }
 
   _shac_bash_complete() {
@@ -195,7 +240,13 @@ if [[ -z "${_SHAC_BASH_LOADED:-}" ]]; then
     cursor_chars="$REPLY"
     _shac_bash_request "$line" "$cursor_chars"
 
-    [[ ${#_shac_bash_candidates[@]} -eq 0 ]] && return
+    if [[ ${#_shac_bash_candidates[@]} -eq 0 ]]; then
+      # The active token is the region between the before/after splice points.
+      local token="${line:${#_shac_bash_before}}"
+      token="${token%"$_shac_bash_after"}"
+      _shac_bash_default_fallback "$token"
+      return
+    fi
     _shac_bash_splice_candidate
   }
 

@@ -2722,7 +2722,13 @@ fn project_history_candidate(
     // SubcommandOrArg position, but a real subcommand never starts with `-`.
     // Classify it as an option so it inserts bare instead of getting the
     // leading-dash `./` path guard (which would yield the broken `bash ./--help`).
-    let kind = if token.starts_with('-') {
+    //
+    // But NOT in a path context: there a `-notes` history token denotes a file
+    // literally named `-notes`, and must keep kind `path` so `quote_token`
+    // applies the `./` guard (`./-notes`). Marking it `option` would let a
+    // history entry shadow the real path candidate and pass `-notes` to the
+    // command as flags (codex/#35).
+    let kind = if token.starts_with('-') && !matches!(parsed.role, TokenRole::Path) {
         "option"
     } else {
         match parsed.role {
@@ -3502,6 +3508,34 @@ mod tests {
             project_history_candidate("bash script.sh", &parsed).expect("arg candidate");
         assert_eq!(token, "script.sh");
         assert_eq!(kind, "subcommand");
+    }
+
+    #[test]
+    fn project_history_candidate_keeps_dash_token_as_path_in_path_context() {
+        // In a Path context (e.g. `vim -notes` where the arg slot is path-like),
+        // a dash-prefixed history token is a filename, not a flag: it must stay
+        // kind "path" so the `./` guard applies on accept (`./-notes`) rather
+        // than being marked "option" and shadowing the real path candidate
+        // (codex/#35).
+        let parsed = ParsedContext {
+            line_before_cursor: "vim ".to_string(),
+            tokens: vec!["vim".to_string(), String::new()],
+            active_token: String::new(),
+            active_index: 1,
+            role: TokenRole::Path,
+            command: Some("vim".to_string()),
+            prev_token: Some("vim".to_string()),
+            project_markers: Vec::new(),
+            open_quote: None,
+        };
+
+        let (token, _display, kind) =
+            project_history_candidate("vim -notes", &parsed).expect("path candidate");
+        assert_eq!(token, "-notes");
+        assert_eq!(
+            kind, "path",
+            "a dash token in a path context stays a path, not an option"
+        );
     }
 
     #[test]
