@@ -9,7 +9,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use clap::Parser;
 use shac::config::{AppConfig, AppPaths};
-use shac::db::{AppDb, COMPLETION_TELEMETRY_RETENTION_DAYS};
+use shac::db::{AppDb, COMPLETION_TELEMETRY_RETENTION_DAYS, HISTORY_RETENTION_DAYS};
 use shac::engine::Engine;
 use shac::indexer;
 use shac::protocol::RecordCommandRequest;
@@ -132,11 +132,25 @@ fn main() -> Result<()> {
                     // takes effect without restarting the daemon — this is
                     // the user-facing privacy control, it should be
                     // responsive.
-                    let retention_days = AppConfig::load(&config_paths)
+                    let config = AppConfig::load(&config_paths).ok();
+                    let telemetry_days = config
+                        .as_ref()
                         .map(|c| c.telemetry_retention_days as i64)
                         .unwrap_or(COMPLETION_TELEMETRY_RETENTION_DAYS);
-                    if let Err(e) = db.prune_completion_telemetry(retention_days) {
+                    if let Err(e) = db.prune_completion_telemetry(telemetry_days) {
                         eprintln!("shac: telemetry prune error: {e}");
+                    }
+                    // Also cap the recorded shell-command history so the DB
+                    // can't grow without bound over months of use. Same
+                    // reload-per-tick rationale as telemetry: `shac config set
+                    // history_retention_days ...` takes effect without a
+                    // daemon restart.
+                    let history_days = config
+                        .as_ref()
+                        .map(|c| c.history_retention_days as i64)
+                        .unwrap_or(HISTORY_RETENTION_DAYS);
+                    if let Err(e) = db.prune_history_events(history_days) {
+                        eprintln!("shac: history prune error: {e}");
                     }
                     // bg indexer never shells out to `<cmd> --help`; only
                     // records names + paths and seeds bundled static_docs.

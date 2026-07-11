@@ -306,6 +306,19 @@ impl Engine {
     }
 
     pub fn record_command(&self, request: RecordCommandRequest) -> Result<()> {
+        // Global kill-switch: when the user has disabled shac, persist nothing
+        // — no history, transitions, project profiles, or cd frecency (F4).
+        if !self.config.enabled {
+            return Ok(());
+        }
+        // Privacy convention mirroring bash `HISTCONTROL=ignorespace` / zsh
+        // `HIST_IGNORE_SPACE`: a command the user prefixed with a space (or
+        // tab) is intentionally ephemeral. Skip recording it entirely so a
+        // secret-bearing ` export TOKEN=...` or ` cd /private` never lands in
+        // history or the cd index (F4).
+        if request.command.starts_with(' ') || request.command.starts_with('\t') {
+            return Ok(());
+        }
         self.db.record_history(&request)?;
         Ok(())
     }
@@ -3184,6 +3197,67 @@ mod tests {
         };
         let engine = Engine::new(&paths).expect("engine");
         (engine, dir)
+    }
+
+    fn record_req(command: &str, cwd: &str) -> crate::protocol::RecordCommandRequest {
+        // Interactive typed_manual hints so the event classifies as a clean
+        // signal that `latest_command` will return (it filters to
+        // interactive/typed rows), letting the test observe whether recording
+        // happened at all.
+        crate::protocol::RecordCommandRequest {
+            command: command.to_string(),
+            cwd: cwd.to_string(),
+            shell: Some("zsh".to_string()),
+            trust: Some("interactive".to_string()),
+            provenance: Some("typed_manual".to_string()),
+            provenance_source: None,
+            provenance_confidence: None,
+            origin: Some("zsh_precmd".to_string()),
+            tty_present: Some(true),
+            exit_status: Some(0),
+            accepted_request_id: None,
+            accepted_item_key: None,
+            accepted_rank: None,
+        }
+    }
+
+    #[test]
+    fn record_command_skips_leading_space_commands() {
+        let (engine, _dir) = test_engine("rec-ignorespace");
+        // A space-prefixed command is intentionally ephemeral (HISTCONTROL
+        // ignorespace convention) — it must not be persisted.
+        engine
+            .record_command(record_req(" secret --token=abc", "/tmp"))
+            .expect("record");
+        assert_eq!(
+            engine.db.latest_command().expect("latest"),
+            None,
+            "a leading-space command must not be recorded"
+        );
+
+        // A normal command is recorded as usual.
+        engine
+            .record_command(record_req("ls -la", "/tmp"))
+            .expect("record");
+        assert_eq!(
+            engine.db.latest_command().expect("latest").as_deref(),
+            Some("ls -la"),
+            "a normal command is recorded"
+        );
+    }
+
+    #[test]
+    fn record_command_skips_when_disabled() {
+        let (mut engine, _dir) = test_engine("rec-disabled");
+        engine.config.enabled = false;
+        engine
+            .record_command(record_req("ls -la", "/tmp"))
+            .expect("record");
+        assert_eq!(
+            engine.db.latest_command().expect("latest"),
+            None,
+            "nothing is recorded while shac is disabled"
+        );
     }
 
     fn make_request(line: &str, cwd: &str) -> CompletionRequest {
