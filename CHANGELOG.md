@@ -69,7 +69,45 @@ protocol flag.
   `bind -x` path returned without deferring to readline (which a `bind -x`
   handler can't invoke), so a down/disabled daemon left Tab inert. It now
   emulates default filesystem completion for simple tokens (unique match or
-  longest common prefix), leaving quoted/escaped/`~` tokens untouched.
+  longest common prefix), leaving quoted/escaped/`~` tokens untouched; at the
+  command position it completes command names, not filenames.
+
+### Fixed — from an adversarial (Fable) review of this batch
+- **Configuring history retention no longer wipes your imported history.**
+  Plain (non-`EXTENDED_HISTORY`) zsh history imports as `ts = 0` with the real
+  clock in `imported_at`; the new prune keyed only on `ts`, so the first
+  background tick deleted the entire imported corpus (and re-armed on
+  re-import). Retention now keys off whichever of `ts`/`imported_at` is more
+  recent.
+- **The whole-line Enter feature actually works in zsh now.** The candidate
+  TSV split elided the empty description field, shifting the `full_line` flag
+  into the description slot — so Enter on a resurrected history line inserted
+  instead of running it, and a stray `1`/`0` showed as the menu description.
+- **A daemon shellout can no longer wedge completions.** A grandchild that
+  inherited a `git`/`man`/`--help` process's stdout pipe kept the drain from
+  seeing EOF, blocking the single-threaded daemon far past the timeout. Each
+  shellout now runs in its own process group (killed as a unit on timeout) and
+  the collect is bounded, so a stuck descendant can't stall other shells.
+- **Resurrecting a history line after `&&`/`|`/`;` no longer breaks it.** The
+  escape decision was tied to the Enter-runs-it flag, but a whole history line
+  offered at a chained command position isn't a whole-buffer replacement, so it
+  was per-token escaped into `git\ commit\ …`. Escaping now keys off a separate
+  "already valid shell" signal.
+- **`config set enabled false` now stops a running daemon from recording.** The
+  daemon cached `enabled` at startup and the client never re-checked it, so
+  recording continued after a disable while completions went quiet. The client
+  now honors the kill-switch and the daemon reloads `enabled` per record.
+- **Redirect targets complete files again.** `cat > <Tab>` / `cat > -n<Tab>`
+  returned nothing (the path dispatch was gated on a command the redirect
+  segment doesn't have); they now offer filesystem candidates.
+- **bash multibyte cursor fix.** `mv Café tmp` with the cursor after `Café`
+  selected the wrong token (a byte offset fed a character-indexed walker); the
+  offset is now converted first.
+- Locale cache keys are sanitized (a hostile `SHAC_LOCALE` can no longer bloat
+  the per-locale cache); the control socket's actual mode is checked at startup
+  and warned about if not owner-only. Note: a `--help` that prints then hangs
+  past its deadline now indexes nothing from help (previously a truncated
+  parse), with `man` as the fallback.
 
 ## v0.6.11 — 2026-07-11
 

@@ -41,7 +41,7 @@ impl Catalog {
     /// A safe locale token: 2–16 chars of ASCII alphanumerics plus `-`/`_`
     /// (e.g. `en`, `en-US`, `zh_CN`). Rejects anything path-shaped (`/`, `.`,
     /// `..`, absolute) — see `build`.
-    fn is_safe_lang_check(lang: &str) -> bool {
+    pub fn is_safe_lang_check(lang: &str) -> bool {
         (2..=16).contains(&lang.len())
             && lang
                 .chars()

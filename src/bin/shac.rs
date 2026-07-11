@@ -500,6 +500,16 @@ fn main() -> Result<()> {
             CompletionArgs::from_arg_matches(sub).unwrap_or_else(|e| e.exit()),
         ),
         Some(("record-command", sub)) => {
+            // Honor the kill-switch client-side: when shac is disabled, record
+            // nothing and don't even `ensure_daemon` (starting a daemon just to
+            // drop the record). The daemon caches `enabled` at startup, so
+            // relying on its gate alone left `config set enabled false`
+            // ineffective on a running daemon until restart — while completions
+            // went quiet client-side, so the user reasonably believed shac was
+            // off yet recording continued (review P1).
+            if shac_disabled(&paths)? {
+                return Ok(());
+            }
             ensure_daemon(&paths)?;
             let a = RecordArgs::from_arg_matches(sub).unwrap_or_else(|e| e.exit());
             send_request(
@@ -1910,19 +1920,24 @@ fn print_completion_response(
                 .and_then(|value| value.as_str())
                 .unwrap_or_default();
             let item_ctx = item_token_context(&ctx, typed_home_user, &item);
-            // The daemon is the single source of truth for whether a candidate
-            // is a whole command line (F3/F7/F8): a multi-word history/transition
-            // entry offered while the user completes the whole buffer from the
-            // start. Such a line replaces the buffer and is already valid shell,
-            // so per-token escaping (which would turn `cd ..` into `cd\ ..` — one
-            // broken word) must be skipped. Single-token candidates (paths,
-            // options, subcommands) are still escaped. The flag is emitted as
-            // field 7 so every widget keys insert/Enter off the same bit.
+            // Two daemon-computed bits, kept separate to avoid the drift F7/F8
+            // set out to kill. `verbatim`: the candidate is already a whole
+            // valid shell line (a multi-word history/transition entry at any
+            // command position — buffer start OR after `&&`/`|`/`;`), so
+            // per-token escaping (which turns `cd ..` into `cd\ ..`, one broken
+            // word) must be skipped. `full_line`: Enter may run it — only when
+            // it replaces the whole buffer — and is emitted as field 7 so every
+            // widget keys Enter/insert off the same bit. Single-token candidates
+            // (paths, options, subcommands) get neither and are escaped.
+            let verbatim = item
+                .get("verbatim")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             let full_line = item
                 .get("full_line")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
-            let quoted_insert = if full_line {
+            let quoted_insert = if verbatim {
                 insert_text.to_string()
             } else {
                 quote_token(shell, &item_ctx, insert_text)

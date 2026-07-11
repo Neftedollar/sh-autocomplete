@@ -193,13 +193,23 @@ if [[ -z "${_SHAC_BASH_LOADED:-}" ]]; then
     case "$token" in
       *[\'\"\\~]*) return ;;
     esac
+    # At the command position (nothing but whitespace before the token) real
+    # readline completes command NAMES, not filenames; elsewhere it completes
+    # files. Match that so a down-daemon `git<Tab>` at the prompt doesn't turn
+    # into a filename prefix (codex/#28 follow-up).
+    local genflag="-f" is_cmd_position=0
+    if [[ "$_shac_bash_before" =~ ^[[:space:]]*$ ]]; then
+      genflag="-c"
+      is_cmd_position=1
+    fi
     local -a matches=()
     local m
-    while IFS= read -r m; do matches+=("$m"); done < <(compgen -f -- "$token" 2>/dev/null)
+    while IFS= read -r m; do matches+=("$m"); done < <(compgen "$genflag" -- "$token" 2>/dev/null)
     (( ${#matches[@]} == 0 )) && return
     local completion="${matches[0]}"
     if (( ${#matches[@]} == 1 )); then
-      [[ -d "$completion" ]] && completion="${completion%/}/"
+      # Trailing slash only makes sense for a uniquely-completed directory.
+      (( is_cmd_position == 0 )) && [[ -d "$completion" ]] && completion="${completion%/}/"
     else
       # Longest common prefix across all matches.
       for m in "${matches[@]:1}"; do
@@ -231,13 +241,18 @@ if [[ -z "${_SHAC_BASH_LOADED:-}" ]]; then
       return
     fi
 
-    _shac_bash_active_region "$line" "$point"
-    _shac_bash_cycle_index=0
-
-    # READLINE_POINT is a byte offset; --cursor wants characters (F9).
+    # READLINE_POINT is a BYTE offset; both the daemon (--cursor) and the
+    # quote-aware region walker index CHARACTERS, so convert once up front and
+    # feed the char offset to both. Passing the raw byte point to
+    # active_region selected the wrong token when multibyte text sat before a
+    # mid-line cursor, e.g. `mv Café tmp` cursor after `Café` grabbed `tmp` (F9).
     local cursor_chars
     _shac_bash_char_point "$line" "$point"
     cursor_chars="$REPLY"
+
+    _shac_bash_active_region "$line" "$cursor_chars"
+    _shac_bash_cycle_index=0
+
     _shac_bash_request "$line" "$cursor_chars"
 
     if [[ ${#_shac_bash_candidates[@]} -eq 0 ]]; then

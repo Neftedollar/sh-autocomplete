@@ -1494,11 +1494,24 @@ impl AppDb {
     /// learned transitions. `retention_days <= 0` prunes everything on the next
     /// cycle, for users who don't want persistent history at all. Returns the
     /// number of rows pruned.
+    ///
+    /// Retention is measured from whichever clock is more recent: the command's
+    /// own timestamp (live rows) or when it entered our DB (`imported_at`, for
+    /// imported rows). Plain (non-`EXTENDED_HISTORY`) zsh history — the zsh
+    /// default — carries no timestamps, so `import` stores `ts = 0` and keeps
+    /// the real clock in `imported_at`. Pruning on `ts` alone would delete the
+    /// entire imported corpus on the first tick (and re-arm on every re-import,
+    /// since the `import_hash` rows vanish with it). A row survives while
+    /// EITHER clock is inside the window.
     pub fn prune_history_events(&self, retention_days: i64) -> Result<usize> {
         let cutoff = unix_ts() - retention_days.max(0) * 86_400;
         let deleted = self
             .conn
-            .execute("DELETE FROM history_events WHERE ts < ?1", params![cutoff])
+            .execute(
+                "DELETE FROM history_events
+                 WHERE ts < ?1 AND (imported_at IS NULL OR imported_at < ?1)",
+                params![cutoff],
+            )
             .context("prune history events")?;
         Ok(deleted)
     }
@@ -2568,6 +2581,45 @@ mod tests {
             .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap();
         assert_eq!(surviving, vec!["ls -recent".to_string()]);
+    }
+
+    /// Plain (non-EXTENDED) zsh history imports store `ts = 0` with the real
+    /// clock in `imported_at`. Retention must key off `imported_at` for those,
+    /// or a single prune tick wipes the whole imported corpus. Recently-imported
+    /// zero-ts rows survive; a stale import (imported > window ago) is pruned.
+    #[test]
+    fn prune_history_events_keeps_recently_imported_zero_ts() {
+        let db = test_db();
+        let now = unix_ts();
+        for (ts, imported_at, cmd) in [
+            (0_i64, now - 1, "imported-fresh"), // zero ts, just imported
+            (0_i64, now - 400 * 86_400, "imported-stale"), // imported > 365d ago
+        ] {
+            db.conn
+                .execute(
+                    "INSERT INTO history_events(ts, cwd, command, imported_at)
+                     VALUES (?1, '/tmp', ?2, ?3)",
+                    params![ts, cmd, imported_at],
+                )
+                .expect("insert imported history");
+        }
+
+        let deleted = db.prune_history_events(365).expect("prune history");
+        assert_eq!(deleted, 1, "only the stale import is pruned");
+
+        let surviving: Vec<String> = db
+            .conn
+            .prepare("SELECT command FROM history_events")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            surviving,
+            vec!["imported-fresh".to_string()],
+            "a freshly imported zero-ts row must survive retention"
+        );
     }
 
     /// `history_retention_days = 0` prunes everything on the next cycle, for

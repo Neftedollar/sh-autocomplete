@@ -317,8 +317,14 @@ you still benefit from.
 
 ```bash
 shac config set history_retention_days 90   # keep three months
-shac config set history_retention_days 0    # no persistent history at all
+shac config set history_retention_days 0    # prune history_events every tick
 ```
+
+Retention prunes the `history_events` table. Aggregates derived from it —
+learned `transitions` and the `cd` frecency index (`paths_index`) — are not
+time-stamped and are **not** cleared by retention, so `0` bounds the raw log
+but is not a privacy wipe. To erase all learned personalization, run
+`shac reset-personalization`.
 
 Two commands are never recorded in the first place:
 

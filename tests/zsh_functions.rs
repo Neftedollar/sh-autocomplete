@@ -1,6 +1,8 @@
 mod support;
 
+use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[test]
 fn zsh_preview_replaces_only_active_token() {
@@ -141,6 +143,86 @@ _shac_menu_selected_index=1
 _shac_selected_is_full_line && REPLY=yes || REPLY=no
 assert_eq "$REPLY" "no" "missing flag defaults to not full_line"
 "#,
+    );
+}
+
+/// Drive the REAL `_shac_fetch_candidates` parse loop against a fake `shac` on
+/// PATH emitting `response`, and return (full_lines, descriptions) as the
+/// comma-joined `_shac_menu_*` arrays it builds. Unlike the direct-assignment
+/// test above, this exercises the TSV field split — the layer where full_line
+/// was being lost.
+fn fetch_candidate_arrays(response: &str) -> (String, String) {
+    let script_path = std::env::current_dir()
+        .expect("cwd")
+        .join("shell/zsh/shac.zsh");
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("shac-zfetch-{}-{}", std::process::id(), nanos));
+    std::fs::create_dir_all(&dir).expect("mk fake bin dir");
+    let respfile = dir.join("resp.txt");
+    std::fs::write(&respfile, response).expect("write response");
+    let fake = dir.join("shac");
+    std::fs::write(
+        &fake,
+        format!("#!/bin/sh\ncat {:?}\n", respfile.to_string_lossy()),
+    )
+    .expect("write fake shac");
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+    let body = format!(
+        r#"
+export PATH="{dir}:$PATH"
+source "{script}"
+BUFFER="git st"
+CURSOR=6
+_shac_fetch_candidates
+print -r -- "${{(j:,:)_shac_menu_full_lines}}"
+print -r -- "${{(j:,:)_shac_menu_descriptions}}"
+"#,
+        dir = dir.display(),
+        script = script_path.display(),
+    );
+    let output = Command::new("zsh")
+        .arg("-f")
+        .arg("-c")
+        .arg(body)
+        .env("SHAC_ZSH_TEST_MODE", "1")
+        .output()
+        .expect("run zsh");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        output.status.success(),
+        "zsh failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let mut lines = stdout.lines();
+    (
+        lines.next().unwrap_or_default().to_string(),
+        lines.next().unwrap_or_default().to_string(),
+    )
+}
+
+#[test]
+fn zsh_fetch_preserves_full_line_flag_with_empty_description() {
+    if !support::command_available("zsh") {
+        eprintln!("skipping zsh function tests: zsh is unavailable");
+        return;
+    }
+
+    // A full-line history candidate has an EMPTY description (field 6) and
+    // full_line=1 (field 7). The candidate split must preserve the interior
+    // empty field so the flag lands in _shac_menu_full_lines, not shifted into
+    // the description slot (F3/F7/F8 regression).
+    let response = "__shac_request_id\t1\treplace_token\t1\n\
+         hist:git status\tgit status\tgit status\thistory\thistory\t\t1\n";
+    let (full_lines, descriptions) = fetch_candidate_arrays(response);
+    assert_eq!(full_lines, "1", "full_line flag must survive the TSV split");
+    assert_eq!(
+        descriptions, "",
+        "empty description must stay empty, not absorb the full_line flag"
     );
 }
 

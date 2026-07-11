@@ -73,6 +73,17 @@ pub struct CompletionItem {
     /// `false`, the conservative "treat as a plain token" default.
     #[serde(default)]
     pub full_line: bool,
+    /// True when `insert_text` is a whole shell line that is already valid
+    /// syntax and must be inserted VERBATIM, not per-token escaped (escaping
+    /// would turn `git commit -m wip` into `git\ commit\ -m\ wip`, one broken
+    /// word). This is the escaping counterpart of `full_line` and a strict
+    /// SUPERSET of it: a resurrected history/transition line is verbatim at
+    /// *any* command position (buffer start or after `&&`/`|`/`;`), whereas
+    /// `full_line` (Enter-runs-it) holds only when it also replaces the whole
+    /// buffer. Keeping the two separate is what fixes the chained-command
+    /// escaping regression. Drives the CLI's quoting decision.
+    #[serde(default)]
+    pub verbatim: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

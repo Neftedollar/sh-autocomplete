@@ -720,7 +720,14 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
         # typed token (F1).
         [[ "$line" != *$'\t'* ]] && continue
         local -a fields
-        fields=("${(ps:\t:)line}")
+        # The `@` flag preserves interior EMPTY fields. Without it, a candidate
+        # with no description (field 6 — every history/runtime/transition and
+        # path row: `description: None` daemon-side) collapses the double tab,
+        # shifting field 7 (`full_line`) into the description slot: the flag is
+        # lost (defaults to 0 → whole-line Enter is inert) and a stray `1`/`0`
+        # renders as the menu description. Old 6-field rows stay compatible:
+        # the unset field 7 still `:-0`-defaults. (F3/F7/F8 regression fix.)
+        fields=("${(@ps:\t:)line}")
         _shac_decode "${fields[1]:-}"
         _shac_menu_item_keys+=("$REPLY")
         _shac_decode "${fields[2]:-}"

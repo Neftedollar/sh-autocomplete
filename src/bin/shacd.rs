@@ -62,10 +62,23 @@ fn main() -> Result<()> {
     let listener = UnixListener::bind(&paths.socket_file).context("bind unix socket")?;
     // The control socket is unauthenticated (any local peer can `complete`,
     // `stats`, or poison learning via `record-command`), so restrict it to the
-    // owner (F5). Best-effort chmod right after bind.
+    // owner (F5). Best-effort chmod right after bind, then verify the ACTUAL
+    // mode once at startup: if the chmod silently failed (exotic FS) and the
+    // 0700 state dir didn't shield it either, warn rather than leaving the
+    // channel quietly reachable by other local users.
     {
         use std::os::unix::fs::PermissionsExt;
         let _ = fs::set_permissions(&paths.socket_file, fs::Permissions::from_mode(0o600));
+        if let Ok(meta) = fs::metadata(&paths.socket_file) {
+            let mode = meta.permissions().mode() & 0o777;
+            if mode & 0o077 != 0 {
+                eprintln!(
+                    "shac: warning: control socket {} is group/other-accessible (mode {mode:o}); \
+                     other local users may be able to reach the daemon",
+                    paths.socket_file.display()
+                );
+            }
+        }
     }
     // Only claim the pid-file after a successful bind, so a bind failure
     // never leaves an orphaned pid-file pointing at a process that's about

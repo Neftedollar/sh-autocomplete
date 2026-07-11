@@ -217,21 +217,29 @@ impl Engine {
         items.sort_by(|left, right| cmp_score(right.item.score, left.item.score));
         items.truncate(self.config.max_results);
 
-        // Mark whole-line candidates (F3/F7/F8). A history/transition entry is
-        // a full command line only when the user is completing the whole buffer
-        // from the start — the active token spans the entire (trimmed) line and
-        // the cursor is at the end — so replacing the token replaces the buffer.
-        // In any other position `project_history_candidate` already returns a
-        // single token, which must stay a per-token insert. Erring toward
-        // `false` is safe: a missed full-line just makes Enter insert instead of
-        // run; a false full-line would run a half-built command.
-        if whole_line_replacement_context(&req, &parsed) {
-            for item in &mut items {
-                item.item.full_line = matches!(
-                    item.item.source.as_str(),
-                    "history" | "runtime_history" | "transition"
-                ) && item.item.insert_text.contains(' ');
-            }
+        // Mark whole-line candidates (F3/F7/F8). Two distinct facts, computed
+        // once by the daemon so client and widgets can't drift:
+        //   * `verbatim` — the candidate is a whole shell line already, so the
+        //     CLI must NOT per-token escape it. `project_history_candidate`
+        //     returns the whole entry whenever the active token is at COMMAND
+        //     position, which recurs after every `&&`/`|`/`;`, not just at
+        //     buffer start.
+        //   * `full_line` — Enter may RUN it, which is only safe when it also
+        //     replaces the entire buffer (active token spans the whole trimmed
+        //     line, cursor at end). Strict subset of `verbatim`.
+        // Erring toward `false` is safe on both: no escaping change / Enter
+        // inserts. A false `full_line` (run a half-command) is the only
+        // dangerous direction, and it can't happen — it requires the whole
+        // buffer to be the single history token.
+        let command_role = matches!(parsed.role, TokenRole::Command);
+        let whole_line = whole_line_replacement_context(&req, &parsed);
+        for item in &mut items {
+            let whole_entry = matches!(
+                item.item.source.as_str(),
+                "history" | "runtime_history" | "transition"
+            ) && item.item.insert_text.contains(char::is_whitespace);
+            item.item.verbatim = command_role && whole_entry;
+            item.item.full_line = whole_line && whole_entry;
         }
 
         let response_sources: Vec<String> = items.iter().map(|i| i.item.source.clone()).collect();
@@ -326,7 +334,14 @@ impl Engine {
     pub fn record_command(&self, request: RecordCommandRequest) -> Result<()> {
         // Global kill-switch: when the user has disabled shac, persist nothing
         // — no history, transitions, project profiles, or cd frecency (F4).
-        if !self.config.enabled {
+        // Reloaded from disk per record (a tiny TOML read; this path is
+        // fire-and-forget, not keystroke-latency-sensitive) so `config set
+        // enabled false` takes effect on a running daemon without a restart,
+        // and a direct-socket client can't bypass the CLI's own gate (review).
+        let enabled = AppConfig::load(&self.paths)
+            .map(|c| c.enabled)
+            .unwrap_or(self.config.enabled);
+        if !enabled {
             return Ok(());
         }
         // Privacy convention mirroring bash `HISTCONTROL=ignorespace` / zsh
@@ -392,28 +407,37 @@ impl Engine {
                 .cloned()
                 .or_else(|| std::env::var("LANG").ok()),
         );
-        // Build (or fetch from cache) a catalog for this exact locale so
-        // user overrides at <config_dir>/locales/<lang>.toml are picked up.
+        // Cache/build key: an UNSAFE locale (path-shaped, or absurdly long —
+        // `normalize` bounds neither length nor `/`) collapses to `en`. Without
+        // this, a client spamming distinct hostile `SHAC_LOCALE` values would
+        // fill the cache with up-to-1-MiB keys that each only map to the `en`
+        // fallback anyway (F5 — the count cap bounds entries, not bytes). A
+        // safe token is a real locale (`en`, `pt-BR`) and keys itself.
+        let lang: &str = if crate::i18n::Catalog::is_safe_lang_check(&resolved.lang) {
+            &resolved.lang
+        } else {
+            "en"
+        };
+        // Build (or fetch from cache) a catalog for this locale so user
+        // overrides at <config_dir>/locales/<lang>.toml are picked up.
         // Future work: invalidate when override file mtime changes.
         let catalog = {
-            // Cap distinct cached locales so a client spamming unique
-            // SHAC_LOCALE values can't grow daemon memory without bound (F5).
-            // The real working set is a handful of locales, so the cap is
-            // effectively never reached in normal use; once full we serve
-            // fresh builds without caching rather than evicting.
+            // Cap distinct cached locales so a client spamming unique locales
+            // can't grow daemon memory without bound (F5). The real working set
+            // is a handful; once full we serve fresh builds without caching.
             const MAX_CATALOG_CACHE: usize = 64;
             let mut cache = self.catalog_cache.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(hit) = cache.get(&resolved.lang) {
+            if let Some(hit) = cache.get(lang) {
                 hit.clone()
             } else {
-                let built = crate::i18n::Catalog::build(&self.paths.config_dir, &resolved.lang);
+                let built = crate::i18n::Catalog::build(&self.paths.config_dir, lang);
                 if cache.len() < MAX_CATALOG_CACHE {
-                    cache.insert(resolved.lang.clone(), built.clone());
+                    cache.insert(lang.to_string(), built.clone());
                 }
                 built
             }
         };
-        crate::i18n::Translator::new(resolved.lang, catalog)
+        crate::i18n::Translator::new(lang.to_string(), catalog)
     }
 
     fn maybe_pick_tip(
@@ -617,6 +641,16 @@ impl Engine {
                     );
                 }
             }
+        }
+
+        // A redirect target (`cat > fi`, `sort < in`) sits alone in its
+        // pipeline segment, so `parsed.command` is None whenever the target is
+        // empty or dash-prefixed (`cat > `, `cat > -n`); the command-gated
+        // dispatch below then never runs, leaving those a dead prompt (review
+        // P2). F3 already classifies a redirect target's active token as a
+        // Path, so offer filesystem completion (files + dirs) for it directly.
+        if parsed.command.is_none() && matches!(parsed.role, TokenRole::Path) {
+            self.collect_path_candidates(active, &req.cwd, false, &mut candidates, &mut seen)?;
         }
 
         if let Some(command) = parsed.command.as_deref() {
@@ -1652,9 +1686,11 @@ impl Engine {
                 meta: CompletionMeta {
                     description: candidate.description.clone(),
                 },
-                // Filled in by `complete` once the whole-line/cursor context
-                // is known (see `whole_line_replacement_context`).
+                // Both filled in by `complete` once the command-position and
+                // whole-line/cursor context are known (see the marking loop and
+                // `whole_line_replacement_context`).
                 full_line: false,
+                verbatim: false,
             },
             item_key: history_key,
             features,
@@ -3285,7 +3321,14 @@ mod tests {
     #[test]
     fn record_command_skips_when_disabled() {
         let (mut engine, _dir) = test_engine("rec-disabled");
+        // `record_command` reloads `enabled` from disk per call so a live
+        // `config set enabled false` takes effect without a daemon restart —
+        // so the disabled state must be persisted, not just set in memory.
         engine.config.enabled = false;
+        engine
+            .config
+            .save(&engine.paths)
+            .expect("persist disabled config");
         engine
             .record_command(record_req("ls -la", "/tmp"))
             .expect("record");
@@ -3293,6 +3336,34 @@ mod tests {
             engine.db.latest_command().expect("latest"),
             None,
             "nothing is recorded while shac is disabled"
+        );
+    }
+
+    #[test]
+    fn record_command_honors_disable_written_after_engine_start() {
+        // The daemon caches config at startup; disabling AFTER that must still
+        // stop recording (the review's stale-gate P1). Start enabled, record
+        // one command, then disable on disk and confirm the next is dropped.
+        let (engine, _dir) = test_engine("rec-disable-live");
+        engine
+            .record_command(record_req("ls -la", "/tmp"))
+            .expect("record while enabled");
+        assert_eq!(
+            engine.db.latest_command().expect("latest").as_deref(),
+            Some("ls -la"),
+        );
+
+        let mut disabled = engine.config.clone();
+        disabled.enabled = false;
+        disabled.save(&engine.paths).expect("persist disable");
+
+        engine
+            .record_command(record_req("git status", "/tmp"))
+            .expect("record while disabled");
+        assert_eq!(
+            engine.db.latest_command().expect("latest").as_deref(),
+            Some("ls -la"),
+            "a command recorded after a live disable must be dropped"
         );
     }
 
@@ -3317,6 +3388,10 @@ mod tests {
             line_item.full_line,
             "multi-word history at command position must be a full line"
         );
+        assert!(
+            line_item.verbatim,
+            "a whole-buffer history line is also verbatim (not escaped)"
+        );
 
         // Mid-line argument completion offers a single token — nothing here is
         // a whole-buffer replacement, so no item may be flagged full_line.
@@ -3329,6 +3404,70 @@ mod tests {
                 "mid-line candidate must not be full_line: {item:?}"
             );
         }
+    }
+
+    #[test]
+    fn whole_line_history_after_operator_is_verbatim_but_not_full_line() {
+        // A resurrected history line offered at a chained command position
+        // (after `&&`) is still a whole shell line → must insert VERBATIM (not
+        // per-token escaped, which would break it: `git\ commit\ -m\ wip`), but
+        // it does NOT replace the whole buffer → Enter must NOT run it. This is
+        // the chained-command escaping regression the split of verbatim from
+        // full_line fixes.
+        let (engine, _dir) = test_engine("verbatim-chained");
+        engine
+            .record_command(record_req("git commit -m wip", "/tmp"))
+            .expect("record");
+
+        let resp = engine
+            .complete(make_request("cd /tmp && gi", "/tmp"))
+            .expect("complete");
+        let item = resp
+            .items
+            .iter()
+            .find(|i| i.insert_text == "git commit -m wip")
+            .expect("whole-line history candidate should be offered after &&");
+        assert!(
+            item.verbatim,
+            "a whole shell line at any command position must be verbatim"
+        );
+        assert!(
+            !item.full_line,
+            "a non-whole-buffer line must not be Enter-runnable"
+        );
+    }
+
+    #[test]
+    fn redirect_target_offers_file_completion() {
+        let (engine, dir) = test_engine("redirect-target");
+        let cwd = dir.path.to_string_lossy().to_string();
+        std::fs::write(dir.path.join("output.log"), "").expect("seed file");
+
+        // `cat > <Tab>` — empty redirect target, no command in the segment:
+        // must still offer filesystem candidates, not dead air (review P2).
+        let empty = engine
+            .complete(make_request("cat > ", &cwd))
+            .expect("complete");
+        assert!(
+            empty
+                .items
+                .iter()
+                .any(|i| i.insert_text.contains("output.log")),
+            "empty redirect target should offer files: {:?}",
+            empty.items
+        );
+
+        // A typed prefix filters to the matching file.
+        let pref = engine
+            .complete(make_request("cat > o", &cwd))
+            .expect("complete");
+        assert!(
+            pref.items
+                .iter()
+                .any(|i| i.insert_text.contains("output.log")),
+            "prefixed redirect target should offer matching files: {:?}",
+            pref.items
+        );
     }
 
     fn make_request(line: &str, cwd: &str) -> CompletionRequest {

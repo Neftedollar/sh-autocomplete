@@ -177,6 +177,23 @@ fn active_region_is_quote_and_escape_aware() {
     );
 }
 
+#[test]
+fn active_region_uses_character_offsets_for_multibyte() {
+    if !support::command_available("bash") {
+        eprintln!("skipping: bash unavailable");
+        return;
+    }
+
+    // `mv Café tmp` — `Café` is 4 chars but 5 bytes. The cursor after `Café`
+    // is CHAR offset 7. `_shac_bash_complete` now converts READLINE_POINT
+    // (bytes) to chars before calling this, so the walker selects `Café`, not
+    // `tmp` — the F9 mid-line multibyte bug.
+    assert_eq!(
+        run_active_region("mv Café tmp", 7),
+        ("mv ".into(), " tmp".into())
+    );
+}
+
 /// Drive `_shac_bash_request` against a fake `shac` on PATH that emits
 /// `header_response`, and return the resulting `_shac_last_request_id`.
 fn last_request_id_after(header_response: &str) -> String {
@@ -301,6 +318,28 @@ fn default_fallback_completes_unique_and_common_prefix() {
     let (line, point) = run_default_fallback(&[("Documents", true)], "cat ", "", "zzz");
     assert_eq!(line, "PRESET");
     assert_eq!(point, "99");
+}
+
+#[test]
+fn default_fallback_completes_commands_not_files_at_command_position() {
+    if !support::command_available("bash") {
+        eprintln!("skipping: bash unavailable");
+        return;
+    }
+
+    // At the command position (empty `before`), a token that matches only a
+    // FILE in cwd must NOT be completed to that filename — readline completes
+    // command names there. `zzqx` matches the cwd file but no command, so the
+    // fallback is a no-op (line untouched).
+    let (line, _) = run_default_fallback(&[("zzqxfile.txt", false)], "", "", "zzqx");
+    assert_eq!(
+        line, "PRESET",
+        "a file match must not complete at the command position"
+    );
+
+    // Control: the same token DOES complete as a filename in an argument slot.
+    let (line, _) = run_default_fallback(&[("zzqxfile.txt", false)], "cat ", "", "zzqx");
+    assert_eq!(line, "cat zzqxfile.txt");
 }
 
 #[test]
