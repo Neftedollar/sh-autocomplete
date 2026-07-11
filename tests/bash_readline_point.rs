@@ -218,7 +218,9 @@ fn last_request_id_after(header_response: &str) -> String {
         r#"
 export PATH="{dir}:$PATH"
 source "{script_path}"
-_shac_last_request_id=""
+# Preset a STALE id so the "0"/no-request path is verified to CLEAR it, not
+# merely leave it unset.
+_shac_last_request_id="STALE"
 _shac_bash_request "foobar" 6
 printf '%s' "$_shac_last_request_id"
 "#,

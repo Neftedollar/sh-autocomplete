@@ -176,6 +176,13 @@ if [[ -z "${_SHAC_BASH_LOADED:-}" ]]; then
       _shac_last_request_id="$request_id"
       _shac_last_completion_line="$line"
       _shac_last_completion_ts="$(date +%s)"
+    else
+      # A no-request (zero-candidate, "0" sentinel) response: clear any stale
+      # accept-tracking so a later command can't be attributed to an unrelated
+      # earlier completion, matching the zsh adapter's unconditional reset.
+      _shac_last_request_id=""
+      _shac_last_completion_line=""
+      _shac_last_completion_ts=""
     fi
   }
 
@@ -202,6 +209,10 @@ if [[ -z "${_SHAC_BASH_LOADED:-}" ]]; then
       genflag="-c"
       is_cmd_position=1
     fi
+    # NB: a filename containing a literal newline fractures into two "matches"
+    # here (compgen is newline-delimited), so the common-prefix may splice a
+    # path that doesn't exist — a harmless no-op on the next Tab. Not worth the
+    # complexity of NUL-delimited parsing for so pathological an input.
     local -a matches=()
     local m
     while IFS= read -r m; do matches+=("$m"); done < <(compgen "$genflag" -- "$token" 2>/dev/null)

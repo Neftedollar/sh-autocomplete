@@ -97,15 +97,39 @@ fn last_segment_start(s: &str) -> (usize, bool) {
                     quote = Some(ch);
                 }
             }
-            '|' | '&' | ';' | '<' | '>' if quote.is_none() => {
+            '<' if quote.is_none() => {
+                // `<<` (heredoc) / `<<<` (here-string): the following word is a
+                // delimiter/string, NOT a filename, so don't classify it as a
+                // path. A single `<` is a real input redirection.
+                if chars.get(i + 1) == Some(&'<') {
+                    while chars.get(i + 1) == Some(&'<') {
+                        i += 1;
+                    }
+                    boundary = i + 1;
+                    redirect = false;
+                } else {
+                    boundary = i + 1;
+                    redirect = true;
+                }
+            }
+            '>' if quote.is_none() => {
+                // `>|` (zsh clobber-override) is still a file redirect; consume
+                // the `|` so it isn't later treated as a pipe boundary. `>>`
+                // (append) needs no special-casing — the second `>` re-sets the
+                // boundary and keeps `redirect` true.
+                if chars.get(i + 1) == Some(&'|') {
+                    i += 1;
+                }
+                boundary = i + 1;
+                redirect = true;
+            }
+            '|' | '&' | ';' if quote.is_none() => {
                 // Treat a doubled operator ("||", "&&") as a single boundary.
-                // ">>"/"<<" need no special-casing: each char sets the boundary
-                // and the redirect flag, so the pair lands past both.
                 if matches!(ch, '|' | '&') && chars.get(i + 1) == Some(&ch) {
                     i += 1;
                 }
                 boundary = i + 1;
-                redirect = matches!(ch, '<' | '>');
+                redirect = false;
             }
             _ => {}
         }
@@ -238,6 +262,12 @@ fn tokenize(line: &str) -> Tokenized {
             continue;
         }
         match ch {
+            // NB: `\` escapes even inside single quotes here, which POSIX
+            // doesn't (in `'a\'` the quote closes at the second `'`). This is
+            // deliberate: the zsh/bash widget span walkers mirror this exact
+            // rule, so the region a widget replaces always matches the token
+            // the daemon completed. Being self-consistent matters more than
+            // POSIX-strictness for an obscure literal-backslash-in-quotes case.
             '\\' => escaped = true,
             '\'' | '"' => {
                 if quote == Some(ch) {
@@ -340,5 +370,13 @@ mod tests {
         // A pipeline boundary is NOT a redirect: the segment head stays a
         // command so `... | gr` still completes command names.
         assert_eq!(parse("cat foo | gr", 12, cwd).role, TokenRole::Command);
+
+        // `>|` (zsh clobber-override) is still a file redirect.
+        assert_eq!(parse("echo hi >| ou", 13, cwd).role, TokenRole::Path);
+
+        // Heredoc `<<` / here-string `<<<` targets are delimiters/words, NOT
+        // files — they must NOT become a Path (no bogus file completion).
+        assert_ne!(parse("cat << EO", 9, cwd).role, TokenRole::Path);
+        assert_ne!(parse("sort <<< wor", 12, cwd).role, TokenRole::Path);
     }
 }

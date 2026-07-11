@@ -328,10 +328,12 @@ but is not a privacy wipe. To erase all learned personalization, run
 
 Two commands are never recorded in the first place:
 
-- Anything typed with a **leading space** (the same `HISTCONTROL=ignorespace` /
-  `HIST_IGNORE_SPACE` convention your shell uses) — so a one-off
-  ` export TOKEN=…` or ` cd /private` leaves no trace in history, transitions,
-  or the `cd` frecency index.
+- Anything typed with a **leading space** — so a one-off ` export TOKEN=…` or
+  ` cd /private` leaves no trace in history, transitions, or the `cd` frecency
+  index. On zsh/fish this is enforced by shac directly (the record hook sees
+  the raw line). On bash, shac records via `history`, which drops the leading
+  space, so this relies on bash's own `HISTCONTROL=ignorespace` (which then
+  never stores the command for shac to see) — set it if you want the marker.
 - Everything, while shac is disabled (`shac config set enabled false`).
 
 ## Trust-aware migration
