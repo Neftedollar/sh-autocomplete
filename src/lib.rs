@@ -6,6 +6,7 @@ pub mod i18n;
 pub mod import;
 pub mod indexer;
 pub mod priors;
+pub mod proc;
 pub mod profiles;
 pub mod protocol;
 pub mod quote;

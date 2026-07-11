@@ -60,6 +60,13 @@ fn main() -> Result<()> {
         fs::remove_file(&paths.socket_file).ok();
     }
     let listener = UnixListener::bind(&paths.socket_file).context("bind unix socket")?;
+    // The control socket is unauthenticated (any local peer can `complete`,
+    // `stats`, or poison learning via `record-command`), so restrict it to the
+    // owner (F5). Best-effort chmod right after bind.
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&paths.socket_file, fs::Permissions::from_mode(0o600));
+    }
     // Only claim the pid-file after a successful bind, so a bind failure
     // never leaves an orphaned pid-file pointing at a process that's about
     // to exit.

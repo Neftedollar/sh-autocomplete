@@ -181,10 +181,22 @@ impl AppPaths {
     }
 
     pub fn ensure(&self) -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
         fs::create_dir_all(&self.config_dir).context("create config dir")?;
         fs::create_dir_all(&self.data_dir).context("create data dir")?;
         fs::create_dir_all(&self.state_dir).context("create state dir")?;
         fs::create_dir_all(&self.shell_dir).context("create shell dir")?;
+        // These dirs hold the command-history DB and the control socket. A
+        // world-traversable dir would let another local user read the entire
+        // shell history or connect to the unauthenticated socket (F5). chmod is
+        // best-effort — ignore on filesystems that don't support unix modes.
+        for dir in [&self.config_dir, &self.data_dir, &self.state_dir] {
+            let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
+        }
+        // The history DB itself, 0600 (defense in depth beyond the 0700 dir).
+        if self.db_file.exists() {
+            let _ = fs::set_permissions(&self.db_file, fs::Permissions::from_mode(0o600));
+        }
         Ok(())
     }
 }
@@ -301,6 +313,46 @@ fn parse_bool(value: &str) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ensure_sets_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let base = tmp.path();
+        let config_dir = base.join("config");
+        let data_dir = base.join("data");
+        let state_dir = base.join("state");
+        let paths = AppPaths {
+            config_file: config_dir.join("config.toml"),
+            db_file: data_dir.join("shac.db"),
+            socket_file: state_dir.join("shacd.sock"),
+            pid_file: state_dir.join("shacd.pid"),
+            shell_dir: config_dir.join("shell"),
+            config_dir: config_dir.clone(),
+            data_dir: data_dir.clone(),
+            state_dir: state_dir.clone(),
+        };
+
+        // First ensure: dirs are created 0700. The db doesn't exist yet, so
+        // its chmod is skipped without error.
+        paths.ensure().expect("ensure creates dirs");
+        for dir in [&config_dir, &data_dir, &state_dir] {
+            let mode = fs::metadata(dir).expect("dir metadata").permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "{} should be 0700, got {mode:o}", dir.display());
+        }
+
+        // Simulate a pre-existing history DB with loose perms, then re-run
+        // ensure: it must tighten the db to 0600 (F5 defense in depth).
+        fs::write(&paths.db_file, b"x").expect("seed db");
+        fs::set_permissions(&paths.db_file, fs::Permissions::from_mode(0o644)).expect("loosen db");
+        paths.ensure().expect("ensure tightens db perms");
+        let db_mode = fs::metadata(&paths.db_file)
+            .expect("db metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(db_mode, 0o600, "db file should be 0600, got {db_mode:o}");
+    }
 
     #[test]
     fn telemetry_retention_days_defaults_to_30() {

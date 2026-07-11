@@ -288,3 +288,27 @@ fn daemon_restarts_cleanly_after_a_crash_leaves_a_stale_socket() {
     let out = support::run_ok(&env, ["invalidate-caches"]);
     assert!(out.contains("caches invalidated"));
 }
+
+// ── F5: control socket is owner-only ────────────────────────────────────────
+
+/// The control socket is unauthenticated — any local peer that can connect can
+/// run `complete`, read `stats`, or poison learning via `record-command`. The
+/// daemon chmods it to 0600 right after bind so only the owner can reach it.
+#[test]
+fn control_socket_is_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let env = support::TestEnv::new("socket-perms");
+    let _daemon = env.spawn_daemon();
+    let paths = env.app_paths();
+
+    let mode = fs::metadata(&paths.socket_file)
+        .expect("socket metadata")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(
+        mode, 0o600,
+        "control socket must be owner-only (0600), got {mode:o}"
+    );
+}

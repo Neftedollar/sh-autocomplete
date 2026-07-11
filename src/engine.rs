@@ -1,11 +1,10 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// Hard timeout on the `git for-each-ref` invocation that backs
 /// `collect_git_branch_candidates`. Branch completion is best-effort —
@@ -366,13 +365,22 @@ impl Engine {
         // user overrides at <config_dir>/locales/<lang>.toml are picked up.
         // Future work: invalidate when override file mtime changes.
         let catalog = {
+            // Cap distinct cached locales so a client spamming unique
+            // SHAC_LOCALE values can't grow daemon memory without bound (F5).
+            // The real working set is a handful of locales, so the cap is
+            // effectively never reached in normal use; once full we serve
+            // fresh builds without caching rather than evicting.
+            const MAX_CATALOG_CACHE: usize = 64;
             let mut cache = self.catalog_cache.lock().unwrap_or_else(|e| e.into_inner());
-            cache
-                .entry(resolved.lang.clone())
-                .or_insert_with(|| {
-                    crate::i18n::Catalog::build(&self.paths.config_dir, &resolved.lang)
-                })
-                .clone()
+            if let Some(hit) = cache.get(&resolved.lang) {
+                hit.clone()
+            } else {
+                let built = crate::i18n::Catalog::build(&self.paths.config_dir, &resolved.lang);
+                if cache.len() < MAX_CATALOG_CACHE {
+                    cache.insert(resolved.lang.clone(), built.clone());
+                }
+                built
+            }
         };
         crate::i18n::Translator::new(resolved.lang, catalog)
     }
@@ -1937,8 +1945,8 @@ fn find_git_repo_root(start: &Path) -> Option<PathBuf> {
 /// The returned vector is deduped (some refs appear under both heads and
 /// remotes/origin) and capped at [`GIT_REF_MAX`].
 fn list_git_refs(repo_root: &Path, timeout: Duration) -> Option<Vec<String>> {
-    let mut child = Command::new("git")
-        .arg("-C")
+    let mut cmd = Command::new("git");
+    cmd.arg("-C")
         .arg(repo_root)
         .args([
             "for-each-ref",
@@ -1947,41 +1955,13 @@ fn list_git_refs(repo_root: &Path, timeout: Duration) -> Option<Vec<String>> {
             "refs/heads",
             "refs/remotes",
         ])
-        .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .stdin(Stdio::null())
-        .spawn()
-        .ok()?;
-
-    let started = Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                if !status.success() {
-                    return None;
-                }
-                break;
-            }
-            Ok(None) => {
-                if started.elapsed() >= timeout {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return None;
-                }
-                thread::sleep(Duration::from_millis(5));
-            }
-            Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
-        }
+        .stdin(Stdio::null());
+    let output = crate::proc::run_capture(cmd, timeout)?;
+    if !output.success {
+        return None;
     }
-
-    let mut buf = String::new();
-    if let Some(mut out) = child.stdout.take() {
-        out.read_to_string(&mut buf).ok()?;
-    }
+    let buf = String::from_utf8_lossy(&output.stdout);
 
     let mut seen = HashSet::new();
     let mut refs = Vec::new();
@@ -2032,48 +2012,15 @@ fn list_kubectl_resources(timeout: Duration) -> Vec<String> {
         return Vec::new();
     }
 
-    let mut child = match Command::new("kubectl")
-        .args(["api-resources", "--no-headers", "--output=name"])
-        .stdout(Stdio::piped())
+    let mut cmd = Command::new("kubectl");
+    cmd.args(["api-resources", "--no-headers", "--output=name"])
         .stderr(Stdio::null())
-        .stdin(Stdio::null())
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(_) => return Vec::new(),
+        .stdin(Stdio::null());
+    let output = match crate::proc::run_capture(cmd, timeout) {
+        Some(output) if output.success => output,
+        _ => return Vec::new(),
     };
-
-    let started = Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                if !status.success() {
-                    return Vec::new();
-                }
-                break;
-            }
-            Ok(None) => {
-                if started.elapsed() >= timeout {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Vec::new();
-                }
-                thread::sleep(Duration::from_millis(10));
-            }
-            Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Vec::new();
-            }
-        }
-    }
-
-    let mut buf = String::new();
-    if let Some(mut out) = child.stdout.take() {
-        if out.read_to_string(&mut buf).is_err() {
-            return Vec::new();
-        }
-    }
+    let buf = String::from_utf8_lossy(&output.stdout);
 
     buf.lines()
         .map(str::trim)
@@ -2088,48 +2035,16 @@ fn list_kubectl_resources(timeout: Duration) -> Vec<String> {
 /// `<none>` are skipped. Returns an empty `Vec` when docker is unavailable,
 /// the daemon is not running, or the command exits non-zero.
 fn list_docker_images() -> Vec<String> {
-    let mut child = match Command::new("docker")
-        .args(["images", "--format", "{{.Repository}}:{{.Tag}}"])
-        .stdout(Stdio::piped())
+    let mut cmd = Command::new("docker");
+    cmd.args(["images", "--format", "{{.Repository}}:{{.Tag}}"])
         .stderr(Stdio::null())
-        .stdin(Stdio::null())
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(_) => return Vec::new(),
+        .stdin(Stdio::null());
+    let output = match crate::proc::run_capture(cmd, DOCKER_TIMEOUT) {
+        Some(output) if output.success => output,
+        _ => return Vec::new(),
     };
 
-    let started = Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                if !status.success() {
-                    return Vec::new();
-                }
-                break;
-            }
-            Ok(None) => {
-                if started.elapsed() >= DOCKER_TIMEOUT {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Vec::new();
-                }
-                thread::sleep(Duration::from_millis(5));
-            }
-            Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Vec::new();
-            }
-        }
-    }
-
-    let mut buf = String::new();
-    if let Some(mut out) = child.stdout.take() {
-        out.read_to_string(&mut buf).ok();
-    }
-
-    parse_docker_images_output(&buf)
+    parse_docker_images_output(&String::from_utf8_lossy(&output.stdout))
 }
 
 /// Parse raw `docker images` output (one `repo:tag` per line) into a deduplicated
@@ -2164,48 +2079,16 @@ fn parse_docker_images_output(output: &str) -> Vec<String> {
 /// docker is unavailable, the daemon is not running, or the command exits
 /// non-zero.
 fn list_docker_containers() -> Vec<String> {
-    let mut child = match Command::new("docker")
-        .args(["ps", "--format", "{{.Names}}"])
-        .stdout(Stdio::piped())
+    let mut cmd = Command::new("docker");
+    cmd.args(["ps", "--format", "{{.Names}}"])
         .stderr(Stdio::null())
-        .stdin(Stdio::null())
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(_) => return Vec::new(),
+        .stdin(Stdio::null());
+    let output = match crate::proc::run_capture(cmd, DOCKER_TIMEOUT) {
+        Some(output) if output.success => output,
+        _ => return Vec::new(),
     };
 
-    let started = Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                if !status.success() {
-                    return Vec::new();
-                }
-                break;
-            }
-            Ok(None) => {
-                if started.elapsed() >= DOCKER_TIMEOUT {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Vec::new();
-                }
-                thread::sleep(Duration::from_millis(5));
-            }
-            Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Vec::new();
-            }
-        }
-    }
-
-    let mut buf = String::new();
-    if let Some(mut out) = child.stdout.take() {
-        out.read_to_string(&mut buf).ok();
-    }
-
-    parse_docker_containers_output(&buf)
+    parse_docker_containers_output(&String::from_utf8_lossy(&output.stdout))
 }
 
 /// Parse raw `docker ps` output (one container name per line) into a Vec,

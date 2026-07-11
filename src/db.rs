@@ -108,6 +108,12 @@ impl AppDb {
         let conn = Connection::open(path).context("open sqlite db")?;
         conn.busy_timeout(Duration::from_millis(1_000))
             .context("set sqlite busy timeout")?;
+        // The command-history DB must not be world-readable (F5). Best-effort
+        // (no-op for the `:memory:` test db, which has no backing file).
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        }
         let db = Self { conn };
         db.init()?;
         Ok(db)
