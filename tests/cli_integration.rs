@@ -283,3 +283,96 @@ fn path_jump_absent_when_paths_index_empty() {
         "expected no path_jump rows when paths_index is empty:\n{output}"
     );
 }
+
+/// The daemon emits an authoritative full-line flag as TSV field 7 (F3/F7/F8):
+/// "1" for a multi-word history line offered while completing the whole buffer,
+/// "0" for a single-token mid-line candidate. Every widget keys off this bit
+/// rather than re-deriving it.
+#[test]
+fn full_line_flag_emitted_as_tsv_field_seven() {
+    let env = support::TestEnv::new("full-line-tsv");
+    let _daemon = env.spawn_daemon();
+
+    support::run_ok(
+        &env,
+        [
+            "record-command",
+            "--shell",
+            "zsh",
+            "--cwd",
+            "/tmp",
+            "--command",
+            "git commit -m wip",
+            "--trust",
+            "interactive",
+            "--provenance",
+            "typed_manual",
+            "--origin",
+            "zsh_precmd",
+            "--tty-present",
+        ],
+    );
+
+    // Whole-buffer completion from the first token: the history line is full.
+    let whole = support::run_ok(
+        &env,
+        [
+            "complete",
+            "--shell",
+            "zsh",
+            "--line",
+            "gi",
+            "--cursor",
+            "2",
+            "--cwd",
+            "/tmp",
+            "--format",
+            "shell-tsv-v3",
+        ],
+    );
+    let full_line_row = whole.lines().find(|line| {
+        let f: Vec<&str> = line.split('\t').collect();
+        f.first() != Some(&"__shac_request_id") && f.get(1) == Some(&"git commit -m wip")
+    });
+    let row = full_line_row
+        .unwrap_or_else(|| panic!("whole-line history candidate should be emitted:\n{whole}"));
+    let fields: Vec<&str> = row.split('\t').collect();
+    assert_eq!(
+        fields.get(6),
+        Some(&"1"),
+        "whole-line history row must carry full_line=1 in field 7:\n{row}"
+    );
+
+    // Mid-line argument completion: nothing is a whole-buffer replacement.
+    let mid = support::run_ok(
+        &env,
+        [
+            "complete",
+            "--shell",
+            "zsh",
+            "--line",
+            "git com",
+            "--cursor",
+            "7",
+            "--cwd",
+            "/tmp",
+            "--format",
+            "shell-tsv-v3",
+        ],
+    );
+    for line in mid.lines() {
+        let f: Vec<&str> = line.split('\t').collect();
+        if f.first() == Some(&"__shac_request_id")
+            || f.first().map(|s| s.starts_with("__shac_")) == Some(true)
+        {
+            continue;
+        }
+        if f.len() >= 7 {
+            assert_eq!(
+                f.get(6),
+                Some(&"0"),
+                "mid-line candidate must carry full_line=0:\n{line}"
+            );
+        }
+    }
+}

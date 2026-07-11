@@ -216,6 +216,24 @@ impl Engine {
 
         items.sort_by(|left, right| cmp_score(right.item.score, left.item.score));
         items.truncate(self.config.max_results);
+
+        // Mark whole-line candidates (F3/F7/F8). A history/transition entry is
+        // a full command line only when the user is completing the whole buffer
+        // from the start — the active token spans the entire (trimmed) line and
+        // the cursor is at the end — so replacing the token replaces the buffer.
+        // In any other position `project_history_candidate` already returns a
+        // single token, which must stay a per-token insert. Erring toward
+        // `false` is safe: a missed full-line just makes Enter insert instead of
+        // run; a false full-line would run a half-built command.
+        if whole_line_replacement_context(&req, &parsed) {
+            for item in &mut items {
+                item.item.full_line = matches!(
+                    item.item.source.as_str(),
+                    "history" | "runtime_history" | "transition"
+                ) && item.item.insert_text.contains(' ');
+            }
+        }
+
         let response_sources: Vec<String> = items.iter().map(|i| i.item.source.clone()).collect();
         let tip = self.maybe_pick_tip(&req, &response_sources, items.len());
         let request_id = self.db.record_completion_request(
@@ -1634,6 +1652,9 @@ impl Engine {
                 meta: CompletionMeta {
                     description: candidate.description.clone(),
                 },
+                // Filled in by `complete` once the whole-line/cursor context
+                // is known (see `whole_line_replacement_context`).
+                full_line: false,
             },
             item_key: history_key,
             features,
@@ -2654,6 +2675,15 @@ fn python_module_candidates() -> &'static [PythonModuleCandidate] {
     ]
 }
 
+/// Whether the completion context is a whole-buffer replacement: the cursor is
+/// at the end of the line and the active token spans the entire (trimmed)
+/// buffer. Only in this context is a multi-word history/transition candidate a
+/// real full command line (see `project_history_candidate`, which returns the
+/// whole entry only in `TokenRole::Command`). `cursor` is a character offset.
+fn whole_line_replacement_context(req: &CompletionRequest, parsed: &ParsedContext) -> bool {
+    req.cursor >= req.line.chars().count() && req.line.trim() == parsed.active_token
+}
+
 fn contextual_history_prefix(parsed: &ParsedContext) -> String {
     if matches!(parsed.role, TokenRole::Command) {
         return parsed.active_token.clone();
@@ -3258,6 +3288,41 @@ mod tests {
             None,
             "nothing is recorded while shac is disabled"
         );
+    }
+
+    #[test]
+    fn full_line_flag_marks_only_whole_line_history() {
+        let (engine, _dir) = test_engine("full-line-flag");
+        engine
+            .record_command(record_req("git commit -m wip", "/tmp"))
+            .expect("record");
+
+        // Completing the whole buffer from the first token ("gi", cursor at
+        // end): the resurrected history line replaces the buffer -> full_line.
+        let whole = engine
+            .complete(make_request("gi", "/tmp"))
+            .expect("complete");
+        let line_item = whole
+            .items
+            .iter()
+            .find(|i| i.insert_text == "git commit -m wip")
+            .expect("whole-line history candidate should be offered");
+        assert!(
+            line_item.full_line,
+            "multi-word history at command position must be a full line"
+        );
+
+        // Mid-line argument completion offers a single token — nothing here is
+        // a whole-buffer replacement, so no item may be flagged full_line.
+        let mid = engine
+            .complete(make_request("git com", "/tmp"))
+            .expect("complete");
+        for item in &mid.items {
+            assert!(
+                !item.full_line,
+                "mid-line candidate must not be full_line: {item:?}"
+            );
+        }
     }
 
     fn make_request(line: &str, cwd: &str) -> CompletionRequest {

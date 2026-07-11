@@ -29,6 +29,7 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
   typeset -ga _shac_menu_kinds=()
   typeset -ga _shac_menu_sources=()
   typeset -ga _shac_menu_descriptions=()
+  typeset -ga _shac_menu_full_lines=()
   typeset -g _shac_ui_menu_detail="compact"
   typeset -gi _shac_ui_show_kind=0
   typeset -gi _shac_ui_show_source=0
@@ -77,6 +78,7 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
     _shac_menu_kinds=()
     _shac_menu_sources=()
     _shac_menu_descriptions=()
+    _shac_menu_full_lines=()
     _shac_pending_tip_id=""
     _shac_pending_tip_text=""
   }
@@ -431,14 +433,6 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
     REPLY="${_shac_menu_kinds[$_shac_menu_selected_index]:-}"
   }
 
-  function _shac_selected_source() {
-    REPLY="${_shac_menu_sources[$_shac_menu_selected_index]:-}"
-  }
-
-  function _shac_selected_item_key() {
-    REPLY="${_shac_menu_item_keys[$_shac_menu_selected_index]:-}"
-  }
-
   function _shac_selected_requires_more_input() {
     local kind="$1"
     local insert_text="$2"
@@ -458,9 +452,11 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
   }
 
   function _shac_selected_is_full_line() {
-    local source="$1"
-    local item_key="$2"
-    [[ "$source" == "history" || "$source" == "runtime_history" || "$source" == "transition" ]] && [[ "$item_key" == *" "* ]]
+    # The daemon marks whole-line candidates authoritatively (TSV field 7 ->
+    # the _shac_menu_full_lines array). The widget no longer re-derives this
+    # from source/item_key heuristics, which used to drift from the daemon's
+    # own escaping decision (F3/F7/F8).
+    [[ "${_shac_menu_full_lines[$_shac_menu_selected_index]:-0}" == "1" ]]
   }
 
   function _shac_buffer_ends_with_space() {
@@ -729,6 +725,12 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
         _shac_menu_sources+=("$REPLY")
         _shac_decode "${fields[6]:-}"
         _shac_menu_descriptions+=("$REPLY")
+        # Field 7 is the daemon's authoritative full-line flag ("1"/"0").
+        # Absent from an older binary's 6-field rows -> defaults to "0" (a
+        # plain token) via the `:-0` fallback, matching the conservative
+        # serde default on the daemon side.
+        _shac_decode "${fields[7]:-0}"
+        _shac_menu_full_lines+=("${REPLY:-0}")
       fi
     done < <(
       TTY="$tty_value" shac complete \
@@ -963,12 +965,7 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
   function _shac_accept_line_widget() {
     _shac_clear_inline
     if (( _shac_menu_open )); then
-      local source item_key
-      _shac_selected_source
-      source="$REPLY"
-      _shac_selected_item_key
-      item_key="$REPLY"
-      if _shac_selected_is_full_line "$source" "$item_key"; then
+      if _shac_selected_is_full_line; then
         _shac_preexec_provenance="accepted_completion"
         _shac_preexec_provenance_source="unknown"
         _shac_preexec_provenance_confidence="unknown"

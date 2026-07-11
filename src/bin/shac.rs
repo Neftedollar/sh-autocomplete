@@ -1910,27 +1910,32 @@ fn print_completion_response(
                 .and_then(|value| value.as_str())
                 .unwrap_or_default();
             let item_ctx = item_token_context(&ctx, typed_home_user, &item);
-            // A whole command line resurrected from history/transitions (kind
-            // `history`/`command`, multi-word) replaces the buffer and is
-            // already valid shell — per-token escaping would turn `cd ..` into
-            // `cd\ ..` (one broken word that executes as "command not found: cd
-            // .."). Single-token candidates (paths, options, subcommands) are
-            // still escaped. Mirrors the widget's `_shac_selected_is_full_line`.
-            let is_full_line_command =
-                matches!(kind, "history" | "command") && item_key.contains(' ');
-            let quoted_insert = if is_full_line_command {
+            // The daemon is the single source of truth for whether a candidate
+            // is a whole command line (F3/F7/F8): a multi-word history/transition
+            // entry offered while the user completes the whole buffer from the
+            // start. Such a line replaces the buffer and is already valid shell,
+            // so per-token escaping (which would turn `cd ..` into `cd\ ..` — one
+            // broken word) must be skipped. Single-token candidates (paths,
+            // options, subcommands) are still escaped. The flag is emitted as
+            // field 7 so every widget keys insert/Enter off the same bit.
+            let full_line = item
+                .get("full_line")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let quoted_insert = if full_line {
                 insert_text.to_string()
             } else {
                 quote_token(shell, &item_ctx, insert_text)
             };
             println!(
-                "{}\t{}\t{}\t{}\t{}\t{}",
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}",
                 encode_field(item_key),
                 encode_field(&quoted_insert),
                 encode_field(display),
                 encode_field(kind),
                 encode_field(source),
-                encode_field(description)
+                encode_field(description),
+                if full_line { "1" } else { "0" }
             );
         }
         if let Some(tip) = response.get("tip").and_then(|v| v.as_object()) {

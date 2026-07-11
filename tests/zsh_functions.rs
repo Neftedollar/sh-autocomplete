@@ -114,6 +114,37 @@ assert_eq "$_shac_menu_open" "0" "right commit closes menu"
 }
 
 #[test]
+fn zsh_selected_is_full_line_reads_daemon_flag() {
+    if !support::command_available("zsh") {
+        eprintln!("skipping zsh function tests: zsh is unavailable");
+        return;
+    }
+
+    run_zsh(
+        r#"
+# The widget must trust the daemon's field-7 flag (the _shac_menu_full_lines
+# array), not re-derive full-lineness from source/item_key (F7/F8).
+_shac_menu_full_lines=("1" "0")
+
+_shac_menu_selected_index=1
+_shac_selected_is_full_line && REPLY=yes || REPLY=no
+assert_eq "$REPLY" "yes" "flag 1 marks the selected candidate full_line"
+
+_shac_menu_selected_index=2
+_shac_selected_is_full_line && REPLY=yes || REPLY=no
+assert_eq "$REPLY" "no" "flag 0 marks the selected candidate not full_line"
+
+# An older binary emits only 6 fields, so the array entry is absent: default
+# to not-full-line (Enter inserts rather than runs a possibly-mis-escaped line).
+_shac_menu_full_lines=()
+_shac_menu_selected_index=1
+_shac_selected_is_full_line && REPLY=yes || REPLY=no
+assert_eq "$REPLY" "no" "missing flag defaults to not full_line"
+"#,
+    );
+}
+
+#[test]
 fn zsh_menu_render_respects_ui_detail_settings() {
     if !support::command_available("zsh") {
         eprintln!("skipping zsh function tests: zsh is unavailable");
