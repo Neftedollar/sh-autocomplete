@@ -527,8 +527,10 @@ impl Engine {
                 if let Some((insert_text, display, kind)) =
                     project_history_candidate(command, parsed)
                 {
-                    let stale_cd_path = kind == "path"
-                        && is_cd_path_context(parsed)
+                    // In a cd context EVERY argument is a directory, whatever
+                    // `kind` the source assigned (single-segment tokens come
+                    // through as `subcommand`), so existence-check them all.
+                    let stale_cd_path = is_cd_path_context(parsed)
                         && !cd_history_path_exists(&insert_text, &req.cwd);
                     if !stale_cd_path
                         && (insert_text.starts_with(active)
@@ -543,7 +545,7 @@ impl Engine {
                                 display,
                                 kind,
                                 source: "runtime_history".to_string(),
-                                description: Some("Provided by current shell context".to_string()),
+                                description: None,
                             },
                         );
                     }
@@ -557,10 +559,9 @@ impl Engine {
             {
                 let history_candidate = project_history_candidate(&entry.command, parsed);
                 if let Some((insert_text, display, kind)) = history_candidate {
-                    // Drop a cd-path suggestion whose directory no longer exists.
-                    if kind == "path"
-                        && is_cd_path_context(parsed)
-                        && !cd_history_path_exists(&insert_text, &req.cwd)
+                    // Drop a cd-path suggestion whose directory no longer exists
+                    // (any kind — see the runtime-history loop above).
+                    if is_cd_path_context(parsed) && !cd_history_path_exists(&insert_text, &req.cwd)
                     {
                         continue;
                     }
@@ -572,7 +573,7 @@ impl Engine {
                             display,
                             kind,
                             source: "history".to_string(),
-                            description: Some("Previously executed command".to_string()),
+                            description: None,
                         },
                     );
                 }
@@ -608,7 +609,7 @@ impl Engine {
                             &mut candidates,
                             &mut seen,
                             Candidate {
-                                insert_text: doc.item_value.clone(),
+                                insert_text: strip_control_chars(&doc.item_value),
                                 // F8: doc text is user/tool-authored (e.g. a
                                 // --help line) and reaches the terminal raw
                                 // if not sanitized like every other display
@@ -624,13 +625,20 @@ impl Engine {
 
                 if !active.is_empty() {
                     if let Some(query) = sanitize_fts_query(active) {
-                        for doc in self.db.search_docs(&query, self.config.max_results)? {
+                        for doc in self
+                            .db
+                            .search_docs(command, &query, self.config.max_results)?
+                        {
                             if should_include_doc(&doc, active, parsed) {
                                 push_candidate(
                                     &mut candidates,
                                     &mut seen,
                                     Candidate {
-                                        insert_text: doc.item_value.clone(),
+                                        // Strip control bytes (roff overstrike
+                                        // `x\bx` from man pages) so accepting a
+                                        // doc row never injects them into the
+                                        // buffer.
+                                        insert_text: strip_control_chars(&doc.item_value),
                                         // F8: same rationale as the
                                         // docs_for_command branch above.
                                         display: sanitize_display(&doc.item_value),
@@ -662,12 +670,18 @@ impl Engine {
             candidates.retain(|c| c.source != "history" && c.source != "runtime_history");
         }
 
-        if let Some(prev_command) = req
-            .history_hint
-            .prev_command
-            .clone()
-            .or_else(|| self.db.latest_command().ok().flatten())
-        {
+        // Transitions predict the NEXT command, so they only make sense at
+        // command position. Offering "what you run after cd" as a `git`
+        // argument (or a once-pasted sentence as a path) is pure noise.
+        let prev_command = if matches!(parsed.role, TokenRole::Command) {
+            req.history_hint
+                .prev_command
+                .clone()
+                .or_else(|| self.db.latest_command().ok().flatten())
+        } else {
+            None
+        };
+        if let Some(prev_command) = prev_command {
             for transition in self
                 .db
                 .transitions_from(&prev_command, self.config.max_results)?
@@ -675,8 +689,10 @@ impl Engine {
                 if let Some((insert_text, display, kind)) =
                     project_history_candidate(&transition.next, parsed)
                 {
-                    let stale_cd_path = kind == "path"
-                        && is_cd_path_context(parsed)
+                    // In a cd context EVERY argument is a directory, whatever
+                    // `kind` the source assigned (single-segment tokens come
+                    // through as `subcommand`), so existence-check them all.
+                    let stale_cd_path = is_cd_path_context(parsed)
                         && !cd_history_path_exists(&insert_text, &req.cwd);
                     if !stale_cd_path
                         && (insert_text.starts_with(active)
@@ -691,9 +707,7 @@ impl Engine {
                                 display,
                                 kind,
                                 source: "transition".to_string(),
-                                description: Some(format!(
-                                    "Frequently used after `{prev_command}`"
-                                )),
+                                description: None,
                             },
                         );
                     }
@@ -710,7 +724,7 @@ impl Engine {
                                 "history".to_string()
                             },
                             source: "transition".to_string(),
-                            description: Some(format!("Frequently used after `{prev_command}`")),
+                            description: None,
                         },
                     );
                 }
@@ -889,19 +903,37 @@ impl Engine {
         };
 
         let limit = self.config.max_results.saturating_mul(2).max(8);
+        // Local branch names, so a remote-tracking `origin/foo` twin can be
+        // collapsed when the local `foo` already exists (offering both halves
+        // the useful window).
+        let local_names: HashSet<&str> = refs
+            .iter()
+            .filter(|r| !r.starts_with("origin/"))
+            .map(|r| r.as_str())
+            .collect();
         let mut emitted = 0usize;
-        for refname in refs {
+        for refname in &refs {
             if emitted >= limit {
                 break;
+            }
+            // A bare remote name (`origin`) is not a branch.
+            if refname == "origin" {
+                continue;
+            }
+            // Collapse the remote-tracking twin of an existing local branch.
+            if let Some(local) = refname.strip_prefix("origin/") {
+                if local_names.contains(local) {
+                    continue;
+                }
             }
             // Filter: prefix or fuzzy match. Empty `active` keeps everything.
             if !active.is_empty()
                 && !refname.starts_with(active)
-                && fuzzy_match_score(active, &refname) <= 0.0
+                && fuzzy_match_score(active, refname) <= 0.0
             {
                 continue;
             }
-            let display = sanitize_display(&refname);
+            let display = sanitize_display(refname);
             let description = if refname.starts_with("origin/") {
                 Some("remote-tracking branch".to_string())
             } else {
@@ -911,7 +943,7 @@ impl Engine {
                 candidates,
                 seen,
                 Candidate {
-                    insert_text: refname,
+                    insert_text: refname.clone(),
                     display,
                     kind: "branch".to_string(),
                     source: "git_branch".to_string(),
@@ -1445,9 +1477,13 @@ impl Engine {
         // uses, and only carry the top `limit` of those into the expensive
         // SQL-backed scoring pass below.
         let limit = self.config.max_results.saturating_mul(2).max(8);
+        // Case-insensitive prefix match: on a default case-insensitive macOS
+        // filesystem `cd d` should surface Documents/Desktop/Downloads, matching
+        // the shell's own matcher rather than hiding them behind case.
+        let prefix_lc = prefix.to_ascii_lowercase();
         let mut matches: Vec<(String, f64)> = Vec::new();
         for entry in entries {
-            if !entry.starts_with(&prefix) {
+            if !entry.to_ascii_lowercase().starts_with(&prefix_lc) {
                 continue;
             }
             let entry_path = dir.join(&entry);
@@ -1769,26 +1805,45 @@ fn is_cd_path_context(parsed: &ParsedContext) -> bool {
         || matches!(parsed.prev_token.as_deref(), Some("cd"))
 }
 
-/// True if a cd-path candidate resurrected from history still resolves to an
-/// existing directory. Relative tokens resolve against `cwd`; `~/` expands via
-/// `$HOME`. Used to drop stale suggestions like `cd dev/sh-autocomplete/` after
-/// the folder was deleted. An unresolvable `~` (no `$HOME`) is treated as
-/// existing so we never over-filter a path we cannot check.
+/// True if a cd-path candidate resurrected from history plausibly points at a
+/// still-existing directory. Used to drop stale suggestions like
+/// `cd dev/sh-autocomplete/` after the folder was deleted.
+///
+/// The guiding rule is *never over-filter what we cannot cheaply and safely
+/// check* — so anything we can't resolve without the shell (env vars, `~user`,
+/// globs) or that could block on a slow/dead network mount (an absolute path
+/// outside `$HOME`) is kept. Only relative paths (resolved against `cwd`),
+/// `~/…`, and absolute paths under `$HOME` are stat'd, and with `is_dir` (a cd
+/// target that became a regular file is also useless).
 fn cd_history_path_exists(token: &str, cwd: &str) -> bool {
-    if token == "~" {
+    // Unresolvable without the shell — keep.
+    if token == "~"
+        || token.starts_with('$')
+        || token.contains('*')
+        || token.contains('?')
+        || (token.starts_with('~') && !token.starts_with("~/"))
+    {
         return true;
     }
+    let home = std::env::var_os("HOME").map(PathBuf::from);
     let path = if let Some(rest) = token.strip_prefix("~/") {
-        match std::env::var_os("HOME") {
-            Some(home) => PathBuf::from(home).join(rest),
+        match &home {
+            Some(h) => h.join(rest),
             None => return true,
         }
     } else if Path::new(token).is_absolute() {
-        PathBuf::from(token)
+        let p = PathBuf::from(token);
+        // Only stat absolute paths under $HOME (cheap, local). An absolute path
+        // elsewhere may be a slow or dead network mount — never block the daemon
+        // on that stat; keep the candidate.
+        match &home {
+            Some(h) if p.starts_with(h) => p,
+            _ => return true,
+        }
     } else {
         Path::new(cwd).join(token)
     };
-    path.exists()
+    path.is_dir()
 }
 
 fn source_prior(source: &str, kind: &str) -> f64 {
@@ -2609,6 +2664,15 @@ fn sanitize_display(s: &str) -> String {
         }
     }
     out
+}
+
+/// Strip control bytes from a value destined for `insert_text`. Unlike
+/// `sanitize_display` (which is for on-screen text and replaces whitespace with
+/// spaces), this keeps the token insertable — it only removes C0/DEL bytes such
+/// as the backspace in roff overstrike (`x\bx`), which would otherwise land in
+/// the user's command buffer on accept.
+fn strip_control_chars(s: &str) -> String {
+    s.chars().filter(|c| !c.is_control()).collect()
 }
 
 fn sanitize_fts_query(query: &str) -> Option<String> {
@@ -3444,6 +3508,7 @@ mod tests {
     fn cd_history_path_exists_filters_deleted_dirs() {
         let base = unique_tmp("cd-exists");
         fs::create_dir_all(base.join("real")).unwrap();
+        fs::write(base.join("afile"), b"x").unwrap();
         let cwd = base.to_string_lossy().to_string();
 
         // Existing relative dir (with and without trailing slash) is kept.
@@ -3452,14 +3517,25 @@ mod tests {
         // A deleted / never-existed relative dir is filtered out.
         assert!(!cd_history_path_exists("gone/", &cwd));
         assert!(!cd_history_path_exists("real/nope/", &cwd));
-        // Absolute existing / missing.
-        assert!(cd_history_path_exists(
-            base.join("real").to_str().unwrap(),
-            &cwd
-        ));
-        assert!(!cd_history_path_exists("/definitely/not/here/xyzzy", &cwd));
-        // Bare `~` is treated as existing (never over-filter home).
+        // A relative path that resolves to a FILE (not a dir) is filtered — cd
+        // would fail on it too (is_dir, not exists).
+        assert!(!cd_history_path_exists("afile", &cwd));
+
+        // Absolute paths OUTSIDE $HOME are kept unconditionally — never block the
+        // daemon on a stat that could hit a dead network mount, even if missing.
+        assert!(cd_history_path_exists("/definitely/not/here/xyzzy", &cwd));
+
+        // Unresolvable-without-the-shell tokens are kept (never over-filter).
         assert!(cd_history_path_exists("~", &cwd));
+        assert!(cd_history_path_exists("$PROJECTS/api", &cwd));
+        assert!(cd_history_path_exists("~alice/dev", &cwd));
+        assert!(cd_history_path_exists("build/*/out", &cwd));
+
+        // A missing path UNDER $HOME is safe to stat and is filtered.
+        if let Some(home) = std::env::var_os("HOME") {
+            let missing = PathBuf::from(&home).join("shac-cd-exists-nope-xyzzy");
+            assert!(!cd_history_path_exists(missing.to_str().unwrap(), &cwd));
+        }
 
         let _ = fs::remove_dir_all(&base);
     }
