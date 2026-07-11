@@ -97,3 +97,80 @@ fn splice_candidate_matches_byte_offset_for_ascii_only_prefix() {
         before.len() + insert.len()
     );
 }
+
+/// Drive `_shac_bash_active_region LINE POINT` and return the (before, after)
+/// splice regions it assigns. Like `run_splice`, this exercises the function
+/// directly by sourcing the script and reading the plain globals it sets.
+fn run_active_region(line: &str, point: usize) -> (String, String) {
+    let script_path = format!("{}/shell/bash/shac.bash", env!("CARGO_MANIFEST_DIR"));
+    let script = format!(
+        r#"
+source "{script_path}"
+_shac_bash_active_region {line:?} {point}
+printf '%s\n%s\n' "$_shac_bash_before" "$_shac_bash_after"
+"#,
+    );
+    let output = Command::new("bash")
+        .arg("-c")
+        .arg(&script)
+        .output()
+        .expect("run bash");
+    assert!(
+        output.status.success(),
+        "bash script failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // Two `printf %s\n` lines; a trailing empty region yields an empty line, so
+    // don't let `lines()` swallow it — index positionally.
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let parts: Vec<&str> = stdout.splitn(2, '\n').collect();
+    let before = parts.first().copied().unwrap_or_default().to_string();
+    let after = parts
+        .get(1)
+        .map(|rest| rest.strip_suffix('\n').unwrap_or(rest))
+        .unwrap_or_default()
+        .to_string();
+    (before, after)
+}
+
+#[test]
+fn active_region_splits_on_plain_whitespace() {
+    if !support::command_available("bash") {
+        eprintln!("skipping: bash unavailable");
+        return;
+    }
+
+    // Cursor at end of the last word: `foo` is the active token, `cat ` is the
+    // untouched prefix.
+    assert_eq!(run_active_region("cat foo", 7), ("cat ".into(), "".into()));
+    // Cursor inside a middle word: the trailing ` bar` is preserved in `after`.
+    assert_eq!(
+        run_active_region("cat foo bar", 5),
+        ("cat ".into(), " bar".into())
+    );
+}
+
+#[test]
+fn active_region_is_quote_and_escape_aware() {
+    if !support::command_available("bash") {
+        eprintln!("skipping: bash unavailable");
+        return;
+    }
+
+    // Whitespace inside double quotes must NOT split the token: the whole
+    // `"my fi` span is active, so a splice replaces it wholesale (F6).
+    assert_eq!(
+        run_active_region("cat \"my fi", 10),
+        ("cat ".into(), "".into())
+    );
+    // Same for single quotes...
+    assert_eq!(
+        run_active_region("echo 'a b", 9),
+        ("echo ".into(), "".into())
+    );
+    // ...and for a backslash-escaped space.
+    assert_eq!(
+        run_active_region("cat My\\ fi", 9),
+        ("cat ".into(), "".into())
+    );
+}

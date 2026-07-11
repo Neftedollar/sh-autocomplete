@@ -77,20 +77,41 @@ if [[ -z "${_SHAC_BASH_LOADED:-}" ]]; then
   }
 
   _shac_bash_active_region() {
-    # Whitespace-delimited word spanning the cursor: everything before it
-    # goes in _shac_bash_before, everything from the next whitespace onward
-    # goes in _shac_bash_after, so an accept replaces the whole active token
-    # (not just the part left of the cursor). Naive/not quote-aware -- same
-    # heuristic the zsh widget uses; context::parse's quote-awareness governs
-    # what insert_text itself looks like, not where widgets splice it in.
+    # Word spanning the cursor, honoring shell quoting: whitespace inside a
+    # quoted (`"`/`'`) or backslash-escaped region does NOT split the token, so
+    # `cat "my fi<Tab>` completes the whole `"my fi` span rather than just the
+    # trailing `fi` and mangling the quote on splice (F6). Everything left of
+    # the token goes in _shac_bash_before, everything from the token's end
+    # onward in _shac_bash_after, so an accept replaces the whole active token.
+    # Mirrors the zsh widget's _shac_active_token_span.
     local base_line="$1" base_point="$2"
-    local left right token_prefix token_suffix
-    left="${base_line:0:base_point}"
-    right="${base_line:base_point}"
-    token_prefix="${left##*[[:space:]]}"
-    _shac_bash_before="${left:0:$(( ${#left} - ${#token_prefix} ))}"
-    token_suffix="${right%%[[:space:]]*}"
-    _shac_bash_after="${right#"$token_suffix"}"
+    local -i len=${#base_line} i=0 start=0 end=${#base_line} escaped=0
+    local quote="" c
+    while (( i < len )); do
+      c="${base_line:i:1}"
+      if (( escaped )); then
+        escaped=0
+      elif [[ "$c" == "\\" ]]; then
+        escaped=1
+      elif [[ "$c" == '"' || "$c" == "'" ]]; then
+        if [[ "$quote" == "$c" ]]; then
+          quote=""
+        elif [[ -z "$quote" ]]; then
+          quote="$c"
+        fi
+      elif [[ -z "$quote" && "$c" == [[:space:]] ]]; then
+        if (( i < base_point )); then
+          # Whitespace left of the cursor: the token starts after it.
+          start=$(( i + 1 ))
+        elif (( end == len )); then
+          # First whitespace at/after the cursor closes the token.
+          end=$i
+        fi
+      fi
+      i+=1
+    done
+    _shac_bash_before="${base_line:0:start}"
+    _shac_bash_after="${base_line:end}"
   }
 
   _shac_bash_byte_length() {
