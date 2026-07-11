@@ -1621,35 +1621,46 @@ fn rc_file_for_shell(shell: ShellKind) -> Result<PathBuf> {
     })
 }
 
+/// Start the daemon if it is not already running, printing NOTHING. Safe to
+/// call from the completion path, whose stdout is a protocol stream the shell
+/// widgets parse — a stray "started"/"running" line there becomes a phantom
+/// completion candidate that erases the user's typed token (F1). Returns true
+/// if the daemon was already up, false if it was freshly started.
+fn start_daemon_quiet(paths: &AppPaths) -> Result<bool> {
+    cleanup_stale_daemon_state(paths);
+    if daemon_is_running(paths) {
+        return Ok(true);
+    }
+    let daemon_bin = daemon_binary_path()?;
+    let command = format!(
+        "if command -v setsid >/dev/null 2>&1; then nohup setsid {} >/dev/null 2>&1 </dev/null & else nohup {} >/dev/null 2>&1 </dev/null & fi",
+        shell_escape(&daemon_bin.to_string_lossy()),
+        shell_escape(&daemon_bin.to_string_lossy())
+    );
+    let status = Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .status()
+        .context("start shacd with detached shell")?;
+    if !status.success() {
+        bail!("failed to launch daemon process");
+    }
+    if wait_for_socket(&paths.socket_file, Duration::from_secs(2)) {
+        Ok(false)
+    } else {
+        bail!("daemon did not create socket in time")
+    }
+}
+
 fn daemon_action(paths: &AppPaths, action: DaemonAction) -> Result<()> {
     match action {
         DaemonAction::Start => {
-            cleanup_stale_daemon_state(paths);
-            if daemon_is_running(paths) {
+            if start_daemon_quiet(paths)? {
                 println!("running");
-                return Ok(());
-            }
-            let daemon_bin = daemon_binary_path()?;
-            let command = format!(
-                "if command -v setsid >/dev/null 2>&1; then nohup setsid {} >/dev/null 2>&1 </dev/null & else nohup {} >/dev/null 2>&1 </dev/null & fi",
-                shell_escape(&daemon_bin.to_string_lossy()),
-                shell_escape(&daemon_bin.to_string_lossy())
-            );
-            let status = Command::new("sh")
-                .arg("-c")
-                .arg(command)
-                .status()
-                .context("start shacd with detached shell")?;
-            if !status.success() {
-                bail!("failed to launch daemon process");
-            }
-            let started = wait_for_socket(&paths.socket_file, Duration::from_secs(2));
-            if started {
-                println!("started");
-                Ok(())
             } else {
-                bail!("daemon did not create socket in time")
+                println!("started");
             }
+            Ok(())
         }
         DaemonAction::Stop => {
             if !paths.pid_file.exists() {
@@ -1847,11 +1858,16 @@ fn print_completion_response(
     if format == "json" {
         println!("{}", serde_json::to_string_pretty(&response)?);
     } else if format == "shell-tsv-v3" {
+        // Never emit an empty field: zsh's `${(ps:\t:)}` elides empty elements
+        // and bash's `IFS=$'\t' read -a` collapses consecutive tabs, so an empty
+        // request_id would shift every following field (F2) — in bash that fed a
+        // non-numeric `--accepted-request-id` and silently dropped the recorded
+        // command. `0` is a safe non-id sentinel (real ids are positive).
         let request_id = response
             .get("request_id")
             .and_then(|value| value.as_i64())
             .map(|value| value.to_string())
-            .unwrap_or_default();
+            .unwrap_or_else(|| "0".to_string());
         let mode = response
             .get("mode")
             .and_then(|value| value.as_str())
@@ -2085,11 +2101,10 @@ fn reset_personalization(paths: &AppPaths) -> Result<()> {
 }
 
 fn ensure_daemon(paths: &AppPaths) -> Result<()> {
-    cleanup_stale_daemon_state(paths);
-    if daemon_is_running(paths) {
-        return Ok(());
-    }
-    daemon_action(paths, DaemonAction::Start)
+    // Quiet start: this runs inside `complete`, whose stdout is the protocol
+    // stream (F1). Never print a status line here.
+    start_daemon_quiet(paths)?;
+    Ok(())
 }
 
 fn shac_disabled(paths: &AppPaths) -> Result<bool> {
