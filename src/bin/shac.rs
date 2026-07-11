@@ -2121,7 +2121,15 @@ fn shac_disabled(paths: &AppPaths) -> Result<bool> {
 
 fn request_timeout_for_action(action: &str, base_timeout_ms: u64) -> Duration {
     let timeout_ms = match action {
-        "reindex" => base_timeout_ms.max(1_500),
+        // `reindex` rescans every PATH command and rebuilds the doc index
+        // synchronously in the daemon; on a machine with a large PATH — or a
+        // slow CI runner — that legitimately takes several seconds. It is an
+        // explicit, occasional command, not a keystroke-latency path, so give
+        // the client a generous ceiling. A too-tight one makes the client
+        // report a "read daemon response" failure while the daemon is still
+        // working and actually finishing the reindex (the recurring CI flake
+        // in reindex_default_flags_succeeds / cli_daemon_records_*).
+        "reindex" => base_timeout_ms.max(30_000),
         "stats" | "migration-status" => base_timeout_ms.max(500),
         _ => base_timeout_ms.max(1),
     };
@@ -2377,6 +2385,27 @@ mod first_run_ux_tests {
         assert_eq!(fmt_count(1_000), "1,000");
         assert_eq!(fmt_count(12_847), "12,847");
         assert_eq!(fmt_count(1_234_567), "1,234,567");
+    }
+
+    #[test]
+    fn reindex_gets_a_generous_timeout_floor() {
+        // A tiny daemon_timeout_ms (the keystroke-latency default) must not
+        // bound a full-PATH reindex: the client would give up while the daemon
+        // is still working. reindex floors at 30s regardless.
+        assert_eq!(
+            request_timeout_for_action("reindex", 150),
+            Duration::from_millis(30_000)
+        );
+        // A larger configured timeout still wins if it exceeds the floor.
+        assert_eq!(
+            request_timeout_for_action("reindex", 45_000),
+            Duration::from_millis(45_000)
+        );
+        // Latency-sensitive actions keep their small ceilings.
+        assert_eq!(
+            request_timeout_for_action("complete", 150),
+            Duration::from_millis(150)
+        );
     }
 
     #[test]
