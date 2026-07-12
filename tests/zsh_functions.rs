@@ -146,6 +146,51 @@ assert_eq "$REPLY" "no" "missing flag defaults to not full_line"
     );
 }
 
+#[test]
+fn zsh_adapter_is_reload_safe() {
+    if !support::command_available("zsh") {
+        eprintln!("skipping zsh function tests: zsh is unavailable");
+        return;
+    }
+
+    let script_path = std::env::current_dir()
+        .expect("cwd")
+        .join("shell/zsh/shac.zsh");
+    // Source once, override a function as a stale/old version would leave it,
+    // then re-source. A reload-safe adapter must REDEFINE the function (so
+    // `shac install` + `source` actually updates a live shell); the old
+    // load-guard structure made the re-source a no-op and the override would
+    // survive.
+    let body = format!(
+        r#"
+source "{script}"
+_shac_decode() {{ REPLY="STALE" }}
+source "{script}"
+_shac_decode "hello"
+print -r -- "$REPLY"
+"#,
+        script = script_path.display(),
+    );
+    let output = Command::new("zsh")
+        .arg("-f")
+        .arg("-c")
+        .arg(body)
+        .env("SHAC_ZSH_TEST_MODE", "1")
+        .output()
+        .expect("run zsh");
+    assert!(
+        output.status.success(),
+        "zsh failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "hello",
+        "re-sourcing must redefine functions (the real _shac_decode), not \
+         no-op on the load guard and leave the STALE override"
+    );
+}
+
 /// Drive the REAL `_shac_fetch_candidates` parse loop against a fake `shac` on
 /// PATH emitting `response`, and return (full_lines, descriptions) as the
 /// comma-joined `_shac_menu_*` arrays it builds. Unlike the direct-assignment

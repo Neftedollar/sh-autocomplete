@@ -1,8 +1,13 @@
 [[ -n "${SHAC_DISABLE:-}" ]] && return 0
 
-if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
-  _SHAC_ZSH_LOADED=1
-
+# Globals and functions below are (re)defined on EVERY `source` — so `shac
+# install` + re-source (or the source line a `brew upgrade` leaves stale)
+# actually updates an already-open shell instead of silently no-op'ing on a
+# load guard. Only the one-time zle wiring near the end of this file is guarded
+# by `_SHAC_ZSH_LOADED`: it saves the ORIGINAL widgets into `_shac_orig_*`,
+# which must happen exactly once (a second save would capture our OWN widget and
+# break the chain). The body keeps its historical 2-space indent from when the
+# whole file was guard-wrapped.
   typeset -g _shac_last_request_id=""
   typeset -g _shac_last_recorded=""
   typeset -g _shac_last_buffer=""
@@ -1092,7 +1097,13 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
     fi
   }
 
-  if [[ "${SHAC_ZSH_TEST_MODE:-0}" != "1" ]]; then
+  # One-time wiring only: saving the ORIGINAL widgets (`zle -A … _shac_orig_*`)
+  # and binding ours must run exactly once per shell — a re-source must NOT
+  # re-save (it would capture our own widget). `_SHAC_ZSH_LOADED` guards this
+  # block alone now, not the function definitions above. (Hooks already use
+  # `add-zsh-hook -D` so they're re-run-safe regardless.)
+  if [[ "${SHAC_ZSH_TEST_MODE:-0}" != "1" && -z "${_SHAC_ZSH_LOADED:-}" ]]; then
+    _SHAC_ZSH_LOADED=1
     autoload -Uz compinit
     if ! typeset -p _comps >/dev/null 2>&1; then
       compinit
@@ -1145,4 +1156,3 @@ if [[ -z "${_SHAC_ZSH_LOADED:-}" ]]; then
     add-zsh-hook preexec _shac_capture_preexec
     add-zsh-hook precmd _shac_record_precmd
   fi
-fi
