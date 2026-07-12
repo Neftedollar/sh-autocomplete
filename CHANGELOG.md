@@ -1,5 +1,25 @@
 # Changelog
 
+## v0.6.13 — 2026-07-12
+
+### Fixed
+- **Upgrading shac now updates an already-open shell.** Every widget wrapped
+  all of its function definitions in a one-time load guard
+  (`_SHAC_ZSH_LOADED` / `_SHAC_BASH_LOADED` / `_SHAC_FISH_LOADED`), so the
+  `source …` line that `shac install` prints — the documented way to pick up a
+  new version — was a silent **no-op** in a shell that had already loaded shac.
+  A `brew upgrade` therefore left the old widget running against the new daemon
+  (visible as a stray `0`/`1` in the menu's description column: the new
+  `full_line` protocol field parsed by an old adapter). The adapters are now
+  reload-safe: function definitions run on every `source`, while only the
+  one-time zle wiring in zsh (which saves the original widgets) stays guarded;
+  bash and fish re-run their idempotent wiring directly.
+
+  Note: this fix helps from 0.6.13 onward. Upgrading *to* 0.6.13 from an older
+  version still has the old guard loaded, so open a new shell (or
+  `unset _SHAC_ZSH_LOADED && source ~/.config/shac/shell/shac.zsh`) once to pick
+  it up.
+
 ## v0.6.12 — 2026-07-11
 
 The rest of the holistic Fable review, batched: security, resource safety, a

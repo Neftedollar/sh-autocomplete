@@ -1,8 +1,11 @@
 [[ -n "${SHAC_DISABLE:-}" ]] && return 0
 
-if [[ -z "${_SHAC_BASH_LOADED:-}" ]]; then
-  _SHAC_BASH_LOADED=1
-
+# No load guard: everything below is idempotent, so re-sourcing (after `shac
+# install` or a `brew upgrade`) actually updates a live shell instead of
+# no-op'ing. Function redefinitions replace; `bind -x`/`complete -F` replace;
+# the PROMPT_COMMAND registration below dedupes itself. (Unlike zsh, bash saves
+# no original widget into a var, so nothing here must run exactly once.) The
+# body keeps its historical 2-space indent from when it was guard-wrapped.
   _shac_decode() {
     # Reverse wire-format v3 field encoding: \\->\, \t->tab, \n->LF, \r->CR.
     # An unrecognized escape (or a trailing lone backslash) passes through
@@ -511,4 +514,3 @@ if [[ -z "${_SHAC_BASH_LOADED:-}" ]]; then
         make cargo go vim nvim nano code open du df diff
     fi
   fi
-fi

@@ -360,6 +360,44 @@ fn default_fallback_skips_quoted_and_tilde_tokens() {
 }
 
 #[test]
+fn bash_adapter_is_reload_safe() {
+    if !support::command_available("bash") {
+        eprintln!("skipping: bash unavailable");
+        return;
+    }
+
+    // Re-sourcing must REDEFINE functions (so `shac install` + `source` updates
+    // a live shell), not no-op on a load guard. Source, override a function as a
+    // stale version would leave it, re-source, and confirm the real function is
+    // back.
+    let script_path = format!("{}/shell/bash/shac.bash", env!("CARGO_MANIFEST_DIR"));
+    let script = format!(
+        r#"
+source "{script_path}" 2>/dev/null
+_shac_decode() {{ REPLY="STALE"; }}
+source "{script_path}" 2>/dev/null
+_shac_decode "hello"
+printf '%s' "$REPLY"
+"#,
+    );
+    let output = Command::new("bash")
+        .arg("-c")
+        .arg(&script)
+        .output()
+        .expect("run bash");
+    assert!(
+        output.status.success(),
+        "bash failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "hello",
+        "re-sourcing must redefine functions, not no-op on a load guard"
+    );
+}
+
+#[test]
 fn request_id_zero_sentinel_is_treated_as_no_request() {
     if !support::command_available("bash") {
         eprintln!("skipping: bash unavailable");

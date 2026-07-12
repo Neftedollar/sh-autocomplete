@@ -1,9 +1,10 @@
 if set -q SHAC_DISABLE
   # User opted out via SHAC_DISABLE; do nothing.
 else if status is-interactive
-  if not set -q _SHAC_FISH_LOADED
-    set -g _SHAC_FISH_LOADED 1
-
+  # No load guard: fish redefines functions and re-runs `bind`/`--on-event`
+  # handlers idempotently on every source, so re-sourcing after `shac install`
+  # (or the stale source line a `brew upgrade` leaves) actually updates a live
+  # shell. Body keeps its 4-space indent from when it was guard-wrapped.
     set -g _shac_last_request_id ""
     set -g _shac_last_accepted_item_key ""
 
@@ -155,5 +156,4 @@ else if status is-interactive
     # a later version that registers per-command completions on demand.
     bind \cf __shac_accept_suggestion
     bind -M insert \cf __shac_accept_suggestion 2>/dev/null; or true
-  end
 end
