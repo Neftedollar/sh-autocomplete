@@ -7,6 +7,11 @@ on:
 
 permissions:
   contents: read
+  # rustsec/audit-check reports findings by opening an issue and writing a check
+  # run. Without these the action fails with "Resource not accessible by
+  # integration" even when the audit itself found nothing.
+  issues: write
+  checks: write
 
 jobs:
   audit:
