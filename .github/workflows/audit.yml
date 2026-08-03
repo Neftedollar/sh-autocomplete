@@ -1,8 +1,10 @@
 name: Security Audit
 
 on:
-  schedule:
-    - cron: "23 4 * * 1"
+  # Manual only. The weekly schedule was removed deliberately: nothing here
+  # polls for new advisories any more, so a CVE published against a dependency
+  # will not surface on its own. Run this from the Actions tab before a release,
+  # or when a dependency changes.
   workflow_dispatch:
 
 permissions:
